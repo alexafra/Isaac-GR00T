@@ -131,6 +131,8 @@ class FinetuneConfig:
     learning_rate: float = 1e-4
     """Initial learning rate for optimizer."""
 
+    optim: str = "adamw_torch"
+
     gradient_accumulation_steps: int = 1
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to
     produce the post-accumulation per-optimizer-step batch."""
