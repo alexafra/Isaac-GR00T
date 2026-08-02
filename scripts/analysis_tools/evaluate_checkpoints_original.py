@@ -71,152 +71,26 @@ def action_labels(trajectory: pd.DataFrame, action_keys: list[str]) -> list[str]
     return labels
 
 
-def plot_trajectory(
-    gt: np.ndarray,
-    pred: np.ndarray,
-    labels: list[str],
-    title: str,
-    path: Path,
-    execution_horizon: int,
-) -> None:
-    from collections import defaultdict
-    from matplotlib.ticker import MultipleLocator
+def plot_trajectory(gt: np.ndarray, pred: np.ndarray, labels: list[str], title: str, path: Path) -> None:
+    columns = 4
+    rows = ceil(len(labels) / columns)
+    figure, axes = plt.subplots(rows, columns, figsize=(18, 3.1 * rows), sharex=True)
+    flat_axes = np.asarray(axes).reshape(-1)
 
-    groups: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for index, label in enumerate(labels):
-        key = label.split("[")[0]
-        groups[key].append((index, label))
+        axis = flat_axes[index]
+        axis.plot(gt[:, index], linewidth=1.2, label="ground truth")
+        axis.plot(pred[:, index], linewidth=1.0, alpha=0.85, label="prediction")
+        axis.set_title(label, fontsize=9)
+        axis.grid(alpha=0.2)
 
-    preferred = ["left_arm", "left_hand", "right_arm", "right_hand"]
-    ordered_keys = [key for key in preferred if key in groups]
-    ordered_keys += [key for key in groups if key not in ordered_keys]
+    for axis in flat_axes[len(labels):]:
+        axis.set_visible(False)
 
-    n_cols = len(ordered_keys)
-    max_rows = max(len(groups[key]) for key in ordered_keys)
-
-    # Find the data range required by each joint.
-    joint_minimums = np.minimum(
-        np.nanmin(gt, axis=0),
-        np.nanmin(pred, axis=0),
-    )
-    joint_maximums = np.maximum(
-        np.nanmax(gt, axis=0),
-        np.nanmax(pred, axis=0),
-    )
-    joint_ranges = joint_maximums - joint_minimums
-
-    # Give every subplot the range required by the widest-ranging joint.
-    common_y_span = float(np.nanmax(joint_ranges))
-
-    if not np.isfinite(common_y_span) or common_y_span <= 0:
-        common_y_span = 1.0
-
-    # Add 10% vertical padding.
-    common_y_span *= 1.10
-
-    # Choose one readable tick interval for every subplot.
-    raw_tick_step = common_y_span / 6.0
-    exponent = np.floor(np.log10(raw_tick_step))
-    fraction = raw_tick_step / (10**exponent)
-
-    if fraction <= 1:
-        nice_fraction = 1
-    elif fraction <= 2:
-        nice_fraction = 2
-    elif fraction <= 2.5:
-        nice_fraction = 2.5
-    elif fraction <= 5:
-        nice_fraction = 5
-    else:
-        nice_fraction = 10
-
-    tick_step = 0.1
-    #tick_step = float(nice_fraction * (10**exponent))
-
-
-    col_width = 4.5
-    row_height = 8.5
-    # row_height = 2.7
-
-    figure, axes = plt.subplots(
-        max_rows,
-        n_cols,
-        figsize=(col_width * n_cols, row_height * max_rows),
-        sharex=True,
-        squeeze=False,
-    )
-
-    for column, key in enumerate(ordered_keys):
-        items = groups[key]
-
-        for row in range(max_rows):
-            axis = axes[row, column]
-
-            if row >= len(items):
-                axis.set_visible(False)
-                continue
-
-            joint_index, label = items[row]
-
-            axis.plot(
-                gt[:, joint_index],
-                linewidth=1.2,
-                label="ground truth",
-            )
-            axis.plot(
-                pred[:, joint_index],
-                linewidth=1.0,
-                alpha=0.85,
-                label="prediction",
-            )
-
-            inference_steps = np.arange(
-                0,
-                len(gt),
-                execution_horizon,
-            )
-
-            # Dashed vertical line marks the beginning of each predicted chunk.
-            for inference_step in inference_steps:
-                axis.axvline(
-                    inference_step,
-                    color="red",
-                    linestyle="--",
-                    linewidth=0.8,
-                    alpha=0.30,
-                    label="chunk boundary" if inference_step == 0 else None,
-                )
-
-            # Red dots reproduce the inference markers from open_loop_eval.py.
-            axis.scatter(
-                inference_steps,
-                gt[inference_steps, joint_index],
-                color="red",
-                s=16,
-                zorder=5,
-                label="inference point",
-            )
-
-            # Centre each joint independently but use the same total span.
-            joint_centre = (
-                joint_minimums[joint_index] + joint_maximums[joint_index]
-            ) / 2.0
-
-            axis.set_ylim(
-                joint_centre - common_y_span / 2.0,
-                joint_centre + common_y_span / 2.0,
-            )
-            axis.yaxis.set_major_locator(MultipleLocator(tick_step))
-
-            axis.set_title(label, fontsize=9)
-            axis.grid(alpha=0.2)
-
-    axes[0, 0].legend(fontsize=8)
-    figure.suptitle(
-        f"{title}\nCommon y-axis span: {common_y_span:.3f} joint units",
-    )
-    figure.subplots_adjust(hspace=0.38, wspace=0.30)
-    figure.savefig(path, dpi=150, bbox_inches="tight")
+    flat_axes[0].legend(fontsize=8)
+    figure.suptitle(title)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
     plt.close(figure)
 
 
@@ -232,6 +106,7 @@ def plot_error_heatmap(error: np.ndarray, labels: list[str], title: str, path: P
     figure.savefig(path, dpi=160)
     plt.close(figure)
 
+
 def plot_checkpoint_progress(summary: pd.DataFrame, path: Path) -> None:
     figure, axis = plt.subplots(figsize=(10, 5))
     axis.plot(summary["checkpoint_step"], summary["mae"], marker="o", label="MAE")
@@ -241,72 +116,6 @@ def plot_checkpoint_progress(summary: pd.DataFrame, path: Path) -> None:
     axis.grid(alpha=0.25)
     axis.legend()
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
-    plt.close(figure)
-
-def plot_checkpoint_metric_summary(summary: pd.DataFrame, path: Path) -> None:
-    steps = summary["checkpoint_step"]
-
-    figure, axes = plt.subplots(
-        2,
-        2,
-        figsize=(13, 9),
-        sharex=True,
-    )
-
-    magnitude_axis = axes[0, 0]
-    magnitude_axis.plot(steps, summary["mae"], marker="o", color="tab:blue", label="MAE")
-    magnitude_axis.plot(steps, summary["rmse"], marker="o", color="tab:orange", label="RMSE")
-    magnitude_axis.plot(
-        steps,
-        summary["median_absolute_error"],
-        marker="o",
-        color="tab:cyan",
-        label="Median absolute error",
-    )
-    magnitude_axis.plot(
-        steps,
-        summary["p95_absolute_error"],
-        marker="o",
-        color="tab:green",
-        label="95th-percentile absolute error",
-    )
-    magnitude_axis.set_ylabel("Action error")
-    magnitude_axis.set_title("Aggregate error magnitude")
-    magnitude_axis.legend(fontsize=8)
-
-    mse_axis = axes[0, 1]
-    mse_axis.plot(steps, summary["mse"], marker="o", color="tab:red", label="MSE")
-    mse_axis.set_ylabel("Squared action error")
-    mse_axis.set_title("Aggregate MSE")
-    mse_axis.legend()
-
-    bias_axis = axes[1, 0]
-    bias_axis.plot(steps, summary["bias"], marker="o", color="tab:purple", label="Bias")
-    bias_axis.axhline(0, color="black", linewidth=0.8, alpha=0.5)
-    bias_axis.set_ylabel("Signed action error")
-    bias_axis.set_title("Aggregate prediction bias")
-    bias_axis.legend()
-
-    maximum_axis = axes[1, 1]
-    maximum_axis.plot(
-        steps,
-        summary["max_absolute_error"],
-        marker="o",
-        color="tab:brown",
-        label="Maximum absolute error",
-    )
-    maximum_axis.set_ylabel("Action error")
-    maximum_axis.set_title("Worst observed error")
-    maximum_axis.legend()
-
-    for axis in axes.flat:
-        axis.set_xlabel("Checkpoint step")
-        axis.set_xticks(steps)
-        axis.grid(alpha=0.25)
-
-    figure.suptitle("Aggregate validation metrics across checkpoints")
-    figure.tight_layout(rect=(0, 0, 1, 0.96))
     figure.savefig(path, dpi=180)
     plt.close(figure)
 
@@ -433,8 +242,6 @@ def main() -> None:
                     labels,
                     f"Checkpoint {step}, trajectory {traj_id}",
                     checkpoint_dir / f"trajectory_{traj_id:04d}_joints.png",
-                    args.execution_horizon,
-
                 )
                 plot_error_heatmap(
                     error,
@@ -452,8 +259,6 @@ def main() -> None:
                 "frames": len(combined),
                 "mae": float(np.mean(np.abs(combined))),
                 "mse": checkpoint_mse,
-                "median_absolute_error": float(np.median(np.abs(combined))),
-                "p95_absolute_error": float(np.percentile(np.abs(combined), 95)),
                 "rmse": float(np.sqrt(checkpoint_mse)),
                 "bias": float(np.mean(combined)),
                 "max_absolute_error": float(np.max(np.abs(combined))),
@@ -488,10 +293,6 @@ def main() -> None:
     joints.to_csv(output_dir / "metrics_per_joint.csv", index=False)
 
     plot_checkpoint_progress(summary, output_dir / "checkpoint_error_progress.png")
-    plot_checkpoint_metric_summary(
-        summary,
-        output_dir / "checkpoint_metric_summary.png",
-    )
     plot_joint_checkpoint_heatmap(joints, canonical_labels or [], output_dir / "joint_error_by_checkpoint.png")
     best_step = int(summary.loc[summary["mae"].idxmin(), "checkpoint_step"])
     plot_best_checkpoint_joints(

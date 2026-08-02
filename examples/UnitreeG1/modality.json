@@ -14,6 +14,9 @@
     "video": {
         "ego_view": {
             "original_key": "observation.images.ego_view"
+        },
+        "depth_gray_view": {
+            "original_key": "observation.images.depth_gray_view"
         }
     },
     "annotation": {
