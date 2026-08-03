@@ -54,17 +54,17 @@ def main() -> None:
 
     figure, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
 
-    axes[0].plot(frame["step"], frame["loss"], alpha=0.30, label="logged loss")
-    axes[0].plot(frame["step"], frame["loss_smoothed"], linewidth=2, label=f"{window}-point mean")
+    axes[0].plot(frame["step"], frame["loss"], alpha=0.30, linewidth=1, label="logged loss")
+    axes[0].plot(frame["step"], frame["loss_smoothed"], linewidth=1.2, label=f"{window}-point mean")
     axes[0].set_ylabel("Training loss")
     axes[0].legend()
 
     if "grad_norm" in frame:
-        axes[1].plot(frame["step"], frame["grad_norm"], color="tab:orange")
+        axes[1].plot(frame["step"], frame["grad_norm"], color="tab:orange", linewidth=1.0, alpha=0.65)
     axes[1].set_ylabel("Gradient norm")
 
     if "learning_rate" in frame:
-        axes[2].plot(frame["step"], frame["learning_rate"], color="tab:green")
+        axes[2].plot(frame["step"], frame["learning_rate"], color="tab:green", linewidth=1)
     axes[2].set_ylabel("Learning rate")
     axes[2].set_xlabel("Optimizer step")
 

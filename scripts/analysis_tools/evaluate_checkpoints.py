@@ -27,17 +27,74 @@ from gr00t.policy.gr00t_policy import Gr00tPolicy
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--dataset-path", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        required=True,
+        help="Held-out validation dataset path.",
+    )
+    parser.add_argument(
+        "--train-dataset-path",
+        type=Path,
+        help="Optional dataset containing training episodes to use as a fixed train probe.",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--embodiment-tag", default="NEW_EMBODIMENT")
     parser.add_argument("--traj-ids", type=int, nargs="*")
+    parser.add_argument(
+        "--train-traj-ids",
+        type=int,
+        nargs="*",
+        help="Specific episode indices from --train-dataset-path to use for the train probe.",
+    )
+    parser.add_argument(
+        "--train-probe-episodes",
+        type=int,
+        default=0,
+        help="Seeded number of train episodes to probe; 0 uses all unless --train-traj-ids is set.",
+    )
+    parser.add_argument("--train-probe-seed", type=int, default=42)
     parser.add_argument("--checkpoint-steps", type=int, nargs="*")
     parser.add_argument("--steps", type=int, default=0, help="0 evaluates each complete episode")
     parser.add_argument("--execution-horizon", type=int, default=16)
     parser.add_argument("--denoising-steps", type=int, default=4)
     parser.add_argument("--modality-keys", nargs="+", default=None)
     parser.add_argument("--skip-trajectory-plots", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.train_dataset_path is None and (args.train_traj_ids or args.train_probe_episodes):
+        parser.error(
+            "--train-traj-ids and --train-probe-episodes require --train-dataset-path"
+        )
+    return args
+
+
+def select_trajectory_ids(
+    dataset_size: int,
+    selected_ids: list[int] | None,
+    episode_count: int = 0,
+    seed: int = 42,
+) -> list[int]:
+    if episode_count < 0:
+        raise ValueError(f"Episode count must be non-negative, got {episode_count}")
+
+    if selected_ids:
+        trajectory_ids = list(selected_ids)
+    elif episode_count:
+        if episode_count > dataset_size:
+            raise ValueError(
+                f"Requested {episode_count} probe episodes from a dataset with {dataset_size} episodes"
+            )
+        rng = np.random.default_rng(seed)
+        trajectory_ids = sorted(rng.choice(dataset_size, size=episode_count, replace=False).tolist())
+    else:
+        trajectory_ids = list(range(dataset_size))
+
+    invalid_ids = [traj_id for traj_id in trajectory_ids if not 0 <= traj_id < dataset_size]
+    if invalid_ids:
+        raise IndexError(
+            f"Trajectory IDs {invalid_ids} are outside dataset range 0..{dataset_size - 1}"
+        )
+    return trajectory_ids
 
 
 def checkpoint_step(path: Path) -> int:
@@ -232,10 +289,37 @@ def plot_error_heatmap(error: np.ndarray, labels: list[str], title: str, path: P
     figure.savefig(path, dpi=160)
     plt.close(figure)
 
+
+def summary_splits(summary: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    if "split" not in summary.columns:
+        return [("validation", summary)]
+    return [
+        (str(split), split_summary.sort_values("checkpoint_step"))
+        for split, split_summary in summary.groupby("split", sort=False)
+    ]
+
+
+def split_label(split: str) -> str:
+    return split.replace("_", " ").title()
+
+
 def plot_checkpoint_progress(summary: pd.DataFrame, path: Path) -> None:
     figure, axis = plt.subplots(figsize=(10, 5))
-    axis.plot(summary["checkpoint_step"], summary["mae"], marker="o", label="MAE")
-    axis.plot(summary["checkpoint_step"], summary["rmse"], marker="o", label="RMSE")
+    for split, split_summary in summary_splits(summary):
+        label = split_label(split)
+        axis.plot(
+            split_summary["checkpoint_step"],
+            split_summary["mae"],
+            marker="o",
+            label=f"{label} MAE",
+        )
+        axis.plot(
+            split_summary["checkpoint_step"],
+            split_summary["rmse"],
+            marker="o",
+            linestyle="--",
+            label=f"{label} RMSE",
+        )
     axis.set_xlabel("Checkpoint step")
     axis.set_ylabel("Unnormalized action error")
     axis.grid(alpha=0.25)
@@ -244,9 +328,8 @@ def plot_checkpoint_progress(summary: pd.DataFrame, path: Path) -> None:
     figure.savefig(path, dpi=180)
     plt.close(figure)
 
-def plot_checkpoint_metric_summary(summary: pd.DataFrame, path: Path) -> None:
-    steps = summary["checkpoint_step"]
 
+def plot_checkpoint_metric_summary(summary: pd.DataFrame, path: Path) -> None:
     figure, axes = plt.subplots(
         2,
         2,
@@ -255,57 +338,67 @@ def plot_checkpoint_metric_summary(summary: pd.DataFrame, path: Path) -> None:
     )
 
     magnitude_axis = axes[0, 0]
-    magnitude_axis.plot(steps, summary["mae"], marker="o", color="tab:blue", label="MAE")
-    magnitude_axis.plot(steps, summary["rmse"], marker="o", color="tab:orange", label="RMSE")
-    magnitude_axis.plot(
-        steps,
-        summary["median_absolute_error"],
-        marker="o",
-        color="tab:cyan",
-        label="Median absolute error",
-    )
-    magnitude_axis.plot(
-        steps,
-        summary["p95_absolute_error"],
-        marker="o",
-        color="tab:green",
-        label="95th-percentile absolute error",
-    )
+    mse_axis = axes[0, 1]
+    bias_axis = axes[1, 0]
+    maximum_axis = axes[1, 1]
+
+    all_steps = sorted(summary["checkpoint_step"].unique())
+    for split, split_summary in summary_splits(summary):
+        steps = split_summary["checkpoint_step"]
+        label = split_label(split)
+        magnitude_axis.plot(steps, split_summary["mae"], marker="o", label=f"{label} MAE")
+        magnitude_axis.plot(
+            steps,
+            split_summary["rmse"],
+            marker="o",
+            linestyle="--",
+            label=f"{label} RMSE",
+        )
+        magnitude_axis.plot(
+            steps,
+            split_summary["median_absolute_error"],
+            marker="o",
+            linestyle=":",
+            label=f"{label} median absolute error",
+        )
+        magnitude_axis.plot(
+            steps,
+            split_summary["p95_absolute_error"],
+            marker="o",
+            linestyle="-.",
+            label=f"{label} 95th-percentile absolute error",
+        )
+        mse_axis.plot(steps, split_summary["mse"], marker="o", label=label)
+        bias_axis.plot(steps, split_summary["bias"], marker="o", label=label)
+        maximum_axis.plot(
+            steps,
+            split_summary["max_absolute_error"],
+            marker="o",
+            label=label,
+        )
     magnitude_axis.set_ylabel("Action error")
     magnitude_axis.set_title("Aggregate error magnitude")
     magnitude_axis.legend(fontsize=8)
 
-    mse_axis = axes[0, 1]
-    mse_axis.plot(steps, summary["mse"], marker="o", color="tab:red", label="MSE")
     mse_axis.set_ylabel("Squared action error")
     mse_axis.set_title("Aggregate MSE")
     mse_axis.legend()
 
-    bias_axis = axes[1, 0]
-    bias_axis.plot(steps, summary["bias"], marker="o", color="tab:purple", label="Bias")
     bias_axis.axhline(0, color="black", linewidth=0.8, alpha=0.5)
     bias_axis.set_ylabel("Signed action error")
     bias_axis.set_title("Aggregate prediction bias")
     bias_axis.legend()
 
-    maximum_axis = axes[1, 1]
-    maximum_axis.plot(
-        steps,
-        summary["max_absolute_error"],
-        marker="o",
-        color="tab:brown",
-        label="Maximum absolute error",
-    )
     maximum_axis.set_ylabel("Action error")
     maximum_axis.set_title("Worst observed error")
     maximum_axis.legend()
 
     for axis in axes.flat:
         axis.set_xlabel("Checkpoint step")
-        axis.set_xticks(steps)
+        axis.set_xticks(all_steps)
         axis.grid(alpha=0.25)
 
-    figure.suptitle("Aggregate validation metrics across checkpoints")
+    figure.suptitle("Aggregate train-probe and validation metrics across checkpoints")
     figure.tight_layout(rect=(0, 0, 1, 0.96))
     figure.savefig(path, dpi=180)
     plt.close(figure)
@@ -342,6 +435,133 @@ def plot_best_checkpoint_joints(joints: pd.DataFrame, best_step: int, labels: li
     plt.close(figure)
 
 
+def evaluate_probe(
+    *,
+    policy: Gr00tPolicy,
+    loader: LeRobotEpisodeLoader,
+    trajectory_ids: list[int],
+    split: str,
+    checkpoint_step_value: int,
+    plot_dir: Path,
+    embodiment_tag: EmbodimentTag,
+    action_keys: list[str],
+    modality_keys: list[str] | None,
+    steps: int,
+    execution_horizon: int,
+    skip_trajectory_plots: bool,
+    canonical_labels: list[str] | None,
+) -> tuple[list[dict], dict, list[dict], list[str]]:
+    episode_rows = []
+    joint_rows = []
+    checkpoint_errors = []
+    labels = None
+
+    for traj_id in trajectory_ids:
+        trajectory = loader[traj_id]
+        labels = action_labels(trajectory, action_keys)
+        if canonical_labels is None:
+            canonical_labels = labels
+        elif labels != canonical_labels:
+            raise RuntimeError(
+                "Action dimensions changed between datasets, checkpoints, or trajectories"
+            )
+
+        captured: dict[str, np.ndarray] = {}
+
+        def capture_plot(**kwargs) -> None:
+            captured["ground_truth"] = np.asarray(kwargs["gt_action_across_time"])
+            captured["prediction"] = np.asarray(kwargs["pred_action_across_time"])
+
+        original_plotter = open_loop_eval.plot_trajectory_results
+        open_loop_eval.plot_trajectory_results = capture_plot
+        try:
+            evaluation_steps = steps if steps > 0 else len(trajectory)
+            mse, mae = open_loop_eval.evaluate_single_trajectory(
+                policy=policy,
+                loader=loader,
+                traj_id=traj_id,
+                embodiment_tag=embodiment_tag,
+                modality_keys=modality_keys,
+                steps=evaluation_steps,
+                execution_horizon=execution_horizon,
+                save_plot_path=None,
+            )
+        finally:
+            open_loop_eval.plot_trajectory_results = original_plotter
+
+        gt = captured["ground_truth"]
+        pred = captured["prediction"]
+        error = pred - gt
+        checkpoint_errors.append(error)
+        episode_rows.append(
+            {
+                "split": split,
+                "checkpoint_step": checkpoint_step_value,
+                "trajectory": traj_id,
+                "frames": len(error),
+                "mae": mae,
+                "mse": mse,
+                "rmse": float(np.sqrt(mse)),
+                "bias": float(np.mean(error)),
+                "max_absolute_error": float(np.max(np.abs(error))),
+            }
+        )
+
+        if not skip_trajectory_plots:
+            plot_trajectory(
+                gt,
+                pred,
+                labels,
+                f"{split_label(split)}: checkpoint {checkpoint_step_value}, trajectory {traj_id}",
+                plot_dir / f"trajectory_{traj_id:04d}_joints.png",
+                execution_horizon,
+            )
+            plot_error_heatmap(
+                error,
+                labels,
+                f"{split_label(split)} absolute error: checkpoint {checkpoint_step_value}, trajectory {traj_id}",
+                plot_dir / f"trajectory_{traj_id:04d}_error_heatmap.png",
+            )
+
+    if not checkpoint_errors:
+        raise ValueError(f"The {split} probe contains no episodes")
+
+    combined = np.concatenate(checkpoint_errors, axis=0)
+    checkpoint_mse = float(np.mean(combined**2))
+    checkpoint_row = {
+        "split": split,
+        "checkpoint_step": checkpoint_step_value,
+        "episodes": len(checkpoint_errors),
+        "frames": len(combined),
+        "mae": float(np.mean(np.abs(combined))),
+        "mse": checkpoint_mse,
+        "median_absolute_error": float(np.median(np.abs(combined))),
+        "p95_absolute_error": float(np.percentile(np.abs(combined), 95)),
+        "rmse": float(np.sqrt(checkpoint_mse)),
+        "bias": float(np.mean(combined)),
+        "max_absolute_error": float(np.max(np.abs(combined))),
+    }
+
+    for index, label in enumerate(labels or []):
+        values = combined[:, index]
+        mse = float(np.mean(values**2))
+        joint_rows.append(
+            {
+                "split": split,
+                "checkpoint_step": checkpoint_step_value,
+                "joint": label,
+                "mae": float(np.mean(np.abs(values))),
+                "mse": mse,
+                "rmse": float(np.sqrt(mse)),
+                "bias": float(np.mean(values)),
+                "max_absolute_error": float(np.max(np.abs(values))),
+            }
+        )
+
+    assert canonical_labels is not None
+    return episode_rows, checkpoint_row, joint_rows, canonical_labels
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -368,141 +588,101 @@ def main() -> None:
         )
         policy.model.action_head.num_inference_timesteps = args.denoising_steps
         modality = policy.get_modality_config()
-        loader = LeRobotEpisodeLoader(dataset_path=str(args.dataset_path), modality_configs=modality)
-        traj_ids = args.traj_ids if args.traj_ids else list(range(len(loader)))
-        action_keys = modality["action"].modality_keys if args.modality_keys is None else args.modality_keys
+        action_keys = (
+            modality["action"].modality_keys
+            if args.modality_keys is None
+            else args.modality_keys
+        )
+        probe_specs = [("validation", args.dataset_path, args.traj_ids, 0, 0)]
+        if args.train_dataset_path is not None:
+            probe_specs.append(
+                (
+                    "train_probe",
+                    args.train_dataset_path,
+                    args.train_traj_ids,
+                    args.train_probe_episodes,
+                    args.train_probe_seed,
+                )
+            )
 
-        checkpoint_errors = []
-        labels = None
+        for split, dataset_path, selected_ids, episode_count, seed in probe_specs:
+            loader = LeRobotEpisodeLoader(
+                dataset_path=str(dataset_path), modality_configs=modality
+            )
+            trajectory_ids = select_trajectory_ids(
+                len(loader), selected_ids, episode_count=episode_count, seed=seed
+            )
+            plot_dir = checkpoint_dir if split == "validation" else checkpoint_dir / split
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(
+                "Evaluating %s on %d episode(s) from %s: %s",
+                split,
+                len(trajectory_ids),
+                dataset_path,
+                trajectory_ids,
+            )
 
-        for traj_id in traj_ids:
-            if not 0 <= traj_id < len(loader):
-                raise IndexError(f"Trajectory {traj_id} is outside dataset range 0..{len(loader) - 1}")
-
-            trajectory = loader[traj_id]
-            labels = action_labels(trajectory, action_keys)
-            if canonical_labels is None:
-                canonical_labels = labels
-            elif labels != canonical_labels:
-                raise RuntimeError("Action dimensions changed between checkpoints or trajectories")
-
-            captured: dict[str, np.ndarray] = {}
-
-            def capture_plot(**kwargs) -> None:
-                captured["ground_truth"] = np.asarray(kwargs["gt_action_across_time"])
-                captured["prediction"] = np.asarray(kwargs["pred_action_across_time"])
-
-            original_plotter = open_loop_eval.plot_trajectory_results
-            open_loop_eval.plot_trajectory_results = capture_plot
-            try:
-                evaluation_steps = args.steps if args.steps > 0 else len(trajectory)
-                mse, mae = open_loop_eval.evaluate_single_trajectory(
+            probe_episode_rows, checkpoint_row, probe_joint_rows, canonical_labels = (
+                evaluate_probe(
                     policy=policy,
                     loader=loader,
-                    traj_id=traj_id,
+                    trajectory_ids=trajectory_ids,
+                    split=split,
+                    checkpoint_step_value=step,
+                    plot_dir=plot_dir,
                     embodiment_tag=embodiment_tag,
+                    action_keys=action_keys,
                     modality_keys=args.modality_keys,
-                    steps=evaluation_steps,
+                    steps=args.steps,
                     execution_horizon=args.execution_horizon,
-                    save_plot_path=None,
+                    skip_trajectory_plots=args.skip_trajectory_plots,
+                    canonical_labels=canonical_labels,
                 )
-            finally:
-                open_loop_eval.plot_trajectory_results = original_plotter
-
-            gt = captured["ground_truth"]
-            pred = captured["prediction"]
-            error = pred - gt
-            checkpoint_errors.append(error)
-            episode_rows.append(
-                {
-                    "checkpoint_step": step,
-                    "trajectory": traj_id,
-                    "frames": len(error),
-                    "mae": mae,
-                    "mse": mse,
-                    "rmse": float(np.sqrt(mse)),
-                    "bias": float(np.mean(error)),
-                    "max_absolute_error": float(np.max(np.abs(error))),
-                }
             )
+            episode_rows.extend(probe_episode_rows)
+            checkpoint_rows.append(checkpoint_row)
+            joint_rows.extend(probe_joint_rows)
+            del loader
 
-            if not args.skip_trajectory_plots:
-                plot_trajectory(
-                    gt,
-                    pred,
-                    labels,
-                    f"Checkpoint {step}, trajectory {traj_id}",
-                    checkpoint_dir / f"trajectory_{traj_id:04d}_joints.png",
-                    args.execution_horizon,
-
-                )
-                plot_error_heatmap(
-                    error,
-                    labels,
-                    f"Absolute error: checkpoint {step}, trajectory {traj_id}",
-                    checkpoint_dir / f"trajectory_{traj_id:04d}_error_heatmap.png",
-                )
-
-        combined = np.concatenate(checkpoint_errors, axis=0)
-        checkpoint_mse = float(np.mean(combined**2))
-        checkpoint_rows.append(
-            {
-                "checkpoint_step": step,
-                "episodes": len(checkpoint_errors),
-                "frames": len(combined),
-                "mae": float(np.mean(np.abs(combined))),
-                "mse": checkpoint_mse,
-                "median_absolute_error": float(np.median(np.abs(combined))),
-                "p95_absolute_error": float(np.percentile(np.abs(combined), 95)),
-                "rmse": float(np.sqrt(checkpoint_mse)),
-                "bias": float(np.mean(combined)),
-                "max_absolute_error": float(np.max(np.abs(combined))),
-            }
-        )
-
-        for index, label in enumerate(labels or []):
-            values = combined[:, index]
-            mse = float(np.mean(values**2))
-            joint_rows.append(
-                {
-                    "checkpoint_step": step,
-                    "joint": label,
-                    "mae": float(np.mean(np.abs(values))),
-                    "mse": mse,
-                    "rmse": float(np.sqrt(mse)),
-                    "bias": float(np.mean(values)),
-                    "max_absolute_error": float(np.max(np.abs(values))),
-                }
-            )
-
-        del loader, policy
+        del policy
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     episodes = pd.DataFrame(episode_rows)
-    summary = pd.DataFrame(checkpoint_rows).sort_values("checkpoint_step")
+    summary = pd.DataFrame(checkpoint_rows).sort_values(["split", "checkpoint_step"])
     joints = pd.DataFrame(joint_rows)
     episodes.to_csv(output_dir / "metrics_per_episode.csv", index=False)
     summary.to_csv(output_dir / "metrics_by_checkpoint.csv", index=False)
     joints.to_csv(output_dir / "metrics_per_joint.csv", index=False)
 
     plot_checkpoint_progress(summary, output_dir / "checkpoint_error_progress.png")
+    checkpoint_summary_csv = output_dir / "checkpoint_metric_summary.csv"
+    summary.to_csv(checkpoint_summary_csv, index=False)
     plot_checkpoint_metric_summary(
         summary,
         output_dir / "checkpoint_metric_summary.png",
     )
-    plot_joint_checkpoint_heatmap(joints, canonical_labels or [], output_dir / "joint_error_by_checkpoint.png")
-    best_step = int(summary.loc[summary["mae"].idxmin(), "checkpoint_step"])
+    validation_summary = summary[summary["split"] == "validation"]
+    validation_joints = joints[joints["split"] == "validation"]
+    plot_joint_checkpoint_heatmap(
+        validation_joints,
+        canonical_labels or [],
+        output_dir / "joint_error_by_checkpoint.png",
+    )
+    best_step = int(
+        validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
+    )
     plot_best_checkpoint_joints(
-        joints,
+        validation_joints,
         best_step,
         canonical_labels or [],
         output_dir / "best_checkpoint_joint_mae.png",
     )
 
     print(summary.to_string(index=False))
-    print(f"\nLowest held-out MAE: checkpoint {best_step}")
+    print(f"\nLowest validation MAE: checkpoint {best_step}")
+    print(f"Checkpoint summary CSV: {checkpoint_summary_csv}")
     print(f"Results: {output_dir}")
 
 
