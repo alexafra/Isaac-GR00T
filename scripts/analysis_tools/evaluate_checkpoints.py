@@ -244,15 +244,15 @@ def plot_trajectory(
                     label="chunk boundary" if inference_step == 0 else None,
                 )
 
-            # Red dots reproduce the inference markers from open_loop_eval.py.
-            axis.scatter(
-                inference_steps,
-                gt[inference_steps, joint_index],
-                color="red",
-                s=16,
-                zorder=5,
-                label="inference point",
-            )
+            # # Red dots reproduce the inference markers from open_loop_eval.py.
+            # axis.scatter(
+            #     inference_steps,
+            #     gt[inference_steps, joint_index],
+            #     color="red",
+            #     s=16,
+            #     zorder=5,
+            #     label="inference point",
+            # )
 
             # Centre each joint independently but use the same total span.
             joint_centre = (
