@@ -112,6 +112,34 @@ class TestAlbumentationsTransforms:
         result = self.eval_transform(image=np.array(pil_img))
         return torch.from_numpy(result["image"]).permute(2, 0, 1)
 
+    def test_color_jitter_can_be_skipped_for_depth_images(self):
+        train_transform, _ = build_image_transformations_albumentations(
+            image_target_size=(16, 16),
+            image_crop_size=(16, 16),
+            random_rotation_angle=None,
+            color_jitter_params={
+                "brightness": (0.5, 0.5),
+                "contrast": 0.0,
+                "saturation": 0.0,
+                "hue": 0.0,
+            },
+            shortest_image_edge=None,
+            crop_fraction=None,
+        )
+
+        image = Image.fromarray(np.full((16, 16, 3), 100, dtype=np.uint8))
+
+        color_images, replay = apply_with_replay(train_transform, [image])
+        depth_images, _ = apply_with_replay(
+            train_transform,
+            [image],
+            replay=replay,
+            skip_color_jitter=True,
+        )
+
+        assert torch.all(color_images[0] == 50)
+        assert torch.all(depth_images[0] == 100)
+
     def test_letterbox_pad_is_not_in_transform_pipeline(self):
         transform_names = [
             type(transform).__name__

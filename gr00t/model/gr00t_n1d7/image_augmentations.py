@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from typing import Sequence
 import warnings
 
@@ -23,7 +24,30 @@ import torch
 import torchvision.transforms.v2 as transforms
 
 
-def apply_with_replay(transform, images, masks=None, replay=None):
+def _replay_without_color_jitter(replay):
+    """Copy replay data while disabling only ColorJitter transforms."""
+    filtered_replay = deepcopy(replay)
+    pending = [filtered_replay]
+
+    while pending:
+        transform_config = pending.pop()
+        pending.extend(transform_config.get("transforms", []))
+
+        transform_name = transform_config.get("__class_fullname__", "").rsplit(".", 1)[-1]
+        if transform_name == "ColorJitter":
+            transform_config["applied"] = False
+            transform_config["params"] = None
+
+    return filtered_replay
+
+
+def apply_with_replay(
+    transform,
+    images,
+    masks=None,
+    replay=None,
+    skip_color_jitter=False,
+):
     """
     Apply albumentations transforms to multiple images with replay functionality.
     When masks are provided, mask-based transforms run per-frame before the main transform.
@@ -33,6 +57,7 @@ def apply_with_replay(transform, images, masks=None, replay=None):
         images: List of PIL Images to transform
         masks: Optional list of masks aligned with images (H, W)
         replay: Optional replay data for consistent transforms. If None, creates new replay.
+        skip_color_jitter: Disable ColorJitter while retaining replayed geometric transforms.
 
     Returns:
         tuple: (transformed_tensors_list, replay_data)
@@ -41,6 +66,7 @@ def apply_with_replay(transform, images, masks=None, replay=None):
     """
     transformed_tensors = []
     current_replay = replay
+    color_free_replay = None
 
     # Check if transform supports replay (ReplayCompose)
     has_replay = hasattr(transform, "replay")
@@ -66,16 +92,28 @@ def apply_with_replay(transform, images, masks=None, replay=None):
                 img_array = result["image"]
 
         if has_replay:
-            if current_replay is None:
-                # First image - create replay data
+            generated_replay = current_replay is None
+
+            if generated_replay:
+                # Generate all random parameters once. If this is a depth image,
+                # the initially augmented result is discarded below.
                 augmented_image = transform(image=img_array)
                 current_replay = augmented_image["replay"]
+
+            if skip_color_jitter:
+                if color_free_replay is None:
+                    color_free_replay = _replay_without_color_jitter(current_replay)
+                replay_for_image = color_free_replay
             else:
-                # Subsequent images - use replay for consistent transforms
+                replay_for_image = current_replay
+
+            # A newly generated non-depth replay has already been applied. Depth images and
+            # subsequent images must explicitly replay the selected transform configuration.
+            if skip_color_jitter or not generated_replay:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=UserWarning)
                     augmented_image = transform.replay(
-                        image=img_array, saved_augmentations=current_replay
+                        image=img_array, saved_augmentations=replay_for_image
                     )
         else:
             # Regular Compose transform - no replay functionality

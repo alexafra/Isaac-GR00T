@@ -723,7 +723,11 @@ class Gr00tN1d7Processor(BaseProcessor):
 
                 # Apply transforms with replay for consistency
                 transformed_images, replay = apply_with_replay(
-                    image_transform, view_images, view_masks, replay
+                    image_transform,
+                    view_images,
+                    masks=view_masks,
+                    replay=replay,
+                    skip_color_jitter="depth" in view.lower(),
                 )
                 temporal_stacked_images[view] = torch.stack(transformed_images)  # (T, C, H, W)
         else:
