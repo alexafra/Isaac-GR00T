@@ -52,11 +52,43 @@ def main() -> None:
     frame["loss_smoothed"] = frame["loss"].rolling(window, min_periods=1).mean()
     frame.to_csv(output_dir / "training_history.csv", index=False)
 
+    validation_rows = [row for row in history if "step" in row and "eval_loss" in row]
+    validation_frame = (
+        pd.DataFrame(validation_rows).sort_values("step").drop_duplicates("step", keep="last")
+        if validation_rows
+        else None
+    )
+
     figure, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
 
-    axes[0].plot(frame["step"], frame["loss"], alpha=0.30, linewidth=1, label="logged loss")
-    axes[0].plot(frame["step"], frame["loss_smoothed"], linewidth=1.2, label=f"{window}-point mean")
-    axes[0].set_ylabel("Training loss")
+    axes[0].plot(
+        frame["step"],
+        frame["loss"],
+        color="tab:gray",
+        linestyle="--",
+        alpha=0.35,
+        linewidth=1,
+        label="Training loss",
+    )
+    axes[0].plot(
+        frame["step"],
+        frame["loss_smoothed"],
+        color="tab:blue",
+        linestyle="--",
+        linewidth=1.8,
+        label=f"Training {window}-point mean",
+    )
+    if validation_frame is not None:
+        axes[0].plot(
+            validation_frame["step"],
+            validation_frame["eval_loss"],
+            color="tab:orange",
+            linestyle="-",
+            marker="o",
+            linewidth=1.8,
+            label="Validation loss",
+        )
+    axes[0].set_ylabel("Loss")
     axes[0].legend()
 
     if "grad_norm" in frame:
