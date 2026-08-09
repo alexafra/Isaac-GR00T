@@ -127,6 +127,40 @@ class TestPolicyServerClient:
         assert isinstance(config["state"], ModalityConfig)
         assert config["state"].modality_keys == ["joint_pos"]
 
+    def test_get_policy_metadata(self, server_client):
+        client, _, _ = server_client
+
+        metadata = client.get_policy_metadata()
+
+        assert metadata == {"protocol_version": 1, "policy_class": "MockPolicy"}
+
+    def test_nested_policy_metadata_roundtrip(self, server_client):
+        client, server, _ = server_client
+        server.policy_metadata["dataset_contract"] = {
+            "fps": 30.0,
+            "joint_names": ["left", "right"],
+        }
+
+        metadata = client.get_policy_metadata()
+
+        assert metadata["dataset_contract"] == {
+            "fps": 30.0,
+            "joint_names": ["left", "right"],
+        }
+
+    def test_reserved_policy_metadata_cannot_be_overridden(self):
+        port = _find_free_port()
+        with PolicyServer(
+            MockPolicy(),
+            host="127.0.0.1",
+            port=port,
+            policy_metadata={"protocol_version": 999, "policy_class": "forged"},
+        ) as server:
+            assert server._handle_policy_metadata() == {
+                "protocol_version": 1,
+                "policy_class": "MockPolicy",
+            }
+
     def test_kill_server(self):
         """Test that kill_server stops the server loop."""
         port = _find_free_port()

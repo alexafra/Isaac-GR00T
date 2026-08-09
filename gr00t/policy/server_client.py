@@ -158,6 +158,7 @@ class PolicyServer:
         host: str = "*",
         port: int = 5555,
         api_token: str = None,
+        policy_metadata: dict[str, Any] | None = None,
     ):
         self.policy = policy
         self.host = host
@@ -169,6 +170,11 @@ class PolicyServer:
         self.socket.bind(f"tcp://{host}:{port}")
         self._endpoints: dict[str, EndpointHandler] = {}
         self.api_token = api_token
+        self.policy_metadata = {
+            **(policy_metadata or {}),
+            "protocol_version": 1,
+            "policy_class": type(policy).__name__,
+        }
 
         # Register the ping endpoint by default
         self.register_endpoint("ping", self._handle_ping, requires_input=False)
@@ -179,6 +185,9 @@ class PolicyServer:
             "get_modality_config",
             getattr(self.policy, "get_modality_config", lambda: {}),
             requires_input=False,
+        )
+        self.register_endpoint(
+            "get_policy_metadata", self._handle_policy_metadata, requires_input=False
         )
 
     def _kill_server(self):
@@ -218,6 +227,11 @@ class PolicyServer:
         Simple ping handler that returns a success message.
         """
         return {"status": "ok", "message": "Server is running"}
+
+    def _handle_policy_metadata(self) -> dict[str, Any]:
+        """Return the explicit deployment identity supplied by the server entrypoint."""
+
+        return dict(self.policy_metadata)
 
     def register_endpoint(self, name: str, handler: Callable, requires_input: bool = True):
         """
@@ -397,6 +411,9 @@ class PolicyClient(BasePolicy):
 
     def get_modality_config(self) -> dict[str, ModalityConfig]:
         return self.call_endpoint("get_modality_config", requires_input=False)
+
+    def get_policy_metadata(self) -> dict[str, Any]:
+        return self.call_endpoint("get_policy_metadata", requires_input=False)
 
     def check_observation(self, observation: dict[str, Any]) -> None:
         raise NotImplementedError(

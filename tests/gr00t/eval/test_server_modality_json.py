@@ -16,7 +16,15 @@
 import json
 
 from gr00t.data.types import ModalityConfig
-from gr00t.eval.run_gr00t_server import _load_json_modality_configs
+import gr00t.eval.run_gr00t_server as server_module
+from gr00t.eval.run_gr00t_server import (
+    ServerConfig,
+    _load_checkpoint_action_output_contract,
+    _load_deployment_dataset_contract,
+    _load_json_modality_configs,
+    _verify_checkpoint_dataset_path,
+    main,
+)
 import pytest
 
 
@@ -44,3 +52,163 @@ def test_valid_modality_config_json_loads(tmp_path):
     assert isinstance(configs["action"], ModalityConfig)
     assert configs["action"].delta_indices == payload["action"]["delta_indices"]
     assert configs["action"].modality_keys == payload["action"]["modality_keys"]
+
+
+def test_load_deployment_dataset_contract(tmp_path):
+    dataset = tmp_path / "dataset"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps(
+            {
+                "robot_type": "TestBot",
+                "fps": 30,
+                "features": {
+                    "observation.state": {"names": [["joint_a", "joint_b"]]},
+                    "action": {"names": [["joint_a", "joint_b"]]},
+                    "observation.images.ego_view": {"shape": [480, 640, 3]},
+                },
+            }
+        )
+    )
+
+    contract = _load_deployment_dataset_contract(dataset)
+
+    assert contract["robot_type"] == "TestBot"
+    assert contract["fps"] == 30.0
+    assert contract["observation_state_names"] == ["joint_a", "joint_b"]
+    assert contract["action_names"] == ["joint_a", "joint_b"]
+    assert contract["ego_view_shape"] == [480, 640, 3]
+    assert len(contract["sha256"]) == 64
+
+
+def test_deployment_dataset_must_match_checkpoint_training_path(tmp_path):
+    model = tmp_path / "checkpoint"
+    experiment = model / "experiment_cfg"
+    experiment.mkdir(parents=True)
+    trained_dataset = tmp_path / "trained"
+    wrong_dataset = tmp_path / "wrong"
+    (experiment / "config.yaml").write_text(
+        """
+data:
+  datasets:
+    - embodiment_tag: new_embodiment
+      dataset_paths:
+        - %s
+""".strip()
+        % trained_dataset
+    )
+
+    _verify_checkpoint_dataset_path(model, "new_embodiment", trained_dataset)
+    with pytest.raises(ValueError, match="single training dataset"):
+        _verify_checkpoint_dataset_path(model, "new_embodiment", wrong_dataset)
+
+
+def _write_processor_config(tmp_path, *, use_relative_action, representations):
+    model = tmp_path / "checkpoint"
+    model.mkdir()
+    action_keys = ["left_arm", "right_arm", "left_hand", "right_hand"]
+    (model / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_kwargs": {
+                    "use_relative_action": use_relative_action,
+                    "modality_configs": {
+                        "new_embodiment": {
+                            "action": {
+                                "modality_keys": action_keys,
+                                "action_configs": [
+                                    {"rep": representation} for representation in representations
+                                ],
+                            }
+                        }
+                    },
+                }
+            }
+        )
+    )
+    return model
+
+
+def test_checkpoint_action_output_contract_describes_relative_decode(tmp_path):
+    model = _write_processor_config(
+        tmp_path,
+        use_relative_action=True,
+        representations=["RELATIVE", "RELATIVE", "ABSOLUTE", "ABSOLUTE"],
+    )
+
+    contract = _load_checkpoint_action_output_contract(model, "new_embodiment")
+
+    assert contract == {
+        "semantics": "absolute_joint_position",
+        "use_relative_action": True,
+        "relative_keys_decoded_to_absolute": ["left_arm", "right_arm"],
+    }
+
+
+def test_checkpoint_action_output_contract_rejects_undecoded_relative_actions(tmp_path):
+    model = _write_processor_config(
+        tmp_path,
+        use_relative_action=False,
+        representations=["RELATIVE", "RELATIVE", "ABSOLUTE", "ABSOLUTE"],
+    )
+
+    contract = _load_checkpoint_action_output_contract(model, "new_embodiment")
+
+    assert contract == {
+        "semantics": "checkpoint_native",
+        "use_relative_action": False,
+        "relative_keys_decoded_to_absolute": [],
+    }
+
+
+def test_checkpoint_action_output_contract_recognizes_native_absolute_actions(tmp_path):
+    model = _write_processor_config(
+        tmp_path,
+        use_relative_action=False,
+        representations=["ABSOLUTE"] * 4,
+    )
+
+    assert _load_checkpoint_action_output_contract(model, "new_embodiment")["semantics"] == (
+        "absolute_joint_position"
+    )
+
+
+def test_checkpoint_action_output_contract_requires_boolean_processor_flag(tmp_path):
+    model = _write_processor_config(
+        tmp_path,
+        use_relative_action="false",
+        representations=["RELATIVE", "RELATIVE", "ABSOLUTE", "ABSOLUTE"],
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _load_checkpoint_action_output_contract(model, "new_embodiment")
+
+
+def test_hugging_face_model_id_does_not_require_local_deployment_metadata(monkeypatch):
+    captured = {}
+
+    class DummyServer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(server_module, "Gr00tPolicy", lambda **_kwargs: object())
+    monkeypatch.setattr(server_module, "PolicyServer", DummyServer)
+    monkeypatch.setattr(
+        server_module,
+        "_load_checkpoint_action_output_contract",
+        lambda *_args: pytest.fail("deployment-only processor metadata was loaded"),
+    )
+
+    main(ServerConfig(model_path="nvidia/GR00T-N1.7-3B", device="cpu"))
+
+    assert "action_output_contract" not in captured["policy_metadata"]
