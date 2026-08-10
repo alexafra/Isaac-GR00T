@@ -66,7 +66,10 @@ def test_load_deployment_dataset_contract(tmp_path):
                 "features": {
                     "observation.state": {"names": [["joint_a", "joint_b"]]},
                     "action": {"names": [["joint_a", "joint_b"]]},
-                    "observation.images.ego_view": {"shape": [480, 640, 3]},
+                    "observation.images.ego_view": {
+                        "dtype": "video",
+                        "shape": [480, 640, 3],
+                    },
                 },
             }
         )
@@ -79,7 +82,108 @@ def test_load_deployment_dataset_contract(tmp_path):
     assert contract["observation_state_names"] == ["joint_a", "joint_b"]
     assert contract["action_names"] == ["joint_a", "joint_b"]
     assert contract["ego_view_shape"] == [480, 640, 3]
+    assert contract["video_shapes"] == {"ego_view": [480, 640, 3]}
+    assert "depth_encoding" not in contract
     assert len(contract["sha256"]) == 64
+
+
+def _write_deployment_dataset(tmp_path, *, reverse_video_order=False, depth_encoding=None):
+    dataset = tmp_path / "dataset"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    image_features = [
+        (
+            "observation.images.ego_view",
+            {"dtype": "video", "shape": [480, 640, 3]},
+        ),
+        (
+            "observation.images.depth_gray_view",
+            {"dtype": "video", "shape": [480, 640, 3]},
+        ),
+    ]
+    if reverse_video_order:
+        image_features.reverse()
+    info = {
+        "robot_type": "TestBot",
+        "fps": 30,
+        "features": {
+            "observation.state": {"names": [["joint_a", "joint_b"]]},
+            "action": {"names": [["joint_a", "joint_b"]]},
+            **dict(image_features),
+        },
+        "depth_encoding": depth_encoding
+        or {
+            "source_key": "depth_0",
+            "feature_key": "observation.images.depth_gray_view",
+            "encoding": "linear_grayscale_replicated_rgb",
+            "default_scale_m_per_unit": 0.001,
+            "near_m": 0.25,
+            "far_m": 1.0,
+            "invalid_value": 0,
+            "valid_value_range": [1, 255],
+        },
+        # Existing datasets may only have the old raw sidecar. It is provenance,
+        # not a prerequisite for serving the already-trained depth view.
+        "raw_depth_encoding": {"scale_m_per_unit": 0.001},
+    }
+    (meta / "info.json").write_text(json.dumps(info))
+    return dataset
+
+
+def test_load_deployment_dataset_contract_includes_normalized_depth(tmp_path):
+    dataset = _write_deployment_dataset(tmp_path)
+
+    contract = _load_deployment_dataset_contract(dataset)
+
+    assert contract["video_shapes"] == {
+        "depth_gray_view": [480, 640, 3],
+        "ego_view": [480, 640, 3],
+    }
+    assert contract["depth_encoding"] == {
+        "source_key": "depth_0",
+        "feature_key": "observation.images.depth_gray_view",
+        "encoding": "linear_grayscale_replicated_rgb",
+        "near_m": 0.25,
+        "far_m": 1.0,
+        "invalid_value": 0,
+        "valid_value_range": [1, 255],
+    }
+
+
+def test_deployment_contract_hash_is_independent_of_feature_insertion_order(tmp_path):
+    first = _write_deployment_dataset(tmp_path / "first")
+    second = _write_deployment_dataset(tmp_path / "second", reverse_video_order=True)
+
+    assert _load_deployment_dataset_contract(first)["sha256"] == (
+        _load_deployment_dataset_contract(second)["sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("feature_key", "observation.images.wrong", "feature_key"),
+        ("near_m", 2.0, "near_m < far_m"),
+        ("valid_value_range", [255, 1], "valid_value_range"),
+    ],
+)
+def test_deployment_contract_rejects_malformed_depth_encoding(
+    tmp_path, field, value, message
+):
+    encoding = {
+        "source_key": "depth_0",
+        "feature_key": "observation.images.depth_gray_view",
+        "encoding": "linear_grayscale_replicated_rgb",
+        "near_m": 0.25,
+        "far_m": 1.0,
+        "invalid_value": 0,
+        "valid_value_range": [1, 255],
+    }
+    encoding[field] = value
+    dataset = _write_deployment_dataset(tmp_path, depth_encoding=encoding)
+
+    with pytest.raises(ValueError, match=message):
+        _load_deployment_dataset_contract(dataset)
 
 
 def test_deployment_dataset_must_match_checkpoint_training_path(tmp_path):

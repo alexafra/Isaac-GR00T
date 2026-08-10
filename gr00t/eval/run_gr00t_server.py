@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -31,6 +32,94 @@ import yaml
 
 
 DEFAULT_MODEL_SERVER_PORT = 5555
+IMAGE_FEATURE_PREFIX = "observation.images."
+
+
+def _load_video_shapes(features: dict) -> dict[str, list[int]]:
+    """Return a stable view-name -> HWC mapping for LeRobot image features."""
+
+    video_shapes: dict[str, list[int]] = {}
+    for feature_key in sorted(features):
+        if not feature_key.startswith(IMAGE_FEATURE_PREFIX):
+            continue
+        feature = features[feature_key]
+        if not isinstance(feature, dict) or feature.get("dtype") != "video":
+            raise ValueError(f"Deployment image feature {feature_key!r} must have dtype 'video'")
+        shape = feature.get("shape")
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 3
+            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in shape)
+        ):
+            raise ValueError(
+                f"Deployment image feature {feature_key!r} must have a positive integer HWC shape"
+            )
+        if shape[-1] != 3:
+            raise ValueError(
+                f"Deployment image feature {feature_key!r} must have three channels, got {shape}"
+            )
+        view_name = feature_key.removeprefix(IMAGE_FEATURE_PREFIX)
+        if not view_name:
+            raise ValueError("Deployment image feature has an empty view name")
+        video_shapes[view_name] = list(shape)
+    if "ego_view" not in video_shapes:
+        raise ValueError("Deployment dataset has no observation.images.ego_view video feature")
+    return video_shapes
+
+
+def _load_depth_encoding(info: dict, video_shapes: dict[str, list[int]]) -> dict | None:
+    """Normalize the model-visible depth encoding without binding sensor-native units."""
+
+    has_depth_view = "depth_gray_view" in video_shapes
+    raw_encoding = info.get("depth_encoding")
+    if not has_depth_view:
+        if raw_encoding is not None:
+            raise ValueError(
+                "Dataset declares depth_encoding but has no observation.images.depth_gray_view"
+            )
+        return None
+    if not isinstance(raw_encoding, dict):
+        raise ValueError("Dataset depth_gray_view requires a depth_encoding object")
+
+    required = {
+        "source_key": str,
+        "feature_key": str,
+        "encoding": str,
+        "near_m": (int, float),
+        "far_m": (int, float),
+        "invalid_value": int,
+        "valid_value_range": list,
+    }
+    for field, expected_type in required.items():
+        value = raw_encoding.get(field)
+        if isinstance(value, bool) or not isinstance(value, expected_type):
+            raise ValueError(f"Dataset depth_encoding.{field} is missing or malformed")
+
+    if raw_encoding["feature_key"] != f"{IMAGE_FEATURE_PREFIX}depth_gray_view":
+        raise ValueError(
+            "Dataset depth_encoding.feature_key does not identify depth_gray_view"
+        )
+    near_m = float(raw_encoding["near_m"])
+    far_m = float(raw_encoding["far_m"])
+    if not math.isfinite(near_m) or not math.isfinite(far_m) or far_m <= near_m:
+        raise ValueError("Dataset depth_encoding requires finite near_m < far_m")
+    valid_range = raw_encoding["valid_value_range"]
+    if (
+        len(valid_range) != 2
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in valid_range)
+        or valid_range[0] > valid_range[1]
+    ):
+        raise ValueError("Dataset depth_encoding.valid_value_range must be two ordered integers")
+
+    return {
+        "source_key": raw_encoding["source_key"],
+        "feature_key": raw_encoding["feature_key"],
+        "encoding": raw_encoding["encoding"],
+        "near_m": near_m,
+        "far_m": far_m,
+        "invalid_value": raw_encoding["invalid_value"],
+        "valid_value_range": list(valid_range),
+    }
 
 
 def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
@@ -43,7 +132,8 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
         features = info["features"]
         state_names = features["observation.state"]["names"]
         action_names = features["action"]["names"]
-        image_shape = features["observation.images.ego_view"]["shape"]
+        video_shapes = _load_video_shapes(features)
+        depth_encoding = _load_depth_encoding(info, video_shapes)
         if len(state_names) == 1 and isinstance(state_names[0], list):
             state_names = state_names[0]
         if len(action_names) == 1 and isinstance(action_names[0], list):
@@ -53,8 +143,12 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
             "fps": float(info["fps"]),
             "observation_state_names": list(state_names),
             "action_names": list(action_names),
-            "ego_view_shape": list(image_shape),
+            # Retained for clients deployed before the multi-view contract.
+            "ego_view_shape": list(video_shapes["ego_view"]),
+            "video_shapes": video_shapes,
         }
+        if depth_encoding is not None:
+            contract["depth_encoding"] = depth_encoding
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Cannot build a deployment contract from {info_path}: {exc}") from exc
     canonical = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
