@@ -87,6 +87,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        processor_path: str | Path | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,6 +97,10 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            processor_path: Optional processor/statistics directory. When omitted,
+                the processor is loaded from ``model_path`` as before. This allows
+                evaluating base weights with a finetuning run's embodiment-specific
+                processor without copying the base model weights.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -115,11 +120,12 @@ class Gr00tPolicy(BasePolicy):
         # Training saves processor files under a "processor/" subdirectory, but
         # AutoProcessor expects them at the model root.  Fall back to the
         # subdirectory when the root lacks a processor_config.json.
+        processor_model_dir = Path(processor_path) if processor_path is not None else model_dir
         processor_dir = (
-            model_dir / "processor"
-            if (model_dir / "processor").is_dir()
-            and not (model_dir / "processor_config.json").exists()
-            else model_dir
+            processor_model_dir / "processor"
+            if (processor_model_dir / "processor").is_dir()
+            and not (processor_model_dir / "processor_config.json").exists()
+            else processor_model_dir
         )
         self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
         self.processor.eval()

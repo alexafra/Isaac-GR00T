@@ -137,6 +137,34 @@ class TestGr00tPolicyInit:
     def test_policy_embodiment_tag(self, policy):
         assert policy.embodiment_tag is not None
 
+    def test_policy_can_load_processor_from_separate_path(self):
+        mock_model = MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_processor = MagicMock()
+        mock_processor.get_modality_configs.return_value = _build_modality_configs()
+        mock_processor.collator = MagicMock()
+
+        with (
+            patch("gr00t.policy.gr00t_policy.AutoModel") as mock_auto_model,
+            patch("gr00t.policy.gr00t_policy.AutoProcessor") as mock_auto_processor,
+        ):
+            mock_auto_model.from_pretrained.return_value = mock_model
+            mock_auto_processor.from_pretrained.return_value = mock_processor
+
+            from gr00t.policy.gr00t_policy import Gr00tPolicy
+
+            Gr00tPolicy(
+                embodiment_tag=EMBODIMENT,
+                model_path="/models/base",
+                processor_path="/runs/custom/processor",
+                device="cpu",
+            )
+
+        assert mock_auto_model.from_pretrained.call_args.args[0] == Path("/models/base")
+        assert mock_auto_processor.from_pretrained.call_args.args[0] == Path(
+            "/runs/custom/processor"
+        )
+
 
 class TestGr00tPolicyCheckObservation:
     def test_valid_observation_passes(self, policy):

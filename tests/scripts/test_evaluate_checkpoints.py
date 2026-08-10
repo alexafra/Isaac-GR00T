@@ -3,11 +3,14 @@ from argparse import Namespace
 
 import numpy as np
 import pandas as pd
+import pytest
+import torch
 
 from scripts.analysis_tools import evaluate_checkpoints
 from scripts.analysis_tools.evaluate_checkpoints import (
     RAW_PREDICTION_COLUMNS,
     append_raw_predictions_csv,
+    find_evaluation_targets,
     initialize_raw_predictions_csv,
     plot_checkpoint_metric_summary,
     plot_checkpoint_progress,
@@ -17,6 +20,7 @@ from scripts.analysis_tools.evaluate_checkpoints import (
     raw_predictions_csv_path,
     raw_trajectory_arrays,
     regenerate_plots,
+    seed_inference,
     select_task_balanced_trajectory_ids,
     select_trajectory_ids,
 )
@@ -76,6 +80,66 @@ def test_default_validation_selection_still_evaluates_every_episode(tmp_path):
     selected = select_trajectory_ids(tmp_path, 5, None, episode_count=0, seed=7)
 
     assert selected == [0, 1, 2, 3, 4]
+
+
+def _write_run_processor(run_dir):
+    processor_dir = run_dir / "processor"
+    processor_dir.mkdir(parents=True)
+    (processor_dir / "processor_config.json").write_text("{}")
+    (processor_dir / "statistics.json").write_text("{}")
+    return processor_dir
+
+
+def test_evaluation_targets_include_run_compatible_base_as_step_zero(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    processor_dir = _write_run_processor(run_dir)
+    (run_dir / "checkpoint-2000").mkdir()
+    (run_dir / "checkpoint-4000").mkdir()
+    base_model = tmp_path / "base"
+    base_model.mkdir()
+
+    targets = find_evaluation_targets(run_dir, None, base_model)
+
+    assert [target.step for target in targets] == [0, 2000, 4000]
+    assert targets[0].model_path == base_model
+    assert targets[0].processor_path == processor_dir
+    assert targets[1].processor_path is None
+
+
+def test_evaluation_target_selection_can_choose_only_base_or_only_checkpoint(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_run_processor(run_dir)
+    checkpoint = run_dir / "checkpoint-2000"
+    checkpoint.mkdir()
+    base_model = tmp_path / "base"
+    base_model.mkdir()
+
+    base_only = find_evaluation_targets(run_dir, [0], base_model)
+    checkpoint_only = find_evaluation_targets(run_dir, [2000], base_model)
+
+    assert [(target.step, target.model_path) for target in base_only] == [(0, base_model)]
+    assert [(target.step, target.model_path) for target in checkpoint_only] == [(2000, checkpoint)]
+
+
+def test_base_evaluation_requires_run_processor_statistics(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    base_model = tmp_path / "base"
+    base_model.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="embodiment processor"):
+        find_evaluation_targets(run_dir, None, base_model)
+
+
+def test_inference_seed_restarts_torch_noise_for_each_model():
+    seed_inference(123)
+    first = torch.randn(8)
+    seed_inference(123)
+    second = torch.randn(8)
+
+    torch.testing.assert_close(first, second)
 
 
 def test_joint_trajectory_plot_labels_visible_frame_axes(tmp_path, monkeypatch):

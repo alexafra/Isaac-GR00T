@@ -8,9 +8,11 @@ import gc
 import gzip
 import json
 import logging
+import random
+import re
+from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
-import re
 
 import matplotlib
 
@@ -29,6 +31,15 @@ from gr00t.policy.gr00t_policy import Gr00tPolicy
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument(
+        "--base-model-path",
+        type=Path,
+        help=(
+            "Optional pretrained model weights to evaluate as logical checkpoint 0. "
+            "The processor/statistics are loaded from RUN_DIR/processor so the baseline "
+            "uses the same embodiment contract as the finetuned checkpoints."
+        ),
+    )
     parser.add_argument(
         "--dataset-path",
         type=Path,
@@ -74,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=0, help="0 evaluates each complete episode")
     parser.add_argument("--execution-horizon", type=int, default=16)
     parser.add_argument("--denoising-steps", type=int, default=4)
+    parser.add_argument(
+        "--inference-seed",
+        type=int,
+        default=42,
+        help="Reset the inference RNG to this seed for every evaluated model.",
+    )
     parser.add_argument("--modality-keys", nargs="+", default=None)
     parser.add_argument("--skip-trajectory-plots", action="store_true")
     parser.add_argument(
@@ -201,6 +218,19 @@ def checkpoint_step(path: Path) -> int:
     return int(match.group(1))
 
 
+@dataclass(frozen=True)
+class EvaluationTarget:
+    """One physical model/processor pair represented on plots by a training step."""
+
+    step: int
+    model_path: Path
+    processor_path: Path | None = None
+
+    @property
+    def output_name(self) -> str:
+        return f"checkpoint-{self.step}"
+
+
 def find_checkpoints(run_dir: Path, selected_steps: list[int] | None) -> list[Path]:
     if re.fullmatch(r"checkpoint-\d+", run_dir.name):
         checkpoints = [run_dir]
@@ -215,6 +245,78 @@ def find_checkpoints(run_dir: Path, selected_steps: list[int] | None) -> list[Pa
     if not checkpoints:
         raise FileNotFoundError(f"No matching checkpoint directories found in {run_dir}")
     return checkpoints
+
+
+def find_evaluation_targets(
+    run_dir: Path,
+    selected_steps: list[int] | None,
+    base_model_path: Path | None,
+) -> list[EvaluationTarget]:
+    """Resolve physical checkpoints plus an optional run-compatible step-0 baseline."""
+
+    if re.fullmatch(r"checkpoint-\d+", run_dir.name):
+        checkpoints = [run_dir]
+    else:
+        checkpoints = [path for path in run_dir.glob("checkpoint-*") if path.is_dir()]
+    checkpoints.sort(key=checkpoint_step)
+
+    selected = set(selected_steps) if selected_steps else None
+    if selected is not None:
+        checkpoints = [path for path in checkpoints if checkpoint_step(path) in selected]
+
+    targets = [
+        EvaluationTarget(step=checkpoint_step(path), model_path=path) for path in checkpoints
+    ]
+
+    include_base = base_model_path is not None and (selected is None or 0 in selected)
+    if include_base:
+        if any(target.step == 0 for target in targets):
+            raise ValueError(
+                "Cannot combine --base-model-path with a physical checkpoint-0 directory"
+            )
+        if not base_model_path.is_dir():
+            raise FileNotFoundError(f"Base model directory does not exist: {base_model_path}")
+        processor_path = run_dir / "processor"
+        required_processor_files = [
+            processor_path / "processor_config.json",
+            processor_path / "statistics.json",
+        ]
+        missing_processor_files = [path for path in required_processor_files if not path.is_file()]
+        if missing_processor_files:
+            missing = ", ".join(str(path) for path in missing_processor_files)
+            raise FileNotFoundError(
+                "Cannot evaluate the base model with this run's embodiment processor; "
+                f"missing: {missing}"
+            )
+        targets.append(
+            EvaluationTarget(
+                step=0,
+                model_path=base_model_path,
+                processor_path=processor_path,
+            )
+        )
+
+    targets.sort(key=lambda target: target.step)
+    if selected is not None:
+        found_steps = {target.step for target in targets}
+        missing_steps = selected - found_steps
+        if missing_steps:
+            raise FileNotFoundError(
+                f"No model target found for checkpoint step(s): {sorted(missing_steps)}"
+            )
+    if not targets:
+        raise FileNotFoundError(f"No matching model targets found in {run_dir}")
+    return targets
+
+
+def seed_inference(seed: int) -> None:
+    """Give every model target the same stochastic flow-sampling sequence."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def action_labels(trajectory: pd.DataFrame, action_keys: list[str]) -> list[str]:
@@ -1286,25 +1388,38 @@ def main() -> None:
         regenerate_plots(args, output_dir)
         return
 
-    checkpoints = find_checkpoints(args.run_dir, args.checkpoint_steps)
+    targets = find_evaluation_targets(
+        args.run_dir,
+        args.checkpoint_steps,
+        args.base_model_path,
+    )
     embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     episode_rows = []
     checkpoint_rows = []
     joint_rows = []
     canonical_labels = None
 
-    for checkpoint in checkpoints:
-        step = checkpoint_step(checkpoint)
-        checkpoint_dir = output_dir / checkpoint.name
+    for target in targets:
+        step = target.step
+        checkpoint_dir = output_dir / target.output_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info("Loading %s", checkpoint)
+        logging.info(
+            "Loading checkpoint step %d: model=%s processor=%s",
+            step,
+            target.model_path,
+            target.processor_path or target.model_path,
+        )
 
         policy = Gr00tPolicy(
             embodiment_tag=embodiment_tag,
-            model_path=str(checkpoint),
+            model_path=str(target.model_path),
             device="cuda" if torch.cuda.is_available() else "cpu",
+            processor_path=(
+                str(target.processor_path) if target.processor_path is not None else None
+            ),
         )
         policy.model.action_head.num_inference_timesteps = args.denoising_steps
+        seed_inference(args.inference_seed)
         modality = policy.get_modality_config()
         action_keys = (
             modality["action"].modality_keys
@@ -1356,7 +1471,7 @@ def main() -> None:
                 )
             plot_dir = checkpoint_dir if split == "validation" else checkpoint_dir / split
             plot_dir.mkdir(parents=True, exist_ok=True)
-            right_checkpoint_dir = output_dir / "right_arm_hand" / checkpoint.name
+            right_checkpoint_dir = output_dir / "right_arm_hand" / target.output_name
             right_plot_dir = (
                 right_checkpoint_dir if split == "validation" else right_checkpoint_dir / split
             )
