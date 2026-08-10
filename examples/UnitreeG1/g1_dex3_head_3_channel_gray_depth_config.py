@@ -24,7 +24,7 @@ g1_dex3_head_3_channel_gray_depth_config = {
         ],
     ),
     "action": ModalityConfig(
-        delta_indices=list(range(16)),
+        delta_indices=list(range(32)),
         modality_keys=[
             "left_arm",
             "right_arm",
