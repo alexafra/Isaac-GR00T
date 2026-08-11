@@ -335,6 +335,8 @@ class StateActionProcessor:
         action: dict[str, np.ndarray],
         embodiment_tag: str,
         state: dict[str, np.ndarray] | None = None,
+        *,
+        clip_outliers: bool | None = None,
     ) -> dict[str, np.ndarray]:
         """
         Apply action processing (absolute->relative conversion, normalization).
@@ -350,6 +352,10 @@ class StateActionProcessor:
             state: Optional dict mapping joint_group -> raw state values
                 Required if any action group uses ActionRepresentation.RELATIVE
                 Shape per group: (T_state, D) where last timestep is used as reference
+            clip_outliers: Per-call override for clipping normalized actions to
+                ``[-1, 1]``. ``None`` preserves the processor-wide setting. RTC
+                uses ``False`` when re-encoding an already-issued physical action
+                tail so clipping cannot distort the model's inpainting context.
 
         Returns:
             Dict mapping joint_group -> processed action values
@@ -359,6 +365,7 @@ class StateActionProcessor:
             ValueError: If state is None but required for relative action conversion
         """
         action = deepcopy(action)  # Avoid modifying input
+        should_clip_outliers = self.clip_outliers if clip_outliers is None else clip_outliers
 
         # Step 1: Convert absolute actions to relative (if needed)
         modality_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
@@ -411,7 +418,7 @@ class StateActionProcessor:
             else:
                 normalized = normalize_values_minmax(action[joint_group], params)
 
-            if self.clip_outliers:
+            if should_clip_outliers:
                 normalized = np.clip(normalized, -1.0, 1.0)
 
             normalized_values[joint_group] = normalized

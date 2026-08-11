@@ -25,6 +25,7 @@ from gr00t.eval.run_gr00t_server import (
     _verify_checkpoint_dataset_path,
     main,
 )
+import gr00t.policy.gr00t_policy as policy_module
 import pytest
 
 
@@ -316,3 +317,39 @@ def test_hugging_face_model_id_does_not_require_local_deployment_metadata(monkey
     main(ServerConfig(model_path="nvidia/GR00T-N1.7-3B", device="cpu"))
 
     assert "action_output_contract" not in captured["policy_metadata"]
+    assert captured["policy_metadata"]["rtc"] == {
+        "protocol_version": 1,
+        "physical_action_tail": True,
+        "backend": "pytorch",
+    }
+
+
+def test_sim_policy_wrapper_does_not_advertise_physical_tail_rtc(monkeypatch):
+    captured = {}
+
+    class DummyServer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(server_module, "Gr00tPolicy", lambda **_kwargs: object())
+    monkeypatch.setattr(policy_module, "Gr00tSimPolicyWrapper", lambda policy: policy)
+    monkeypatch.setattr(server_module, "PolicyServer", DummyServer)
+
+    main(
+        ServerConfig(
+            model_path="nvidia/GR00T-N1.7-3B",
+            device="cpu",
+            use_sim_policy_wrapper=True,
+        )
+    )
+
+    assert "rtc" not in captured["policy_metadata"]

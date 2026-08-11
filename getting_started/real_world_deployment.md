@@ -410,7 +410,19 @@ When direct optimization is insufficient, use one or more of the following:
 
 **Recommended strategy**: `Asynchronous Inference + RTC` is usually the most effective.
 
-> **RTC status (experimental):** Asynchronous inference is supported today. RTC is currently only a low-level model primitive: `action_head.get_action(..., options={"rtc_overlap_steps": ..., "rtc_frozen_steps": ..., "rtc_ramp_rate": ...})` with the previous action fed back in (`gr00t/model/gr00t_n1d7/gr00t_n1d7.py`). It is **not wired into `Gr00tPolicy` or the server-client path** (there `options` is currently unused), and it has no tests or ready-made example — so the RTC steps below require manual integration.
+> **RTC status (experimental):** The direct PyTorch `Gr00tPolicy` and
+> `PolicyServer` now expose the model's RTC primitive. An RTC request supplies the
+> still-unconsumed **physical** action tail plus `rtc_overlap_steps`,
+> `rtc_frozen_steps`, and optionally `rtc_ramp_rate`. `Gr00tPolicy` re-encodes that
+> tail against the request's current state (important for relative-action
+> embodiments), then restores the completely frozen physical prefix after decode.
+> A compatible server advertises `policy_metadata.rtc.protocol_version == 1`.
+> ReplayPolicy and the simulation policy wrapper do not advertise this capability.
+> TensorRT deployment does not currently implement this RTC options path either.
+> The server does not schedule robot actions: the deployment client must still own
+> a timestamped action queue, measure how many old actions elapsed during the
+> request, atomically discard the same prefix from the reply, reject stale
+> generations, and enter a safe state on buffer underrun.
 
 #### Real-Time Chunking (RTC) Details
 
@@ -446,7 +458,9 @@ In the RTC (Real-Time Chunking) framework, two key parameters control how adjace
 - **`overlap`**: The number of action steps retained from the previous prediction to constrain the current one, ensuring temporal consistency between consecutive chunks.
 - **`frozen`**: The number of steps that remain completely frozen (i.e., not updated by the new prediction), typically set to match the inference latency.
 
-Below is a simplified async inference + RTC loop. Note that official RTC support for GR00T is coming soon; the current implementation may require manual adaptation.
+Below is a simplified async inference + RTC loop. It illustrates the model-side
+idea only; a real scheduler also needs generation IDs and a child-measured elapsed
+index so a late response cannot replay actions that have already executed.
 
 ```
 actions = policy.infer(obs)                        # blocking first call
@@ -460,5 +474,3 @@ loop:
             actions = future.get()                 # swap in next chunk
             break                                  # discard frozen tail
 ```
-
-

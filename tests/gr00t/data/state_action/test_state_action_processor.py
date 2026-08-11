@@ -24,6 +24,13 @@ import json
 from pathlib import Path
 
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
+from gr00t.data.types import (
+    ActionConfig,
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    ModalityConfig,
+)
 import numpy as np
 import pytest
 
@@ -152,6 +159,65 @@ class TestActionNormalization:
         for key, val in result.items():
             assert val.min() >= -1.0, f"{key}: action value {val.min()} < -1"
             assert val.max() <= 1.0, f"{key}: action value {val.max()} > 1"
+
+    def test_per_call_no_clip_override_preserves_relative_rtc_context(self):
+        embodiment = "relative_test"
+        modality_configs = {
+            embodiment: {
+                "state": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
+                "action": ModalityConfig(
+                    delta_indices=[0, 1, 2],
+                    modality_keys=["joint"],
+                    action_configs=[
+                        ActionConfig(
+                            rep=ActionRepresentation.RELATIVE,
+                            type=ActionType.NON_EEF,
+                            format=ActionFormat.DEFAULT,
+                        )
+                    ],
+                ),
+            }
+        }
+        unit_stats = {
+            "min": [-1.0],
+            "max": [1.0],
+            "mean": [0.0],
+            "std": [1.0],
+            "q01": [-1.0],
+            "q99": [1.0],
+        }
+        statistics = {
+            embodiment: {
+                "state": {"joint": unit_stats},
+                "action": {"joint": unit_stats},
+                "relative_action": {"joint": unit_stats},
+            }
+        }
+        relative_processor = StateActionProcessor(
+            modality_configs=modality_configs,
+            statistics=statistics,
+            use_relative_action=True,
+            clip_outliers=True,
+        )
+        new_state = {"joint": np.array([[0.5]], dtype=np.float32)}
+        physical_tail = {
+            "joint": np.array([[3.0], [4.0], [5.0]], dtype=np.float32),
+        }
+
+        clipped = relative_processor.apply_action(physical_tail, embodiment, state=new_state)
+        unclipped = relative_processor.apply_action(
+            physical_tail,
+            embodiment,
+            state=new_state,
+            clip_outliers=False,
+        )
+        assert np.max(clipped["joint"]) == 1.0
+        assert np.max(unclipped["joint"]) > 1.0
+        np.testing.assert_allclose(
+            unclipped["joint"],
+            np.array([[2.5], [3.5], [4.5]], dtype=np.float32),
+            atol=1e-6,
+        )
 
     def test_action_roundtrip(self, processor, modality_keys, statistics):
         _, action_keys = modality_keys

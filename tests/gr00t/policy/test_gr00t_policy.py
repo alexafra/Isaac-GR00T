@@ -20,6 +20,7 @@ Uses mocked model and processor to avoid downloading checkpoints.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from gr00t.data.types import ModalityConfig
@@ -56,6 +57,11 @@ def policy():
     mock_model.to = MagicMock(return_value=mock_model)
     mock_model.device = torch.device("cpu")
     mock_model.dtype = torch.bfloat16
+    mock_model.config = SimpleNamespace(
+        action_horizon=16,
+        max_action_dim=7,
+        rtc_ramp_rate=6.0,
+    )
 
     mock_model.get_action = MagicMock(
         return_value=BatchFeature(data={"action_pred": torch.randn(1, 16, 7)})
@@ -65,12 +71,32 @@ def policy():
     mock_processor.modality_configs = _build_modality_configs()
     mock_processor.get_modality_configs.return_value = _build_modality_configs()
     mock_processor.state_action_processor = MagicMock()
+    mock_processor.state_action_processor.norm_params = {
+        EMBODIMENT: {
+            "action": {key: {"dim": np.array(1)} for key in ACTION_KEYS},
+        }
+    }
+    mock_processor.state_action_processor.apply_action.side_effect = (
+        lambda action, _embodiment_tag, state=None, clip_outliers=None: action
+    )
     mock_processor.action_dim = {EMBODIMENT: 7}
-    mock_processor.max_action_dim = 128
-    mock_processor.max_action_horizon = 50
+    mock_processor.max_action_dim = 7
+    mock_processor.max_action_horizon = 16
     mock_processor.eval = MagicMock()
     mock_processor.training = False
-    mock_processor.collator = MagicMock()
+
+    def fake_collator(features):
+        batch_size = len(features)
+        return BatchFeature(
+            data={
+                "inputs": {
+                    "state": torch.zeros(batch_size, 1, 128),
+                    "embodiment_id": torch.zeros(batch_size, dtype=torch.long),
+                }
+            }
+        )
+
+    mock_processor.collator = MagicMock(side_effect=fake_collator)
 
     def fake_process_observation(observation, embodiment_tag):
         return BatchFeature(
@@ -88,7 +114,7 @@ def policy():
     mock_processor.process_observation = MagicMock(side_effect=fake_process_observation)
 
     def fake_decode_action(action, embodiment_tag, state=None):
-        return {k: np.zeros((1, 16, 1), dtype=np.float32) for k in ACTION_KEYS}
+        return {k: np.zeros((action.shape[0], 16, 1), dtype=np.float32) for k in ACTION_KEYS}
 
     mock_processor.decode_action = MagicMock(side_effect=fake_decode_action)
 
@@ -196,6 +222,136 @@ class TestGr00tPolicyGetAction:
         action, info = policy.get_action(obs)
         assert isinstance(action, dict)
         assert isinstance(info, dict)
+
+    def test_synchronous_inference_does_not_add_model_options_or_action_input(self, policy):
+        policy.get_action(_make_observation(), options={"inference_mode": "synchronous"})
+
+        call_kwargs = policy.model.get_action.call_args.kwargs
+        assert "options" not in call_kwargs
+        assert "action" not in call_kwargs["inputs"]
+
+    def test_rtc_reencodes_variable_physical_tail_and_derives_model_options(self, policy):
+        tail_horizon = 5
+        previous_action = {
+            key: np.full((1, tail_horizon, 1), index + 0.25, dtype=np.float32)
+            for index, key in enumerate(ACTION_KEYS)
+        }
+
+        action, info = policy.get_action(
+            _make_observation(),
+            options={
+                "inference_mode": "rtc",
+                "rtc_previous_action": previous_action,
+                "rtc_overlap_steps": tail_horizon,
+                "rtc_frozen_steps": 2,
+            },
+        )
+
+        call_kwargs = policy.model.get_action.call_args.kwargs
+        assert call_kwargs["options"] == {
+            "action_horizon": tail_horizon,
+            "rtc_overlap_steps": tail_horizon,
+            "rtc_frozen_steps": 2,
+            "rtc_ramp_rate": 6.0,
+        }
+        encoded = call_kwargs["inputs"]["action"]
+        assert encoded.shape == (1, 16, 7)
+        assert encoded.dtype == torch.bfloat16
+        expected_prefix = np.concatenate([previous_action[key][0] for key in ACTION_KEYS], axis=-1)
+        np.testing.assert_allclose(encoded[0, :tail_horizon].float().numpy(), expected_prefix)
+        assert torch.count_nonzero(encoded[0, tail_horizon:]) == 0
+        apply_kwargs = policy.processor.state_action_processor.apply_action.call_args.kwargs
+        assert apply_kwargs["clip_outliers"] is False
+        for key in ACTION_KEYS:
+            np.testing.assert_array_equal(action[key][:, :2], previous_action[key][:, :2])
+        assert info == {
+            "rtc_applied": True,
+            "rtc_previous_action_horizon": tail_horizon,
+            "rtc_overlap_steps": tail_horizon,
+            "rtc_frozen_steps": 2,
+            "rtc_ramp_rate": 6.0,
+        }
+
+    def test_rtc_rejects_client_action_horizon(self, policy):
+        previous_action = {key: np.zeros((1, 5, 1), dtype=np.float32) for key in ACTION_KEYS}
+        with pytest.raises(ValueError, match="derived from rtc_previous_action"):
+            policy.get_action(
+                _make_observation(),
+                options={
+                    "inference_mode": "rtc",
+                    "rtc_previous_action": previous_action,
+                    "rtc_overlap_steps": 5,
+                    "rtc_frozen_steps": 2,
+                    "action_horizon": 5,
+                },
+            )
+
+    @pytest.mark.parametrize(
+        ("mutate_options", "message"),
+        [
+            (lambda options: options.update(rtc_overlap_steps=6), "RTC overlap must satisfy"),
+            (lambda options: options.update(rtc_frozen_steps=6), "RTC frozen steps must satisfy"),
+            (lambda options: options.update(rtc_ramp_rate=float("nan")), "finite positive"),
+        ],
+    )
+    def test_rtc_rejects_invalid_schedule(self, policy, mutate_options, message):
+        previous_action = {key: np.zeros((1, 5, 1), dtype=np.float32) for key in ACTION_KEYS}
+        options = {
+            "inference_mode": "rtc",
+            "rtc_previous_action": previous_action,
+            "rtc_overlap_steps": 5,
+            "rtc_frozen_steps": 2,
+        }
+        mutate_options(options)
+
+        with pytest.raises(ValueError, match=message):
+            policy.get_action(_make_observation(), options=options)
+
+    def test_rtc_rejects_inconsistent_tail_horizons(self, policy):
+        previous_action = {key: np.zeros((1, 5, 1), dtype=np.float32) for key in ACTION_KEYS}
+        previous_action[ACTION_KEYS[-1]] = np.zeros((1, 4, 1), dtype=np.float32)
+
+        with pytest.raises(ValueError, match="same tail horizon"):
+            policy.get_action(
+                _make_observation(),
+                options={
+                    "inference_mode": "rtc",
+                    "rtc_previous_action": previous_action,
+                    "rtc_overlap_steps": 4,
+                    "rtc_frozen_steps": 2,
+                },
+            )
+
+    def test_rtc_rejects_missing_action_key_and_nonfinite_value(self, policy):
+        previous_action = {key: np.zeros((1, 5, 1), dtype=np.float32) for key in ACTION_KEYS}
+        del previous_action[ACTION_KEYS[0]]
+        with pytest.raises(ValueError, match="must exactly match"):
+            policy.get_action(
+                _make_observation(),
+                options={
+                    "inference_mode": "rtc",
+                    "rtc_previous_action": previous_action,
+                    "rtc_overlap_steps": 5,
+                    "rtc_frozen_steps": 2,
+                },
+            )
+
+        previous_action[ACTION_KEYS[0]] = np.zeros((1, 5, 1), dtype=np.float32)
+        previous_action[ACTION_KEYS[1]][0, 0, 0] = np.inf
+        with pytest.raises(ValueError, match="NaN or infinity"):
+            policy.get_action(
+                _make_observation(),
+                options={
+                    "inference_mode": "rtc",
+                    "rtc_previous_action": previous_action,
+                    "rtc_overlap_steps": 5,
+                    "rtc_frozen_steps": 2,
+                },
+            )
+
+    def test_policy_options_must_be_a_dictionary(self, policy):
+        with pytest.raises(ValueError, match="must be a dictionary"):
+            policy.get_action(_make_observation(), options=[])
 
 
 class _NumpyLanguageSimPolicy:

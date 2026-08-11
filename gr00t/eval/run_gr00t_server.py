@@ -361,6 +361,16 @@ def main(config: ServerConfig):
         "embodiment_tag": config.embodiment_tag.value,
         "embodiment_name": config.embodiment_tag.name,
     }
+    if config.model_path is not None and not config.use_sim_policy_wrapper:
+        # Explicit capability handshake for clients that need model-side RTC
+        # inpainting. ReplayPolicy and older servers deliberately omit it so a
+        # real-robot client can fail before arming rather than silently falling
+        # back to independent asynchronous chunks.
+        policy_metadata["rtc"] = {
+            "protocol_version": 1,
+            "physical_action_tail": True,
+            "backend": "pytorch",
+        }
     if config.deployment_dataset_path is not None:
         deployment_dataset_path = Path(config.deployment_dataset_path)
         if config.model_path is not None:

@@ -20,6 +20,8 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import math
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,26 @@ from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 
 from .policy import BasePolicy, PolicyWrapper
+
+
+_RTC_MODE = "rtc"
+_SYNCHRONOUS_MODE = "synchronous"
+_RTC_OPTION_KEYS = frozenset(
+    {
+        "inference_mode",
+        "rtc_previous_action",
+        "rtc_overlap_steps",
+        "rtc_frozen_steps",
+        "rtc_ramp_rate",
+    }
+)
+_RTC_REQUIRED_OPTION_KEYS = frozenset(
+    {
+        "rtc_previous_action",
+        "rtc_overlap_steps",
+        "rtc_frozen_steps",
+    }
+)
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -220,6 +242,229 @@ class Gr00tPolicy(BasePolicy):
             embodiment=self.embodiment_tag,
         )
 
+    @staticmethod
+    def _rtc_integer_option(options: dict[str, Any], key: str) -> int:
+        value = options[key]
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"RTC option '{key}' must be an integer, got {value!r}")
+        return int(value)
+
+    def _prepare_rtc_action_input(
+        self,
+        options: dict[str, Any] | None,
+        states: list[dict[str, np.ndarray]],
+    ) -> tuple[
+        np.ndarray | None,
+        dict[str, Any] | None,
+        dict[str, Any],
+        dict[str, np.ndarray] | None,
+    ]:
+        """Validate and encode an RTC continuation request.
+
+        ``rtc_previous_action`` is the unconsumed *physical* action tail at the
+        instant the accompanying observation was captured. Re-encoding it against
+        that new observation is required for relative-action embodiments: feeding
+        back the old normalized deltas would re-anchor them to the new state and
+        move the supposedly frozen physical targets.
+        """
+
+        if options is None:
+            return None, None, {}, None
+        if not isinstance(options, dict):
+            raise ValueError(f"Policy options must be a dictionary, got {type(options).__name__}")
+        if not options:
+            return None, None, {}, None
+
+        mode = options.get("inference_mode")
+        supplied_rtc_keys = set(options) & (_RTC_OPTION_KEYS - {"inference_mode"})
+        if mode is None:
+            if supplied_rtc_keys:
+                raise ValueError(
+                    "RTC options require inference_mode='rtc'; got RTC keys "
+                    f"{sorted(supplied_rtc_keys)}"
+                )
+            # Preserve the historical behavior for unrelated policy options.
+            return None, None, {}, None
+        if mode == _SYNCHRONOUS_MODE:
+            unexpected = set(options) - {"inference_mode"}
+            if unexpected:
+                raise ValueError(
+                    f"Synchronous inference does not accept RTC options: {sorted(unexpected)}"
+                )
+            return None, None, {}, None
+        if mode != _RTC_MODE:
+            raise ValueError(
+                f"Policy option 'inference_mode' must be 'synchronous' or 'rtc', got {mode!r}"
+            )
+
+        unknown = set(options) - _RTC_OPTION_KEYS
+        if unknown:
+            suffix = (
+                " The RTC action horizon is derived from rtc_previous_action and must not "
+                "be supplied by the client."
+                if "action_horizon" in unknown
+                else ""
+            )
+            raise ValueError(f"Unknown RTC options: {sorted(unknown)}.{suffix}")
+        missing = _RTC_REQUIRED_OPTION_KEYS - set(options)
+        if missing:
+            raise ValueError(f"Missing required RTC options: {sorted(missing)}")
+
+        previous_action = options["rtc_previous_action"]
+        if not isinstance(previous_action, dict):
+            raise ValueError("RTC option 'rtc_previous_action' must be an action dictionary")
+
+        action_config = self.modality_configs["action"]
+        action_keys = list(action_config.modality_keys)
+        expected_keys = set(action_keys)
+        actual_keys = set(previous_action)
+        if actual_keys != expected_keys:
+            raise ValueError(
+                "RTC previous action keys must exactly match the policy action keys; "
+                f"missing={sorted(expected_keys - actual_keys)}, "
+                f"unexpected={sorted(actual_keys - expected_keys)}"
+            )
+
+        batch_size = len(states)
+        previous_horizon: int | None = None
+        action_dims: dict[str, int] = {}
+        normalizer = getattr(self.processor, "state_action_processor", None)
+        if normalizer is None or not callable(getattr(normalizer, "apply_action", None)):
+            raise RuntimeError(
+                "This policy processor cannot re-encode physical actions, so RTC is unsupported"
+            )
+
+        norm_params = normalizer.norm_params[self.embodiment_tag.value]["action"]
+        for key in action_keys:
+            value = previous_action[key]
+            if not isinstance(value, np.ndarray):
+                raise ValueError(
+                    f"RTC previous action '{key}' must be a numpy array, got {type(value).__name__}"
+                )
+            if value.dtype != np.float32:
+                raise ValueError(
+                    f"RTC previous action '{key}' must have dtype float32, got {value.dtype}"
+                )
+            if value.ndim != 3:
+                raise ValueError(
+                    f"RTC previous action '{key}' must have shape (B, L, D), got {value.shape}"
+                )
+            expected_dim = int(norm_params[key]["dim"].item())
+            expected_prefix = (batch_size,)
+            if value.shape[0:1] != expected_prefix or value.shape[2] != expected_dim:
+                raise ValueError(
+                    f"RTC previous action '{key}' must have shape "
+                    f"({batch_size}, L, {expected_dim}), got {value.shape}"
+                )
+            if previous_horizon is None:
+                previous_horizon = value.shape[1]
+            elif value.shape[1] != previous_horizon:
+                raise ValueError(
+                    "All RTC previous action groups must have the same tail horizon; "
+                    f"'{key}' has {value.shape[1]}, expected {previous_horizon}"
+                )
+            if not np.isfinite(value).all():
+                raise ValueError(f"RTC previous action '{key}' contains NaN or infinity")
+            action_dims[key] = expected_dim
+
+        assert previous_horizon is not None  # action configuration must contain at least one key
+        trained_horizon = len(action_config.delta_indices)
+        if not 1 <= previous_horizon <= trained_horizon:
+            raise ValueError(
+                "RTC previous action tail horizon must satisfy "
+                f"1 <= L <= trained horizon {trained_horizon}, got {previous_horizon}"
+            )
+
+        overlap_steps = self._rtc_integer_option(options, "rtc_overlap_steps")
+        frozen_steps = self._rtc_integer_option(options, "rtc_frozen_steps")
+        if not 1 <= overlap_steps <= previous_horizon:
+            raise ValueError(
+                "RTC overlap must satisfy "
+                f"1 <= rtc_overlap_steps <= previous tail horizon {previous_horizon}, "
+                f"got {overlap_steps}"
+            )
+        if not 0 <= frozen_steps <= overlap_steps:
+            raise ValueError(
+                "RTC frozen steps must satisfy "
+                f"0 <= rtc_frozen_steps <= rtc_overlap_steps {overlap_steps}, "
+                f"got {frozen_steps}"
+            )
+
+        ramp_rate = options.get("rtc_ramp_rate")
+        if ramp_rate is None:
+            ramp_rate = getattr(getattr(self.model, "config", None), "rtc_ramp_rate", None)
+            if ramp_rate is None:
+                raise ValueError(
+                    "RTC ramp rate was not supplied and the model config has no rtc_ramp_rate"
+                )
+        if isinstance(ramp_rate, bool) or not isinstance(ramp_rate, Real):
+            raise ValueError(f"RTC ramp rate must be a finite positive number, got {ramp_rate!r}")
+        ramp_rate = float(ramp_rate)
+        if not math.isfinite(ramp_rate) or ramp_rate <= 0.0:
+            raise ValueError(f"RTC ramp rate must be a finite positive number, got {ramp_rate!r}")
+
+        model_config = getattr(self.model, "config", None)
+        try:
+            model_horizon = int(model_config.action_horizon)
+            model_action_dim = int(model_config.max_action_dim)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "The loaded model does not expose action_horizon/max_action_dim; RTC is unsupported"
+            ) from exc
+        total_action_dim = sum(action_dims.values())
+        if model_horizon < trained_horizon or model_action_dim < total_action_dim:
+            raise RuntimeError(
+                "The loaded model action shape cannot represent this RTC request: "
+                f"model=({model_horizon}, {model_action_dim}), "
+                f"policy=({trained_horizon}, {total_action_dim})"
+            )
+
+        normalized_batch = []
+        for batch_index, state in enumerate(states):
+            sample_action = {key: previous_action[key][batch_index] for key in action_keys}
+            normalized_groups = normalizer.apply_action(
+                sample_action,
+                self.embodiment_tag.value,
+                state=state,
+                clip_outliers=False,
+            )
+            normalized = np.concatenate(
+                [np.asarray(normalized_groups[key], dtype=np.float32) for key in action_keys],
+                axis=-1,
+            )
+            if normalized.shape != (previous_horizon, total_action_dim):
+                raise RuntimeError(
+                    "RTC action normalizer returned an unexpected shape: "
+                    f"{normalized.shape}, expected ({previous_horizon}, {total_action_dim})"
+                )
+            if not np.isfinite(normalized).all():
+                raise ValueError("Normalized RTC previous action contains NaN or infinity")
+            padded = np.zeros((model_horizon, model_action_dim), dtype=np.float32)
+            padded[:previous_horizon, :total_action_dim] = normalized
+            normalized_batch.append(padded)
+
+        model_options = {
+            "action_horizon": previous_horizon,
+            "rtc_overlap_steps": overlap_steps,
+            "rtc_frozen_steps": frozen_steps,
+            "rtc_ramp_rate": ramp_rate,
+        }
+        info = {
+            "rtc_applied": True,
+            "rtc_previous_action_horizon": previous_horizon,
+            "rtc_overlap_steps": overlap_steps,
+            "rtc_frozen_steps": frozen_steps,
+            "rtc_ramp_rate": ramp_rate,
+        }
+        frozen_physical_prefix = None
+        if frozen_steps:
+            source_start = previous_horizon - overlap_steps
+            frozen_physical_prefix = {
+                key: previous_action[key][:, source_start : source_start + frozen_steps, :].copy()
+                for key in action_keys
+            }
+        return np.stack(normalized_batch, axis=0), model_options, info, frozen_physical_prefix
+
     def check_observation(self, observation: dict[str, Any]) -> None:
         """Validate that the observation has the correct structure and types.
 
@@ -397,7 +642,9 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional inference parameters. ``inference_mode='rtc'``
+                accepts an unconsumed physical action tail plus RTC overlap/frozen
+                settings; synchronous behavior is unchanged when omitted.
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -405,22 +652,37 @@ class Gr00tPolicy(BasePolicy):
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
+        states = [obs["state"] for obs in unbatched_observations]
+        (
+            rtc_action_input,
+            model_options,
+            inference_info,
+            frozen_physical_prefix,
+        ) = self._prepare_rtc_action_input(options, states)
 
         # Step 2: Process each observation through the VLA processor
-        states = []
         for obs in unbatched_observations:
             vla_step_data = self._to_vla_step_data(obs)
-            states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
 
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
+        if rtc_action_input is not None:
+            try:
+                collated_inputs["inputs"]["action"] = torch.from_numpy(rtc_action_input)
+            except (KeyError, TypeError) as exc:
+                raise RuntimeError(
+                    "The policy collator does not expose inputs['action']; RTC is unsupported"
+                ) from exc
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            if model_options is None:
+                model_pred = self.model.get_action(**collated_inputs)
+            else:
+                model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -430,12 +692,15 @@ class Gr00tPolicy(BasePolicy):
         unnormalized_action = self.processor.decode_action(
             normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
         )
+        if frozen_physical_prefix is not None:
+            for key, frozen_targets in frozen_physical_prefix.items():
+                unnormalized_action[key][:, : frozen_targets.shape[1], :] = frozen_targets
 
         # Cast all actions to float32 for consistency
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        return casted_action, inference_info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
