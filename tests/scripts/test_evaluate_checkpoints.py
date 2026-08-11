@@ -15,6 +15,7 @@ from scripts.analysis_tools.evaluate_checkpoints import (
     plot_checkpoint_metric_summary,
     plot_checkpoint_progress,
     plot_error_heatmap,
+    plot_evaluation_summaries,
     plot_trajectory,
     raw_action_frame,
     raw_predictions_csv_path,
@@ -183,7 +184,9 @@ def test_joint_trajectory_plot_labels_visible_frame_axes(tmp_path, monkeypatch):
     )
 
 
-def test_checkpoint_summary_styles_metrics_and_two_line_panels(tmp_path, monkeypatch):
+def test_checkpoint_summary_splits_magnitude_metrics_with_matching_colours(
+    tmp_path, monkeypatch
+):
     saved_figures = []
 
     def capture_figure(figure, *_args, **_kwargs):
@@ -210,34 +213,34 @@ def test_checkpoint_summary_styles_metrics_and_two_line_panels(tmp_path, monkeyp
     plot_checkpoint_metric_summary(pd.DataFrame(rows), tmp_path / "summary.png")
 
     axes_by_title = {axis.get_title(): axis for axis in saved_figures[0].axes}
-    for title in ("Aggregate MSE", "Aggregate prediction bias", "Worst observed error"):
+    for title in ("Aggregate prediction bias", "Worst observed error"):
         split_lines = {line.get_label(): line for line in axes_by_title[title].lines}
         assert split_lines["Train Probe"].get_color() == "tab:blue"
         assert split_lines["Validation"].get_color() == "tab:orange"
         assert split_lines["Train Probe"].get_linestyle() == "-"
         assert split_lines["Validation"].get_linestyle() == "-"
 
-    magnitude_lines = {
-        line.get_label(): line for line in axes_by_title["Aggregate error magnitude"].lines
+    expected_metric_colours = {
+        "MAE": "tab:blue",
+        "RMSE": "tab:orange",
+        "MSE": "tab:purple",
+        "Median absolute error": "tab:green",
+        "95th-percentile absolute error": "tab:red",
     }
-    assert (
-        magnitude_lines["Train Probe MAE"].get_color()
-        == magnitude_lines["Validation MAE"].get_color()
-    )
-    assert magnitude_lines["Train Probe MAE"].get_linestyle() == "--"
-    assert magnitude_lines["Validation MAE"].get_linestyle() == "-"
-    magnitude_legend = axes_by_title["Aggregate error magnitude"].get_legend()
-    assert magnitude_legend._ncols == 1
-    assert [text.get_text() for text in magnitude_legend.get_texts()] == [
-        "MAE — Validation",
-        "MAE — Train Probe",
-        "RMSE — Validation",
-        "RMSE — Train Probe",
-        "median absolute error — Validation",
-        "median absolute error — Train Probe",
-        "95th-percentile absolute error — Validation",
-        "95th-percentile absolute error — Train Probe",
-    ]
+    for title in ("Validation error magnitude", "Train Probe error magnitude"):
+        magnitude_lines = {line.get_label(): line for line in axes_by_title[title].lines}
+        assert set(magnitude_lines) == set(expected_metric_colours)
+        for metric, colour in expected_metric_colours.items():
+            line = magnitude_lines[metric]
+            assert line.get_color() == colour
+            assert line.get_linewidth() == 1.0
+            assert line.get_markersize() == 4.0
+            assert line.get_alpha() == 0.72
+        legend = axes_by_title[title].get_legend()
+        assert legend._ncols == 1
+        assert [text.get_text() for text in legend.get_texts()] == list(
+            expected_metric_colours
+        )
 
 
 def test_checkpoint_progress_legend_explains_color_and_line_style(tmp_path, monkeypatch):
@@ -272,6 +275,60 @@ def test_checkpoint_progress_legend_explains_color_and_line_style(tmp_path, monk
         "MAE — Train Probe",
         "RMSE — Validation",
         "RMSE — Train Probe",
+    ]
+
+
+def test_step_zero_summaries_also_create_finetuned_only_views(tmp_path, monkeypatch):
+    summary = pd.DataFrame(
+        [
+            {
+                "split": split,
+                "checkpoint_step": step,
+                "mae": 0.2,
+            }
+            for split in ("train_probe", "validation")
+            for step in (0, 2000)
+        ]
+    )
+    joints = pd.DataFrame(
+        [
+            {
+                "split": split,
+                "checkpoint_step": step,
+                "joint": "right_arm[0]",
+                "mae": 0.2,
+            }
+            for split in ("train_probe", "validation")
+            for step in (0, 2000)
+        ]
+    )
+    saved_paths = []
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "plot_checkpoint_progress",
+        lambda _summary, path, _scope: saved_paths.append(path.name),
+    )
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "plot_checkpoint_metric_summary",
+        lambda _summary, path, _scope: saved_paths.append(path.name),
+    )
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "plot_joint_checkpoint_heatmap",
+        lambda _joints, _labels, path, _scope: saved_paths.append(path.name),
+    )
+    monkeypatch.setattr(evaluate_checkpoints, "plot_best_checkpoint_joints", lambda *_args: None)
+
+    plot_evaluation_summaries(tmp_path, summary, joints, ["right_arm[0]"])
+
+    assert saved_paths == [
+        "checkpoint_error_progress.png",
+        "checkpoint_metric_summary.png",
+        "joint_error_by_checkpoint.png",
+        "checkpoint_error_progress_finetuned_only.png",
+        "checkpoint_metric_summary_finetuned_only.png",
+        "joint_error_by_checkpoint_finetuned_only.png",
     ]
 
 

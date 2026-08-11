@@ -584,6 +584,18 @@ def split_linestyle(split: str) -> str:
     return "--" if split.startswith("train") else "-"
 
 
+SUMMARY_LINE_WIDTH = 1.0
+SUMMARY_MARKER_SIZE = 4.0
+SUMMARY_ALPHA = 0.72
+MAGNITUDE_METRICS = [
+    ("mae", "MAE", "tab:blue"),
+    ("rmse", "RMSE", "tab:orange"),
+    ("mse", "MSE", "tab:purple"),
+    ("median_absolute_error", "Median absolute error", "tab:green"),
+    ("p95_absolute_error", "95th-percentile absolute error", "tab:red"),
+]
+
+
 def plot_checkpoint_progress(
     summary: pd.DataFrame,
     path: Path,
@@ -602,6 +614,9 @@ def plot_checkpoint_progress(
             color="tab:blue",
             linestyle=linestyle,
             label=f"{label} MAE",
+            linewidth=SUMMARY_LINE_WIDTH,
+            markersize=SUMMARY_MARKER_SIZE,
+            alpha=SUMMARY_ALPHA,
         )
         axis.plot(
             split_summary["checkpoint_step"],
@@ -610,6 +625,9 @@ def plot_checkpoint_progress(
             color="tab:orange",
             linestyle=linestyle,
             label=f"{label} RMSE",
+            linewidth=SUMMARY_LINE_WIDTH,
+            markersize=SUMMARY_MARKER_SIZE,
+            alpha=SUMMARY_ALPHA,
         )
     axis.set_xlabel("Checkpoint step")
     axis.set_ylabel("Unnormalized action error")
@@ -629,6 +647,9 @@ def plot_checkpoint_progress(
                     marker="o",
                     linestyle="-",
                     label=f"{metric_label} — Validation",
+                    linewidth=SUMMARY_LINE_WIDTH,
+                    markersize=SUMMARY_MARKER_SIZE,
+                    alpha=SUMMARY_ALPHA,
                 ),
                 Line2D(
                     [0],
@@ -637,6 +658,9 @@ def plot_checkpoint_progress(
                     marker="o",
                     linestyle="--",
                     label=f"{metric_label} — Train Probe",
+                    linewidth=SUMMARY_LINE_WIDTH,
+                    markersize=SUMMARY_MARKER_SIZE,
+                    alpha=SUMMARY_ALPHA,
                 ),
             )
         ],
@@ -653,8 +677,6 @@ def plot_checkpoint_metric_summary(
     path: Path,
     scope_label: str | None = None,
 ) -> None:
-    from matplotlib.lines import Line2D
-
     figure, axes = plt.subplots(
         2,
         2,
@@ -662,40 +684,36 @@ def plot_checkpoint_metric_summary(
         sharex=True,
     )
 
-    magnitude_axis = axes[0, 0]
-    mse_axis = axes[0, 1]
+    validation_magnitude_axis = axes[0, 0]
+    train_magnitude_axis = axes[0, 1]
     bias_axis = axes[1, 0]
     maximum_axis = axes[1, 1]
 
     all_steps = sorted(summary["checkpoint_step"].unique())
-    magnitude_metrics = [
-        ("mae", "MAE", "tab:blue"),
-        ("rmse", "RMSE", "tab:orange"),
-        ("median_absolute_error", "median absolute error", "tab:green"),
-        ("p95_absolute_error", "95th-percentile absolute error", "tab:red"),
-    ]
+    magnitude_axes = {
+        "validation": validation_magnitude_axis,
+        "train_probe": train_magnitude_axis,
+    }
+    populated_magnitude_splits = set()
     for split, split_summary in summary_splits(summary):
         steps = split_summary["checkpoint_step"]
         label = split_label(split)
-        linestyle = split_linestyle(split)
+        magnitude_split = "train_probe" if split.startswith("train") else "validation"
+        magnitude_axis = magnitude_axes[magnitude_split]
+        populated_magnitude_splits.add(magnitude_split)
         split_color = "tab:blue" if split.startswith("train") else "tab:orange"
-        for column, metric_label, color in magnitude_metrics:
+        for column, metric_label, color in MAGNITUDE_METRICS:
             magnitude_axis.plot(
                 steps,
                 split_summary[column],
                 marker="o",
                 color=color,
-                linestyle=linestyle,
-                label=f"{label} {metric_label}",
+                linestyle="-",
+                label=metric_label,
+                linewidth=SUMMARY_LINE_WIDTH,
+                markersize=SUMMARY_MARKER_SIZE,
+                alpha=SUMMARY_ALPHA,
             )
-        mse_axis.plot(
-            steps,
-            split_summary["mse"],
-            marker="o",
-            color=split_color,
-            linestyle="-",
-            label=label,
-        )
         bias_axis.plot(
             steps,
             split_summary["bias"],
@@ -703,6 +721,9 @@ def plot_checkpoint_metric_summary(
             color=split_color,
             linestyle="-",
             label=label,
+            linewidth=SUMMARY_LINE_WIDTH,
+            markersize=SUMMARY_MARKER_SIZE,
+            alpha=SUMMARY_ALPHA,
         )
         maximum_axis.plot(
             steps,
@@ -711,41 +732,25 @@ def plot_checkpoint_metric_summary(
             color=split_color,
             linestyle="-",
             label=label,
+            linewidth=SUMMARY_LINE_WIDTH,
+            markersize=SUMMARY_MARKER_SIZE,
+            alpha=SUMMARY_ALPHA,
         )
-    magnitude_axis.set_ylabel("Action error")
-    magnitude_axis.set_title("Aggregate error magnitude")
-    magnitude_legend_handles = [
-        handle
-        for _, metric_label, color in magnitude_metrics
-        for handle in (
-            Line2D(
-                [0],
-                [0],
-                color=color,
-                marker="o",
-                linestyle="-",
-                label=f"{metric_label} — Validation",
-            ),
-            Line2D(
-                [0],
-                [0],
-                color=color,
-                marker="o",
-                linestyle="--",
-                label=f"{metric_label} — Train Probe",
-            ),
-        )
-    ]
-    magnitude_axis.legend(
-        handles=magnitude_legend_handles,
-        fontsize=8,
-        handlelength=3.5,
-        ncol=1,
-    )
-
-    mse_axis.set_ylabel("Squared action error")
-    mse_axis.set_title("Aggregate MSE")
-    mse_axis.legend()
+    for split, axis in magnitude_axes.items():
+        axis.set_ylabel("Metric value")
+        axis.set_title(f"{split_label(split)} error magnitude")
+        if split in populated_magnitude_splits:
+            axis.legend(fontsize=8, handlelength=2.5, ncol=1)
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                f"No {split_label(split).lower()} metrics",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                color="dimgray",
+            )
 
     bias_axis.axhline(0, color="black", linewidth=0.8, alpha=0.5)
     bias_axis.set_ylabel("Signed action error")
@@ -1117,15 +1122,21 @@ def plot_evaluation_summaries(
     filename_suffix: str = "",
     scope_label: str | None = None,
 ) -> int:
+    includes_base = bool((summary["checkpoint_step"] == 0).any())
+    full_scope_label = scope_label
+    if includes_base:
+        full_scope_label = " — ".join(
+            label for label in (scope_label, "Including base step 0") if label
+        )
     plot_checkpoint_progress(
         summary,
         output_dir / f"checkpoint_error_progress{filename_suffix}.png",
-        scope_label,
+        full_scope_label,
     )
     plot_checkpoint_metric_summary(
         summary,
         output_dir / f"checkpoint_metric_summary{filename_suffix}.png",
-        scope_label,
+        full_scope_label,
     )
     validation_summary = summary[summary["split"] == "validation"]
     validation_joints = joints[joints["split"] == "validation"]
@@ -1138,8 +1149,37 @@ def plot_evaluation_summaries(
         validation_joints,
         labels,
         output_dir / f"joint_error_by_checkpoint{filename_suffix}.png",
-        scope_label,
+        full_scope_label,
     )
+
+    finetuned_summary = summary[summary["checkpoint_step"] > 0]
+    finetuned_joints = joints[joints["checkpoint_step"] > 0]
+    if includes_base and not finetuned_summary.empty:
+        finetuned_scope_label = " — ".join(
+            label for label in (scope_label, "Finetuned checkpoints only") if label
+        )
+        finetuned_suffix = f"{filename_suffix}_finetuned_only"
+        plot_checkpoint_progress(
+            finetuned_summary,
+            output_dir / f"checkpoint_error_progress{finetuned_suffix}.png",
+            finetuned_scope_label,
+        )
+        plot_checkpoint_metric_summary(
+            finetuned_summary,
+            output_dir / f"checkpoint_metric_summary{finetuned_suffix}.png",
+            finetuned_scope_label,
+        )
+        finetuned_validation_joints = finetuned_joints[
+            finetuned_joints["split"] == "validation"
+        ]
+        if not finetuned_validation_joints.empty:
+            plot_joint_checkpoint_heatmap(
+                finetuned_validation_joints,
+                labels,
+                output_dir / f"joint_error_by_checkpoint{finetuned_suffix}.png",
+                finetuned_scope_label,
+            )
+
     best_step = int(
         validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
     )

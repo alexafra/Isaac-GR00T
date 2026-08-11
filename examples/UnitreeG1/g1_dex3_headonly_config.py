@@ -24,7 +24,7 @@ g1_dex3_headonly_config = {
         ],
     ),
     "action": ModalityConfig(
-        delta_indices=list(range(32)),
+        delta_indices=list(range(16)),
         modality_keys=[
             "left_arm",
             "right_arm",
