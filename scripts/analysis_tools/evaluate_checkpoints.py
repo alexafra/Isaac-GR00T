@@ -10,6 +10,7 @@ import json
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
@@ -51,7 +52,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional dataset containing training episodes to use as a fixed train probe.",
     )
-    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help=(
+            "Output directory. Defaults to "
+            "RUN_DIR/evaluation_exec_hor_<EXECUTION_HORIZON>."
+        ),
+    )
     parser.add_argument("--embodiment-tag", default="NEW_EMBODIMENT")
     parser.add_argument("--traj-ids", type=int, nargs="*")
     parser.add_argument(
@@ -317,6 +325,25 @@ def seed_inference(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def format_duration(seconds: float) -> str:
+    """Format an elapsed-time or ETA value for compact progress logs."""
+
+    seconds = max(0, round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m {seconds:02d}s"
+    return f"{seconds:d}s"
+
+
+def default_evaluation_output_dir(run_dir: Path, execution_horizon: int) -> Path:
+    """Keep results from different execution horizons in separate directories."""
+
+    return run_dir / f"evaluation_exec_hor_{execution_horizon}"
 
 
 def action_labels(trajectory: pd.DataFrame, action_keys: list[str]) -> list[str]:
@@ -974,6 +1001,7 @@ def evaluate_probe(
     trajectory_goals: dict[int, str],
     raw_predictions_path: Path | None,
     canonical_labels: list[str] | None,
+    checkpoint_progress_label: str,
 ) -> tuple[list[dict], dict, list[dict], list[str]]:
     episode_rows = []
     joint_rows = []
@@ -982,8 +1010,26 @@ def evaluate_probe(
     if raw_predictions_path is not None:
         initialize_raw_predictions_csv(raw_predictions_path)
 
-    for traj_id in trajectory_ids:
+    probe_started_at = time.perf_counter()
+    trajectory_count = len(trajectory_ids)
+    for trajectory_index, traj_id in enumerate(trajectory_ids, start=1):
+        trajectory_started_at = time.perf_counter()
         trajectory = loader[traj_id]
+        evaluation_steps = steps if steps > 0 else len(trajectory)
+        evaluation_steps = min(evaluation_steps, len(trajectory))
+        inference_count = ceil(evaluation_steps / execution_horizon)
+        progress_label = (
+            f"{checkpoint_progress_label} | {split} episode "
+            f"{trajectory_index}/{trajectory_count} traj={traj_id}"
+        )
+        goal = trajectory_goals.get(traj_id)
+        logging.info(
+            "[%s] starting: %d frame(s), %d inference request(s), goal=%r",
+            progress_label,
+            evaluation_steps,
+            inference_count,
+            goal,
+        )
         labels = action_labels(trajectory, action_keys)
         if canonical_labels is None:
             canonical_labels = labels
@@ -1001,7 +1047,6 @@ def evaluate_probe(
         original_plotter = open_loop_eval.plot_trajectory_results
         open_loop_eval.plot_trajectory_results = capture_plot
         try:
-            evaluation_steps = steps if steps > 0 else len(trajectory)
             mse, mae = open_loop_eval.evaluate_single_trajectory(
                 policy=policy,
                 loader=loader,
@@ -1011,6 +1056,7 @@ def evaluate_probe(
                 steps=evaluation_steps,
                 execution_horizon=execution_horizon,
                 save_plot_path=None,
+                progress_label=progress_label,
             )
         finally:
             open_loop_eval.plot_trajectory_results = original_plotter
@@ -1075,6 +1121,19 @@ def evaluate_probe(
                 goal,
             )
 
+        trajectory_elapsed = time.perf_counter() - trajectory_started_at
+        probe_elapsed = time.perf_counter() - probe_started_at
+        remaining_trajectories = trajectory_count - trajectory_index
+        probe_eta = probe_elapsed / trajectory_index * remaining_trajectories
+        logging.info(
+            "[%s] complete in %s: MAE=%.6f, MSE=%.6f; split ETA %s",
+            progress_label,
+            format_duration(trajectory_elapsed),
+            mae,
+            mse,
+            format_duration(probe_eta),
+        )
+
     if not checkpoint_errors:
         raise ValueError(f"The {split} probe contains no episodes")
 
@@ -1093,6 +1152,16 @@ def evaluate_probe(
         "bias": float(np.mean(combined)),
         "max_absolute_error": float(np.max(np.abs(combined))),
     }
+    logging.info(
+        "[%s | %s] complete in %s: %d episode(s), %d frame(s), MAE=%.6f, RMSE=%.6f",
+        checkpoint_progress_label,
+        split,
+        format_duration(time.perf_counter() - probe_started_at),
+        len(checkpoint_errors),
+        len(combined),
+        checkpoint_row["mae"],
+        checkpoint_row["rmse"],
+    )
 
     for index, label in enumerate(labels or []):
         values = combined[:, index]
@@ -1422,7 +1491,9 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
-    output_dir = args.output_dir or args.run_dir / "evaluation"
+    output_dir = args.output_dir or default_evaluation_output_dir(
+        args.run_dir, args.execution_horizon
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.plots_only:
         regenerate_plots(args, output_dir)
@@ -1438,14 +1509,26 @@ def main() -> None:
     checkpoint_rows = []
     joint_rows = []
     canonical_labels = None
+    evaluation_started_at = time.perf_counter()
+    target_count = len(targets)
+    logging.info(
+        "Evaluation plan: %d model target(s), checkpoint steps=%s, output=%s",
+        target_count,
+        [target.step for target in targets],
+        output_dir,
+    )
 
-    for target in targets:
+    for target_index, target in enumerate(targets, start=1):
+        target_started_at = time.perf_counter()
         step = target.step
+        checkpoint_progress_label = (
+            f"checkpoint {target_index}/{target_count} step={step}"
+        )
         checkpoint_dir = output_dir / target.output_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         logging.info(
-            "Loading checkpoint step %d: model=%s processor=%s",
-            step,
+            "[%s] loading model=%s processor=%s",
+            checkpoint_progress_label,
             target.model_path,
             target.processor_path or target.model_path,
         )
@@ -1516,7 +1599,8 @@ def main() -> None:
                 right_checkpoint_dir if split == "validation" else right_checkpoint_dir / split
             )
             logging.info(
-                "Evaluating %s on %d episode(s) from %s: %s",
+                "[%s | %s] evaluating %d episode(s) from %s: %s",
+                checkpoint_progress_label,
                 split,
                 len(trajectory_ids),
                 dataset_path,
@@ -1548,6 +1632,7 @@ def main() -> None:
                     trajectory_goals=trajectory_goals,
                     raw_predictions_path=raw_predictions_path,
                     canonical_labels=canonical_labels,
+                    checkpoint_progress_label=checkpoint_progress_label,
                 )
             )
             logging.info("Saved frame-level %s data to %s", split, raw_predictions_path)
@@ -1560,6 +1645,18 @@ def main() -> None:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        target_elapsed = time.perf_counter() - target_started_at
+        total_elapsed = time.perf_counter() - evaluation_started_at
+        remaining_targets = target_count - target_index
+        overall_eta = total_elapsed / target_index * remaining_targets
+        logging.info(
+            "[%s] finished in %s; overall %d/%d complete, estimated remaining %s",
+            checkpoint_progress_label,
+            format_duration(target_elapsed),
+            target_index,
+            target_count,
+            format_duration(overall_eta),
+        )
 
     episodes = pd.DataFrame(episode_rows)
     summary = pd.DataFrame(checkpoint_rows).sort_values(["split", "checkpoint_step"])
@@ -1597,6 +1694,11 @@ def main() -> None:
         f"{output_dir}/<checkpoint>/train_probe_frame_predictions.csv.gz"
     )
     print(f"Results: {output_dir}")
+    logging.info(
+        "Evaluation complete: %d model target(s) in %s",
+        target_count,
+        format_duration(time.perf_counter() - evaluation_started_at),
+    )
 
 
 if __name__ == "__main__":

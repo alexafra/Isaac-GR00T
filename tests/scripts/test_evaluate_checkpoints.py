@@ -1,5 +1,6 @@
 import json
 from argparse import Namespace
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -10,7 +11,10 @@ from scripts.analysis_tools import evaluate_checkpoints
 from scripts.analysis_tools.evaluate_checkpoints import (
     RAW_PREDICTION_COLUMNS,
     append_raw_predictions_csv,
+    default_evaluation_output_dir,
+    evaluate_probe,
     find_evaluation_targets,
+    format_duration,
     initialize_raw_predictions_csv,
     plot_checkpoint_metric_summary,
     plot_checkpoint_progress,
@@ -141,6 +145,79 @@ def test_inference_seed_restarts_torch_noise_for_each_model():
     second = torch.randn(8)
 
     torch.testing.assert_close(first, second)
+
+
+def test_progress_duration_format_is_compact():
+    assert format_duration(4.6) == "5s"
+    assert format_duration(125) == "2m 05s"
+    assert format_duration(3723) == "1h 02m 03s"
+
+
+def test_default_evaluation_output_records_execution_horizon(tmp_path):
+    assert default_evaluation_output_dir(tmp_path, 8) == tmp_path / "evaluation_exec_hor_8"
+    assert default_evaluation_output_dir(tmp_path, 16) == tmp_path / "evaluation_exec_hor_16"
+
+
+def test_evaluate_probe_passes_checkpoint_split_and_episode_progress(tmp_path, monkeypatch, caplog):
+    class FakeLoader:
+        def __getitem__(self, trajectory_id):
+            value = np.asarray([float(trajectory_id)], dtype=np.float32)
+            return pd.DataFrame({"action.right_arm": [value, value, value]})
+
+    progress_labels = []
+
+    def fake_evaluate_single_trajectory(**kwargs):
+        progress_labels.append(kwargs["progress_label"])
+        trajectory_id = kwargs["traj_id"]
+        ground_truth = np.full((3, 1), trajectory_id, dtype=np.float32)
+        prediction = ground_truth + 0.25
+        evaluate_checkpoints.open_loop_eval.plot_trajectory_results(
+            state_joints_across_time=ground_truth,
+            gt_action_across_time=ground_truth,
+            pred_action_across_time=prediction,
+            traj_id=trajectory_id,
+            state_keys=["right_arm"],
+            action_keys=["right_arm"],
+            execution_horizon=kwargs["execution_horizon"],
+            save_plot_path=None,
+        )
+        return 0.0625, 0.25
+
+    monkeypatch.setattr(
+        evaluate_checkpoints.open_loop_eval,
+        "evaluate_single_trajectory",
+        fake_evaluate_single_trajectory,
+    )
+    caplog.set_level("INFO")
+
+    evaluate_probe(
+        policy=SimpleNamespace(),
+        loader=FakeLoader(),
+        trajectory_ids=[4, 9],
+        split="validation",
+        checkpoint_step_value=2000,
+        plot_dir=tmp_path / "plots",
+        right_plot_dir=tmp_path / "right_plots",
+        embodiment_tag=evaluate_checkpoints.EmbodimentTag.NEW_EMBODIMENT,
+        action_keys=["right_arm"],
+        modality_keys=["right_arm"],
+        steps=0,
+        execution_horizon=8,
+        skip_trajectory_plots=True,
+        plot_trajectory_ids=set(),
+        trajectory_goals={4: "pick", 9: "place"},
+        raw_predictions_path=None,
+        canonical_labels=None,
+        checkpoint_progress_label="checkpoint 2/11 step=2000",
+    )
+
+    assert progress_labels == [
+        "checkpoint 2/11 step=2000 | validation episode 1/2 traj=4",
+        "checkpoint 2/11 step=2000 | validation episode 2/2 traj=9",
+    ]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("validation episode 1/2 traj=4" in message for message in messages)
+    assert any("validation episode 2/2 traj=9" in message for message in messages)
 
 
 def test_joint_trajectory_plot_labels_visible_frame_axes(tmp_path, monkeypatch):

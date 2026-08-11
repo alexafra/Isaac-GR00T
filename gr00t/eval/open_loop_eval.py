@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
+import time
 from typing import Any
 import warnings
 
@@ -142,6 +143,7 @@ def evaluate_single_trajectory(
     steps=300,
     execution_horizon=16,
     save_plot_path=None,
+    progress_label: str | None = None,
 ):
     # Ensure steps doesn't exceed trajectory length
     traj = loader[traj_id]
@@ -150,6 +152,9 @@ def evaluate_single_trajectory(
     logging.info(
         f"Using {actual_steps} steps (requested: {steps}, trajectory length: {traj_length})"
     )
+    progress_label = progress_label or f"trajectory {traj_id}"
+    total_inferences = (actual_steps + execution_horizon - 1) // execution_horizon
+    trajectory_started_at = time.perf_counter()
 
     pred_action_across_time = []
 
@@ -168,9 +173,10 @@ def evaluate_single_trajectory(
 
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
-    for step_count in range(0, actual_steps, execution_horizon):
+    for inference_index, step_count in enumerate(
+        range(0, actual_steps, execution_horizon), start=1
+    ):
         data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
-        logging.info(f"inferencing at step: {step_count}")
         obs = {}
         for k, v in data_point.states.items():
             obs[f"state.{k}"] = v  # (T, D)
@@ -179,7 +185,27 @@ def evaluate_single_trajectory(
         for language_key in loader.modality_configs["language"].modality_keys:
             obs[language_key] = data_point.text
         parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
+        inference_started_at = time.perf_counter()
         _action_chunk, _ = policy.get_action(parsed_obs)
+        inference_seconds = time.perf_counter() - inference_started_at
+        elapsed_seconds = time.perf_counter() - trajectory_started_at
+        completed_frame = min(step_count + execution_horizon, actual_steps)
+        remaining_inferences = total_inferences - inference_index
+        estimated_remaining_seconds = elapsed_seconds / inference_index * remaining_inferences
+        logging.info(
+            "[%s] inference %d/%d complete: frames %d-%d/%d (%.1f%%), "
+            "request %.3fs, episode elapsed %.1fs, episode ETA %.1fs",
+            progress_label,
+            inference_index,
+            total_inferences,
+            step_count + 1,
+            completed_frame,
+            actual_steps,
+            100.0 * completed_frame / actual_steps,
+            inference_seconds,
+            elapsed_seconds,
+            estimated_remaining_seconds,
+        )
         action_chunk = parse_action_gr00t(_action_chunk)
         for j in range(execution_horizon):
             # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
