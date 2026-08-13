@@ -4,29 +4,29 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import gc
 import gzip
 import json
 import logging
+from math import ceil
+from pathlib import Path
 import random
 import re
 import time
-from dataclasses import dataclass
-from math import ceil
-from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")
-from matplotlib import pyplot as plt
-import numpy as np
-import pandas as pd
-import torch
 
+matplotlib.use("Agg")
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.eval import open_loop_eval
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from matplotlib import pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,10 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help=(
-            "Output directory. Defaults to "
-            "RUN_DIR/evaluation_exec_hor_<EXECUTION_HORIZON>."
-        ),
+        help=("Output directory. Defaults to RUN_DIR/evaluation_exec_hor_<EXECUTION_HORIZON>."),
     )
     parser.add_argument("--embodiment-tag", default="NEW_EMBODIMENT")
     parser.add_argument("--traj-ids", type=int, nargs="*")
@@ -102,6 +99,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modality-keys", nargs="+", default=None)
     parser.add_argument("--skip-trajectory-plots", action="store_true")
     parser.add_argument(
+        "--velocity-analysis",
+        action="store_true",
+        help=(
+            "Opt in to per-trajectory joint-velocity plots and all-frame joint "
+            "position/velocity statistics. Position, error, and checkpoint plots are "
+            "generated without this flag."
+        ),
+    )
+    parser.add_argument(
         "--plots-only",
         action="store_true",
         help=(
@@ -111,9 +117,7 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if args.train_dataset_path is None and (args.train_traj_ids or args.train_probe_episodes):
-        parser.error(
-            "--train-traj-ids and --train-probe-episodes require --train-dataset-path"
-        )
+        parser.error("--train-traj-ids and --train-probe-episodes require --train-dataset-path")
     return args
 
 
@@ -346,12 +350,101 @@ def default_evaluation_output_dir(run_dir: Path, execution_horizon: int) -> Path
     return run_dir / f"evaluation_exec_hor_{execution_horizon}"
 
 
-def action_labels(trajectory: pd.DataFrame, action_keys: list[str]) -> list[str]:
+def load_dataset_fps(dataset_path: Path) -> float:
+    """Load the sampling rate used to turn action-target differences into velocities."""
+
+    info_path = dataset_path / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(
+            f"Cannot calculate action-target velocities; missing dataset metadata: {info_path}"
+        )
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        fps = float(info["fps"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot calculate action-target velocities; {info_path} has no valid fps"
+        ) from exc
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(
+            f"Cannot calculate action-target velocities; {info_path} fps must be positive, "
+            f"got {fps}"
+        )
+    return fps
+
+
+def joint_labels(
+    trajectory: pd.DataFrame,
+    column_prefix: str,
+    keys: list[str],
+) -> list[str]:
     labels = []
-    for key in action_keys:
-        width = np.asarray(trajectory.iloc[0][f"action.{key}"]).reshape(-1).size
+    for key in keys:
+        column = f"{column_prefix}.{key}"
+        if column not in trajectory:
+            raise ValueError(f"Trajectory is missing required column {column}")
+        width = np.asarray(trajectory.iloc[0][column]).reshape(-1).size
         labels.extend(f"{key}[{index}]" for index in range(width))
     return labels
+
+
+def action_labels(trajectory: pd.DataFrame, action_keys: list[str]) -> list[str]:
+    return joint_labels(trajectory, "action", action_keys)
+
+
+def save_figure_with_parent(figure, path: Path, **savefig_kwargs) -> None:
+    """Create a plot parent at write time and retry once if it disappears concurrently."""
+
+    for attempt in range(2):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            figure.savefig(path, **savefig_kwargs)
+            return
+        except FileNotFoundError:
+            if attempt:
+                raise
+            logging.warning("Plot output directory disappeared; recreating %s", path.parent)
+
+
+def align_measured_state_to_action_labels(
+    measured_state: np.ndarray,
+    *,
+    trajectory: pd.DataFrame,
+    state_keys: list[str],
+    action_labels_to_match: list[str],
+    frame_count: int,
+) -> np.ndarray:
+    """Reorder captured observation.state columns to the plotted action-joint schema."""
+
+    measured_state = np.asarray(measured_state)
+    if measured_state.ndim != 2:
+        raise ValueError(
+            f"Expected captured measured state [frames, joints], got {measured_state.shape}"
+        )
+    state_labels = joint_labels(trajectory, "state", state_keys)
+    if measured_state.shape[1] != len(state_labels):
+        raise ValueError(
+            f"Captured measured state has {measured_state.shape[1]} columns but state schema "
+            f"describes {len(state_labels)}: {state_labels}"
+        )
+    if measured_state.shape[0] < frame_count:
+        raise ValueError(
+            f"Captured measured state has {measured_state.shape[0]} frames but evaluation "
+            f"produced {frame_count} action-target frames"
+        )
+    if len(set(state_labels)) != len(state_labels):
+        raise ValueError(f"State schema contains duplicate joint labels: {state_labels}")
+    state_indices = {label: index for index, label in enumerate(state_labels)}
+    missing_labels = [label for label in action_labels_to_match if label not in state_indices]
+    if missing_labels:
+        raise ValueError(
+            "Cannot align measured observation.state to action targets; state schema is "
+            f"missing: {missing_labels}"
+        )
+    return measured_state[
+        :frame_count,
+        [state_indices[label] for label in action_labels_to_match],
+    ]
 
 
 def plot_trajectory(
@@ -362,8 +455,10 @@ def plot_trajectory(
     path: Path,
     execution_horizon: int,
     goal: str | None = None,
+    measured_state: np.ndarray | None = None,
 ) -> None:
     from collections import defaultdict
+
     from matplotlib.ticker import MaxNLocator, MultipleLocator
 
     groups: dict[str, list[tuple[int, str]]] = defaultdict(list)
@@ -378,15 +473,20 @@ def plot_trajectory(
     n_cols = len(ordered_keys)
     max_rows = max(len(groups[key]) for key in ordered_keys)
 
-    # Find the data range required by each joint.
-    joint_minimums = np.minimum(
-        np.nanmin(gt, axis=0),
-        np.nanmin(pred, axis=0),
-    )
-    joint_maximums = np.maximum(
-        np.nanmax(gt, axis=0),
-        np.nanmax(pred, axis=0),
-    )
+    if measured_state is not None:
+        measured_state = np.asarray(measured_state)
+        if measured_state.shape != gt.shape:
+            raise ValueError(
+                f"Measured-state shape {measured_state.shape} does not match action-target "
+                f"shape {gt.shape}"
+            )
+
+    # Find the data range required by each joint across every displayed signal.
+    displayed_positions = [gt, pred]
+    if measured_state is not None:
+        displayed_positions.append(measured_state)
+    joint_minimums = np.nanmin(np.stack(displayed_positions), axis=(0, 1))
+    joint_maximums = np.nanmax(np.stack(displayed_positions), axis=(0, 1))
     joint_ranges = joint_maximums - joint_minimums
 
     # Give every subplot the range required by the widest-ranging joint.
@@ -398,25 +498,7 @@ def plot_trajectory(
     # Add 10% vertical padding.
     common_y_span *= 1.10
 
-    # Choose one readable tick interval for every subplot.
-    raw_tick_step = common_y_span / 6.0
-    exponent = np.floor(np.log10(raw_tick_step))
-    fraction = raw_tick_step / (10**exponent)
-
-    if fraction <= 1:
-        nice_fraction = 1
-    elif fraction <= 2:
-        nice_fraction = 2
-    elif fraction <= 2.5:
-        nice_fraction = 2.5
-    elif fraction <= 5:
-        nice_fraction = 5
-    else:
-        nice_fraction = 10
-
     tick_step = 0.1
-    #tick_step = float(nice_fraction * (10**exponent))
-
 
     col_width = 4.5
     row_height = 8.5
@@ -442,16 +524,25 @@ def plot_trajectory(
 
             joint_index, label = items[row]
 
+            if measured_state is not None:
+                axis.plot(
+                    measured_state[:, joint_index],
+                    linewidth=1.2,
+                    color="tab:green",
+                    label="measured joint state",
+                )
             axis.plot(
                 gt[:, joint_index],
                 linewidth=1.2,
-                label="ground truth",
+                color="tab:blue",
+                label="demonstration action target",
             )
             axis.plot(
                 pred[:, joint_index],
                 linewidth=1.0,
                 alpha=0.85,
-                label="prediction",
+                color="tab:orange",
+                label="model-predicted action target",
             )
 
             inference_steps = np.arange(
@@ -482,9 +573,7 @@ def plot_trajectory(
             # )
 
             # Centre each joint independently but use the same total span.
-            joint_centre = (
-                joint_minimums[joint_index] + joint_maximums[joint_index]
-            ) / 2.0
+            joint_centre = (joint_minimums[joint_index] + joint_maximums[joint_index]) / 2.0
 
             axis.set_ylim(
                 joint_centre - common_y_span / 2.0,
@@ -516,13 +605,236 @@ def plot_trajectory(
     figure.text(
         0.5,
         header_y,
-        f"Common y-axis span: {common_y_span:.3f} joint units",
+        f"Common y-axis span: {common_y_span:.3f} rad; action targets are setpoints, "
+        "not measured q",
         ha="center",
         va="top",
         fontsize=9,
     )
     figure.subplots_adjust(top=0.94, hspace=0.38, wspace=0.30)
-    figure.savefig(path, dpi=150, bbox_inches="tight")
+    save_figure_with_parent(figure, path, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+
+
+def action_target_velocities(
+    ground_truth: np.ndarray,
+    prediction: np.ndarray,
+    dataset_fps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Finite-difference absolute action targets without inventing a frame-0 velocity."""
+
+    ground_truth = np.asarray(ground_truth)
+    prediction = np.asarray(prediction)
+    if ground_truth.shape != prediction.shape:
+        raise ValueError(
+            f"Ground-truth shape {ground_truth.shape} does not match prediction shape "
+            f"{prediction.shape}"
+        )
+    if ground_truth.ndim != 2:
+        raise ValueError(f"Expected [frames, joints] action targets, got {ground_truth.shape}")
+    if not np.isfinite(dataset_fps) or dataset_fps <= 0:
+        raise ValueError(f"Dataset FPS must be positive, got {dataset_fps}")
+
+    transition_frames = np.arange(1, ground_truth.shape[0])
+    ground_truth_velocity = np.diff(ground_truth, axis=0) * dataset_fps
+    prediction_velocity = np.diff(prediction, axis=0) * dataset_fps
+    return transition_frames, ground_truth_velocity, prediction_velocity
+
+
+def plot_action_target_velocities(
+    ground_truth: np.ndarray,
+    prediction: np.ndarray,
+    labels: list[str],
+    title: str,
+    path: Path,
+    execution_horizon: int,
+    dataset_fps: float,
+    goal: str | None = None,
+    measured_state: np.ndarray | None = None,
+) -> None:
+    """Plot finite-difference measured positions and action targets without conflating them."""
+
+    from collections import defaultdict
+
+    from matplotlib.ticker import MaxNLocator
+
+    if execution_horizon <= 0:
+        raise ValueError(f"Execution horizon must be positive, got {execution_horizon}")
+    transition_frames, gt_velocity, pred_velocity = action_target_velocities(
+        ground_truth,
+        prediction,
+        dataset_fps,
+    )
+    if ground_truth.shape[1] != len(labels):
+        raise ValueError(f"Expected {ground_truth.shape[1]} action labels, got {len(labels)}")
+    measured_velocity = None
+    if measured_state is not None:
+        measured_state = np.asarray(measured_state)
+        if measured_state.shape != ground_truth.shape:
+            raise ValueError(
+                f"Measured-state shape {measured_state.shape} does not match action-target "
+                f"shape {ground_truth.shape}"
+            )
+        measured_velocity = np.diff(measured_state, axis=0) * dataset_fps
+
+    groups: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for index, label in enumerate(labels):
+        key = label.split("[")[0]
+        groups[key].append((index, label))
+
+    preferred = ["left_arm", "left_hand", "right_arm", "right_hand"]
+    ordered_keys = [key for key in preferred if key in groups]
+    ordered_keys += [key for key in groups if key not in ordered_keys]
+    if not ordered_keys:
+        raise ValueError("Cannot plot action-target velocities without action labels")
+
+    n_cols = len(ordered_keys)
+    max_rows = max(len(groups[key]) for key in ordered_keys)
+    figure, axes = plt.subplots(
+        max_rows,
+        n_cols,
+        figsize=(4.5 * n_cols, 3.0 * max_rows),
+        sharex=True,
+        squeeze=False,
+    )
+
+    chunk_transitions = np.arange(
+        execution_horizon,
+        ground_truth.shape[0],
+        execution_horizon,
+    )
+    for column, key in enumerate(ordered_keys):
+        items = groups[key]
+        for row in range(max_rows):
+            axis = axes[row, column]
+            if row >= len(items):
+                axis.set_visible(False)
+                continue
+
+            joint_index, label = items[row]
+            if transition_frames.size:
+                gt_joint_velocity = gt_velocity[:, joint_index]
+                pred_joint_velocity = pred_velocity[:, joint_index]
+                measured_joint_velocity = (
+                    measured_velocity[:, joint_index] if measured_velocity is not None else None
+                )
+                if measured_joint_velocity is not None:
+                    axis.plot(
+                        transition_frames,
+                        measured_joint_velocity,
+                        linewidth=1.2,
+                        color="tab:green",
+                        label="measured joint velocity from state q",
+                    )
+                axis.plot(
+                    transition_frames,
+                    gt_joint_velocity,
+                    linewidth=1.2,
+                    color="tab:blue",
+                    label="demonstration action-target velocity",
+                )
+                axis.plot(
+                    transition_frames,
+                    pred_joint_velocity,
+                    linewidth=1.0,
+                    alpha=0.85,
+                    color="tab:orange",
+                    label="model-predicted action-target velocity",
+                )
+                velocity_series = [gt_joint_velocity, pred_joint_velocity]
+                if measured_joint_velocity is not None:
+                    velocity_series.append(measured_joint_velocity)
+                finite_values = np.concatenate(
+                    [values[np.isfinite(values)] for values in velocity_series]
+                )
+                max_absolute_velocity = (
+                    float(np.max(np.abs(finite_values))) if finite_values.size else 1.0
+                )
+                if max_absolute_velocity <= 0:
+                    max_absolute_velocity = 1.0
+                axis.set_ylim(-1.10 * max_absolute_velocity, 1.10 * max_absolute_velocity)
+                maximum_parts = []
+                if measured_joint_velocity is not None:
+                    measured_finite = measured_joint_velocity[np.isfinite(measured_joint_velocity)]
+                    measured_max = (
+                        float(np.max(np.abs(measured_finite))) if measured_finite.size else np.nan
+                    )
+                    maximum_parts.append(f"measured={measured_max:.3f}")
+                for name, values in (
+                    ("demo target", gt_joint_velocity),
+                    ("pred target", pred_joint_velocity),
+                ):
+                    finite = values[np.isfinite(values)]
+                    maximum = float(np.max(np.abs(finite))) if finite.size else np.nan
+                    maximum_parts.append(f"{name}={maximum:.3f}")
+                maximum_text = "max |v| rad/s: " + "; ".join(maximum_parts)
+            else:
+                maximum_text = "max |v|=n/a (fewer than 2 frames)"
+                axis.text(
+                    0.5,
+                    0.5,
+                    "No target-velocity samples\n(fewer than 2 action-target frames)",
+                    transform=axis.transAxes,
+                    ha="center",
+                    va="center",
+                    color="dimgray",
+                    fontsize=8,
+                )
+                axis.set_xlim(0, 1)
+
+            for chunk_transition in chunk_transitions:
+                axis.axvline(
+                    chunk_transition,
+                    color="red",
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.30,
+                    label=(
+                        "cross-chunk transition" if chunk_transition == execution_horizon else None
+                    ),
+                )
+
+            axis.axhline(0, color="black", linewidth=0.6, alpha=0.35)
+            axis.set_title(f"{label}\n{maximum_text}", fontsize=8)
+            axis.set_xlabel("Transition frame")
+            axis.set_ylabel("Joint / action-target velocity (rad/s)")
+            if transition_frames.size:
+                axis.set_xlim(1, max(1, ground_truth.shape[0] - 1))
+            axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
+            axis.tick_params(axis="x", which="both", bottom=True, labelbottom=True)
+            axis.grid(alpha=0.2)
+
+    legend_handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+    if legend_handles:
+        axes[0, 0].legend(legend_handles, legend_labels, fontsize=7)
+    figure.suptitle(
+        f"{title} — measured joint and action-target velocities",
+        fontsize=14,
+    )
+    header_y = 0.975
+    if goal:
+        figure.text(
+            0.5,
+            header_y,
+            f"Goal: {goal}",
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="dimgray",
+        )
+        header_y -= 0.018
+    figure.text(
+        0.5,
+        header_y,
+        f"v[t] = (position[t] - position[t-1]) x {dataset_fps:g} FPS; measured line "
+        "uses state q; target lines are setpoint changes; chunk-boundary transitions "
+        "are retained",
+        ha="center",
+        va="top",
+        fontsize=9,
+    )
+    figure.subplots_adjust(top=0.93, hspace=0.55, wspace=0.35)
+    save_figure_with_parent(figure, path, dpi=150, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -552,7 +864,7 @@ def plot_error_heatmap(
         )
     figure.colorbar(image, ax=axis, label="Absolute error (joint units)")
     figure.tight_layout()
-    figure.savefig(path, dpi=160)
+    save_figure_with_parent(figure, path, dpi=160)
     plt.close(figure)
 
 
@@ -564,7 +876,9 @@ def plot_right_trajectory_outputs(
     plot_dir: Path,
     trajectory_id: int,
     execution_horizon: int,
+    dataset_fps: float | None,
     goal: str | None,
+    measured_state: np.ndarray | None = None,
 ) -> None:
     indices = right_action_indices(labels)
     if not indices:
@@ -574,6 +888,7 @@ def plot_right_trajectory_outputs(
     plot_dir.mkdir(parents=True, exist_ok=True)
     right_ground_truth = ground_truth[:, indices]
     right_prediction = prediction[:, indices]
+    right_measured_state = measured_state[:, indices] if measured_state is not None else None
     right_labels = [labels[index] for index in indices]
     plot_trajectory(
         right_ground_truth,
@@ -583,7 +898,20 @@ def plot_right_trajectory_outputs(
         plot_dir / f"trajectory_{trajectory_id:04d}_joints.png",
         execution_horizon,
         goal,
+        measured_state=right_measured_state,
     )
+    if dataset_fps is not None:
+        plot_action_target_velocities(
+            right_ground_truth,
+            right_prediction,
+            right_labels,
+            f"{title} — right arm + right hand",
+            plot_dir / f"trajectory_{trajectory_id:04d}_joint_velocities.png",
+            execution_horizon,
+            dataset_fps,
+            goal,
+            measured_state=right_measured_state,
+        )
     plot_error_heatmap(
         right_prediction - right_ground_truth,
         right_labels,
@@ -695,7 +1023,7 @@ def plot_checkpoint_progress(
         handlelength=3.5,
     )
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    save_figure_with_parent(figure, path, dpi=180)
     plt.close(figure)
 
 
@@ -798,7 +1126,7 @@ def plot_checkpoint_metric_summary(
         title += f" — {scope_label}"
     figure.suptitle(title)
     figure.tight_layout(rect=(0, 0, 1, 0.96))
-    figure.savefig(path, dpi=180)
+    save_figure_with_parent(figure, path, dpi=180)
     plt.close(figure)
 
 
@@ -825,7 +1153,7 @@ def plot_joint_checkpoint_heatmap(
     axis.set_title(title)
     figure.colorbar(image, ax=axis, label="MAE (joint units)")
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    save_figure_with_parent(figure, path, dpi=180)
     plt.close(figure)
 
 
@@ -848,11 +1176,11 @@ def plot_best_checkpoint_joints(
     axis.set_title(title)
     axis.grid(axis="y", alpha=0.25)
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    save_figure_with_parent(figure, path, dpi=180)
     plt.close(figure)
 
 
-RAW_PREDICTION_COLUMNS = [
+LEGACY_RAW_PREDICTION_COLUMNS = [
     "checkpoint_step",
     "trajectory",
     "frame",
@@ -862,18 +1190,45 @@ RAW_PREDICTION_COLUMNS = [
     "error",
     "absolute_error",
 ]
+RAW_PREDICTION_COLUMNS = [*LEGACY_RAW_PREDICTION_COLUMNS, "measured_state"]
 RAW_PREDICTION_FILENAMES = {
     "validation": "validation_frame_predictions.csv.gz",
     "train_probe": "train_probe_frame_predictions.csv.gz",
 }
 RIGHT_ACTION_PREFIXES = ("right_arm[", "right_hand[")
+JOINT_POSITION_VELOCITY_STATISTICS_FILENAME = "joint_position_velocity_statistics.csv"
+JOINT_POSITION_VELOCITY_STATISTICS_COLUMNS = [
+    "checkpoint_step",
+    "split",
+    "execution_horizon",
+    "dataset_fps",
+    "joint",
+    "source",
+    "episodes",
+    "position_samples",
+    "velocity_samples",
+    "within_chunk_velocity_samples",
+    "chunk_boundary_velocity_samples",
+    "position_min_rad",
+    "position_max_rad",
+    "absolute_position_p95_rad",
+    "absolute_position_p99_rad",
+    "absolute_position_max_rad",
+    "absolute_velocity_p95_rad_s",
+    "absolute_velocity_p99_rad_s",
+    "absolute_velocity_max_rad_s",
+    "within_chunk_absolute_velocity_p95_rad_s",
+    "within_chunk_absolute_velocity_p99_rad_s",
+    "within_chunk_absolute_velocity_max_rad_s",
+    "chunk_boundary_absolute_velocity_p95_rad_s",
+    "chunk_boundary_absolute_velocity_p99_rad_s",
+    "chunk_boundary_absolute_velocity_max_rad_s",
+]
 
 
 def right_action_indices(labels: list[str]) -> list[int]:
     return [
-        index
-        for index, label in enumerate(labels)
-        if str(label).startswith(RIGHT_ACTION_PREFIXES)
+        index for index, label in enumerate(labels) if str(label).startswith(RIGHT_ACTION_PREFIXES)
     ]
 
 
@@ -918,9 +1273,7 @@ def right_summary_from_raw_predictions(
                 "split": split,
                 "checkpoint_step": step,
                 "episodes": int(right_predictions["trajectory"].nunique()),
-                "frames": len(
-                    right_predictions[["trajectory", "frame"]].drop_duplicates()
-                ),
+                "frames": len(right_predictions[["trajectory", "frame"]].drop_duplicates()),
                 "mae": float(np.mean(absolute_error)),
                 "mse": mse,
                 "median_absolute_error": float(np.median(absolute_error)),
@@ -943,6 +1296,7 @@ def raw_action_frame(
     ground_truth: np.ndarray,
     prediction: np.ndarray,
     labels: list[str],
+    measured_state: np.ndarray | None = None,
 ) -> pd.DataFrame:
     if ground_truth.shape != prediction.shape:
         raise ValueError(
@@ -950,12 +1304,22 @@ def raw_action_frame(
             f"{prediction.shape}"
         )
     if ground_truth.ndim != 2 or ground_truth.shape[1] != len(labels):
-        raise ValueError(
-            f"Expected [frames, {len(labels)} joints], got {ground_truth.shape}"
-        )
+        raise ValueError(f"Expected [frames, {len(labels)} joints], got {ground_truth.shape}")
+    if measured_state is not None:
+        measured_state = np.asarray(measured_state)
+        if measured_state.shape != ground_truth.shape:
+            raise ValueError(
+                f"Measured-state shape {measured_state.shape} does not match action-target "
+                f"shape {ground_truth.shape}"
+            )
 
     frame_count, joint_count = ground_truth.shape
     error = prediction - ground_truth
+    measured_values = (
+        measured_state.reshape(-1)
+        if measured_state is not None
+        else np.full(frame_count * joint_count, np.nan)
+    )
     return pd.DataFrame(
         {
             "checkpoint_step": np.full(frame_count * joint_count, checkpoint_step_value),
@@ -966,9 +1330,393 @@ def raw_action_frame(
             "prediction": prediction.reshape(-1),
             "error": error.reshape(-1),
             "absolute_error": np.abs(error).reshape(-1),
+            "measured_state": measured_values,
         },
         columns=RAW_PREDICTION_COLUMNS,
     )
+
+
+def ensure_measured_state_in_raw_predictions(
+    raw_predictions: pd.DataFrame,
+    *,
+    dataset_path: Path,
+    state_cache: dict[tuple, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """Fill missing measured q values from exact saved episode/frame/joint parquet rows."""
+
+    missing_columns = set(LEGACY_RAW_PREDICTION_COLUMNS) - set(raw_predictions.columns)
+    if missing_columns:
+        raise ValueError(
+            "Raw prediction CSV is missing columns: " + ", ".join(sorted(missing_columns))
+        )
+    result = raw_predictions.copy()
+    if "measured_state" not in result:
+        result["measured_state"] = np.nan
+    measured_values = pd.to_numeric(result["measured_state"], errors="coerce")
+    if np.all(np.isfinite(measured_values.to_numpy(dtype=float))):
+        result["measured_state"] = measured_values
+        return result
+    if state_cache is None:
+        state_cache = {}
+
+    meta_dir = dataset_path / "meta"
+    info_path = meta_dir / "info.json"
+    modality_path = meta_dir / "modality.json"
+    episodes_path = meta_dir / "episodes.jsonl"
+    for metadata_path in (info_path, modality_path, episodes_path):
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot load measured observation.state; missing {metadata_path}"
+            )
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        modality = json.loads(modality_path.read_text(encoding="utf-8"))
+        episodes = [
+            json.loads(line)
+            for line in episodes_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        data_path_pattern = str(info["data_path"])
+        chunk_size = int(info["chunks_size"])
+        state_schema = modality["state"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot load measured observation.state; invalid dataset metadata under {meta_dir}"
+        ) from exc
+    if chunk_size <= 0 or not isinstance(state_schema, dict):
+        raise ValueError(f"Invalid state/chunk schema under {meta_dir}")
+
+    label_specs: dict[str, tuple[str, int]] = {}
+    for label in result["joint"].drop_duplicates().astype(str):
+        match = re.fullmatch(r"(.+)\[(\d+)\]", label)
+        if match is None:
+            raise ValueError(f"Cannot map measured state for invalid joint label {label!r}")
+        group_name, local_index_text = match.groups()
+        if group_name not in state_schema:
+            raise ValueError(
+                f"Measured-state schema has no group {group_name!r} required by {label}"
+            )
+        group_schema = state_schema[group_name]
+        try:
+            start = int(group_schema["start"])
+            end = int(group_schema["end"])
+            original_key = str(group_schema.get("original_key", "observation.state"))
+            local_index = int(local_index_text)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid measured-state schema for group {group_name!r}") from exc
+        if start < 0 or end <= start or not 0 <= local_index < end - start:
+            raise ValueError(
+                f"Measured-state schema range [{start}, {end}) does not contain {label}"
+            )
+        label_specs[label] = (original_key, start + local_index)
+
+    key_columns = ["trajectory", "frame", "joint"]
+    if result.duplicated(key_columns).any():
+        raise ValueError("Raw prediction CSV contains duplicate trajectory/frame/joint rows")
+
+    for trajectory_value, trajectory_rows in result.groupby("trajectory", sort=False):
+        trajectory_id = int(trajectory_value)
+        if float(trajectory_value) != trajectory_id or not 0 <= trajectory_id < len(episodes):
+            raise ValueError(
+                f"Saved trajectory ID {trajectory_value!r} is not a valid dataset episode index"
+            )
+        episode_record = episodes[trajectory_id]
+        try:
+            episode_index = int(episode_record["episode_index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid episode metadata record at index {trajectory_id}") from exc
+        parquet_relative_path = data_path_pattern.format(
+            episode_chunk=episode_index // chunk_size,
+            episode_index=episode_index,
+        )
+        parquet_path = dataset_path / parquet_relative_path
+        if not parquet_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot load measured observation.state; missing {parquet_path}"
+            )
+        schema_key = tuple(
+            sorted(
+                (label, original_key, state_index)
+                for label, (original_key, state_index) in label_specs.items()
+            )
+        )
+        cache_key = (str(dataset_path.resolve()), episode_index, schema_key)
+        measured_episode = state_cache.get(cache_key)
+        if measured_episode is None:
+            episode_data = pd.read_parquet(parquet_path)
+            if "episode_index" in episode_data:
+                parquet_episode_ids = set(
+                    pd.to_numeric(episode_data["episode_index"], errors="raise").astype(int)
+                )
+                if parquet_episode_ids != {episode_index}:
+                    raise ValueError(
+                        f"{parquet_path} contains episode IDs "
+                        f"{sorted(parquet_episode_ids)}, expected only {episode_index}"
+                    )
+            if "frame_index" not in episode_data:
+                raise ValueError(
+                    f"Cannot safely align measured state; {parquet_path} has no frame_index column"
+                )
+            frame_numbers = pd.to_numeric(episode_data["frame_index"], errors="raise").astype(int)
+            if frame_numbers.duplicated().any():
+                raise ValueError(f"{parquet_path} contains duplicate frame_index values")
+            episode_data = episode_data.set_index(frame_numbers)
+            measured_episode = pd.DataFrame(index=episode_data.index)
+            for label, (original_key, state_index) in label_specs.items():
+                if original_key not in episode_data:
+                    raise ValueError(
+                        f"Measured-state source column {original_key!r} for {label} is "
+                        f"absent from {parquet_path}"
+                    )
+                label_values = []
+                for frame, raw_state in episode_data[original_key].items():
+                    state_vector = np.asarray(raw_state).reshape(-1)
+                    if state_index >= len(state_vector):
+                        raise ValueError(
+                            f"Measured-state vector {original_key!r} at episode "
+                            f"{episode_index} frame {frame} has width {len(state_vector)}, "
+                            f"cannot read index {state_index} for {label}"
+                        )
+                    label_values.append(float(state_vector[state_index]))
+                label_array = np.asarray(label_values, dtype=float)
+                if not np.all(np.isfinite(label_array)):
+                    raise ValueError(
+                        f"Measured-state values for episode {episode_index} {label} are non-finite"
+                    )
+                measured_episode[label] = label_array
+            state_cache[cache_key] = measured_episode
+
+        requested_frames = trajectory_rows["frame"].astype(int)
+        missing_frames = sorted(set(requested_frames) - set(measured_episode.index))
+        if missing_frames:
+            raise ValueError(
+                f"{parquet_path} is missing saved frame indices {missing_frames} for "
+                f"trajectory {trajectory_id}"
+            )
+        for label, label_rows in trajectory_rows.groupby("joint", sort=False):
+            label = str(label)
+            label_frames = label_rows["frame"].astype(int).to_numpy()
+            loaded_values = measured_episode.loc[label_frames, label].to_numpy(dtype=float)
+            existing_values = measured_values.loc[label_rows.index].to_numpy(dtype=float)
+            disagreements = np.isfinite(existing_values) & ~np.isclose(
+                existing_values,
+                loaded_values,
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            if np.any(disagreements):
+                mismatch_index = int(np.flatnonzero(disagreements)[0])
+                raise ValueError(
+                    f"Saved measured state disagrees with dataset at trajectory "
+                    f"{trajectory_id} frame {label_frames[mismatch_index]} {label}: "
+                    f"{existing_values[mismatch_index]} vs {loaded_values[mismatch_index]}"
+                )
+            result.loc[label_rows.index, "measured_state"] = loaded_values
+
+    if not np.all(np.isfinite(result["measured_state"].to_numpy(dtype=float))):
+        raise ValueError("Failed to populate every saved measured-state row")
+    return result
+
+
+def joint_position_velocity_statistics(
+    raw_predictions: pd.DataFrame,
+    *,
+    split: str,
+    dataset_fps: float,
+    execution_horizon: int,
+) -> pd.DataFrame:
+    """Summarize measured q and action targets without crossing episode boundaries."""
+
+    missing_columns = set(RAW_PREDICTION_COLUMNS) - set(raw_predictions.columns)
+    if missing_columns:
+        raise ValueError(
+            "Raw prediction CSV is missing columns: " + ", ".join(sorted(missing_columns))
+        )
+    if not np.isfinite(dataset_fps) or dataset_fps <= 0:
+        raise ValueError(f"Dataset FPS must be positive, got {dataset_fps}")
+    if execution_horizon <= 0:
+        raise ValueError(f"Execution horizon must be positive, got {execution_horizon}")
+
+    rows = []
+    for (step_value, joint), joint_frame in raw_predictions.groupby(
+        ["checkpoint_step", "joint"],
+        sort=False,
+    ):
+        episode_count = int(joint_frame["trajectory"].nunique())
+        for source, value_column in (
+            ("measured_state", "measured_state"),
+            ("ground_truth_action_target", "ground_truth"),
+            ("predicted_action_target", "prediction"),
+        ):
+            positions = joint_frame[value_column].to_numpy(dtype=float)
+            if not np.all(np.isfinite(positions)):
+                raise ValueError(
+                    f"Checkpoint {step_value} {split} {joint} {source} contains "
+                    "non-finite joint positions"
+                )
+
+            episode_velocities = []
+            within_chunk_velocities = []
+            chunk_boundary_velocities = []
+            for trajectory_id, episode_frame in joint_frame.groupby("trajectory", sort=False):
+                episode_frame = episode_frame.sort_values("frame")
+                frame_numbers = episode_frame["frame"].to_numpy(dtype=int)
+                if len(np.unique(frame_numbers)) != len(frame_numbers):
+                    raise ValueError(
+                        f"Checkpoint {step_value} {split} trajectory {trajectory_id} "
+                        f"joint {joint} contains duplicate frames"
+                    )
+                if len(frame_numbers) > 1 and not np.all(np.diff(frame_numbers) == 1):
+                    raise ValueError(
+                        f"Checkpoint {step_value} {split} trajectory {trajectory_id} "
+                        f"joint {joint} contains non-contiguous frames"
+                    )
+                episode_positions = episode_frame[value_column].to_numpy(dtype=float)
+                if len(episode_positions) > 1:
+                    velocities = np.diff(episode_positions) * dataset_fps
+                    is_chunk_boundary = frame_numbers[1:] % execution_horizon == 0
+                    episode_velocities.append(velocities)
+                    within_chunk_velocities.append(velocities[~is_chunk_boundary])
+                    chunk_boundary_velocities.append(velocities[is_chunk_boundary])
+
+            target_velocities = (
+                np.concatenate(episode_velocities) if episode_velocities else np.empty(0)
+            )
+            within_chunk_target_velocities = (
+                np.concatenate(within_chunk_velocities) if within_chunk_velocities else np.empty(0)
+            )
+            chunk_boundary_target_velocities = (
+                np.concatenate(chunk_boundary_velocities)
+                if chunk_boundary_velocities
+                else np.empty(0)
+            )
+            absolute_positions = np.abs(positions)
+            absolute_velocities = np.abs(target_velocities)
+            within_chunk_absolute_velocities = np.abs(within_chunk_target_velocities)
+            chunk_boundary_absolute_velocities = np.abs(chunk_boundary_target_velocities)
+
+            def percentile_or_nan(values: np.ndarray, percentile: float) -> float:
+                return float(np.percentile(values, percentile)) if values.size else np.nan
+
+            def maximum_or_nan(values: np.ndarray) -> float:
+                return float(np.max(values)) if values.size else np.nan
+
+            rows.append(
+                {
+                    "checkpoint_step": int(step_value),
+                    "split": split,
+                    "execution_horizon": execution_horizon,
+                    "dataset_fps": dataset_fps,
+                    "joint": str(joint),
+                    "source": source,
+                    "episodes": episode_count,
+                    "position_samples": len(positions),
+                    "velocity_samples": len(target_velocities),
+                    "within_chunk_velocity_samples": len(within_chunk_target_velocities),
+                    "chunk_boundary_velocity_samples": len(chunk_boundary_target_velocities),
+                    "position_min_rad": float(np.min(positions)),
+                    "position_max_rad": float(np.max(positions)),
+                    "absolute_position_p95_rad": float(np.percentile(absolute_positions, 95)),
+                    "absolute_position_p99_rad": float(np.percentile(absolute_positions, 99)),
+                    "absolute_position_max_rad": float(np.max(absolute_positions)),
+                    "absolute_velocity_p95_rad_s": percentile_or_nan(absolute_velocities, 95),
+                    "absolute_velocity_p99_rad_s": percentile_or_nan(absolute_velocities, 99),
+                    "absolute_velocity_max_rad_s": maximum_or_nan(absolute_velocities),
+                    "within_chunk_absolute_velocity_p95_rad_s": percentile_or_nan(
+                        within_chunk_absolute_velocities, 95
+                    ),
+                    "within_chunk_absolute_velocity_p99_rad_s": percentile_or_nan(
+                        within_chunk_absolute_velocities, 99
+                    ),
+                    "within_chunk_absolute_velocity_max_rad_s": maximum_or_nan(
+                        within_chunk_absolute_velocities
+                    ),
+                    "chunk_boundary_absolute_velocity_p95_rad_s": percentile_or_nan(
+                        chunk_boundary_absolute_velocities, 95
+                    ),
+                    "chunk_boundary_absolute_velocity_p99_rad_s": percentile_or_nan(
+                        chunk_boundary_absolute_velocities, 99
+                    ),
+                    "chunk_boundary_absolute_velocity_max_rad_s": maximum_or_nan(
+                        chunk_boundary_absolute_velocities
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows, columns=JOINT_POSITION_VELOCITY_STATISTICS_COLUMNS)
+
+
+def write_joint_position_velocity_statistics(
+    *,
+    output_dir: Path,
+    summary: pd.DataFrame,
+    dataset_paths: dict[str, Path | None],
+    execution_horizon: int,
+    state_cache: dict[tuple, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """Build root/right all-frame measured-state and action-target statistics CSVs."""
+
+    statistic_frames = []
+    if state_cache is None:
+        state_cache = {}
+    split_steps = summary[["split", "checkpoint_step"]].drop_duplicates()
+    for split_value, step_value in split_steps.itertuples(index=False, name=None):
+        split = str(split_value)
+        step = int(step_value)
+        dataset_path = dataset_paths.get(split)
+        if dataset_path is None:
+            logging.warning(
+                "Cannot calculate %s target position/velocity statistics without its dataset path",
+                split,
+            )
+            continue
+        raw_path = raw_predictions_csv_path(output_dir / f"checkpoint-{step}", split)
+        if not raw_path.is_file():
+            logging.warning(
+                "Cannot calculate %s target position/velocity statistics; missing %s",
+                split,
+                raw_path,
+            )
+            continue
+        raw_predictions = pd.read_csv(raw_path, compression="gzip")
+        raw_predictions = ensure_measured_state_in_raw_predictions(
+            raw_predictions,
+            dataset_path=dataset_path,
+            state_cache=state_cache,
+        )
+        statistic_frames.append(
+            joint_position_velocity_statistics(
+                raw_predictions,
+                split=split,
+                dataset_fps=load_dataset_fps(dataset_path),
+                execution_horizon=execution_horizon,
+            )
+        )
+
+    if not statistic_frames:
+        logging.warning("No raw predictions were available for target statistics")
+        return pd.DataFrame(columns=JOINT_POSITION_VELOCITY_STATISTICS_COLUMNS)
+
+    statistics = pd.concat(statistic_frames, ignore_index=True).sort_values(
+        ["split", "checkpoint_step", "joint", "source"]
+    )
+    statistics_path = output_dir / JOINT_POSITION_VELOCITY_STATISTICS_FILENAME
+    statistics.to_csv(statistics_path, index=False)
+
+    right_statistics = statistics[
+        statistics["joint"].astype(str).str.startswith(RIGHT_ACTION_PREFIXES)
+    ].copy()
+    right_output_dir = output_dir / "right_arm_hand"
+    right_output_dir.mkdir(parents=True, exist_ok=True)
+    right_statistics.to_csv(
+        right_output_dir / JOINT_POSITION_VELOCITY_STATISTICS_FILENAME,
+        index=False,
+    )
+    logging.info(
+        "Saved all-frame measured-state/action-target position/velocity statistics to %s",
+        statistics_path,
+    )
+    return statistics
 
 
 def initialize_raw_predictions_csv(path: Path) -> None:
@@ -996,12 +1744,14 @@ def evaluate_probe(
     modality_keys: list[str] | None,
     steps: int,
     execution_horizon: int,
+    dataset_fps: float | None,
     skip_trajectory_plots: bool,
     plot_trajectory_ids: set[int],
     trajectory_goals: dict[int, str],
     raw_predictions_path: Path | None,
     canonical_labels: list[str] | None,
     checkpoint_progress_label: str,
+    velocity_analysis: bool = False,
 ) -> tuple[list[dict], dict, list[dict], list[str]]:
     episode_rows = []
     joint_rows = []
@@ -1038,11 +1788,13 @@ def evaluate_probe(
                 "Action dimensions changed between datasets, checkpoints, or trajectories"
             )
 
-        captured: dict[str, np.ndarray] = {}
+        captured: dict[str, object] = {}
 
         def capture_plot(**kwargs) -> None:
+            captured["measured_state"] = np.asarray(kwargs["state_joints_across_time"])
             captured["ground_truth"] = np.asarray(kwargs["gt_action_across_time"])
             captured["prediction"] = np.asarray(kwargs["pred_action_across_time"])
+            captured["state_keys"] = [str(key) for key in kwargs["state_keys"]]
 
         original_plotter = open_loop_eval.plot_trajectory_results
         open_loop_eval.plot_trajectory_results = capture_plot
@@ -1061,8 +1813,15 @@ def evaluate_probe(
         finally:
             open_loop_eval.plot_trajectory_results = original_plotter
 
-        gt = captured["ground_truth"]
-        pred = captured["prediction"]
+        gt = np.asarray(captured["ground_truth"])
+        pred = np.asarray(captured["prediction"])
+        measured_state = align_measured_state_to_action_labels(
+            np.asarray(captured["measured_state"]),
+            trajectory=trajectory,
+            state_keys=list(captured["state_keys"]),
+            action_labels_to_match=labels,
+            frame_count=len(gt),
+        )
         error = pred - gt
         checkpoint_errors.append(error)
         if raw_predictions_path is not None:
@@ -1074,6 +1833,7 @@ def evaluate_probe(
                     ground_truth=gt,
                     prediction=pred,
                     labels=labels,
+                    measured_state=measured_state,
                 ),
             )
         episode_rows.append(
@@ -1100,7 +1860,25 @@ def evaluate_probe(
                 plot_dir / f"trajectory_{traj_id:04d}_joints.png",
                 execution_horizon,
                 goal,
+                measured_state=measured_state,
             )
+            if velocity_analysis:
+                if dataset_fps is None:
+                    raise ValueError("Velocity analysis requires the dataset FPS")
+                plot_action_target_velocities(
+                    gt,
+                    pred,
+                    labels,
+                    (
+                        f"{split_label(split)}: checkpoint {checkpoint_step_value}, "
+                        f"trajectory {traj_id}"
+                    ),
+                    plot_dir / f"trajectory_{traj_id:04d}_joint_velocities.png",
+                    execution_horizon,
+                    dataset_fps,
+                    goal,
+                    measured_state=measured_state,
+                )
             plot_error_heatmap(
                 error,
                 labels,
@@ -1113,12 +1891,13 @@ def evaluate_probe(
                 gt,
                 pred,
                 labels,
-                f"{split_label(split)}: checkpoint {checkpoint_step_value}, "
-                f"trajectory {traj_id}",
+                f"{split_label(split)}: checkpoint {checkpoint_step_value}, trajectory {traj_id}",
                 right_plot_dir,
                 traj_id,
                 execution_horizon,
+                dataset_fps if velocity_analysis else None,
                 goal,
+                measured_state=measured_state,
             )
 
         trajectory_elapsed = time.perf_counter() - trajectory_started_at
@@ -1238,9 +2017,7 @@ def plot_evaluation_summaries(
             output_dir / f"checkpoint_metric_summary{finetuned_suffix}.png",
             finetuned_scope_label,
         )
-        finetuned_validation_joints = finetuned_joints[
-            finetuned_joints["split"] == "validation"
-        ]
+        finetuned_validation_joints = finetuned_joints[finetuned_joints["split"] == "validation"]
         if not finetuned_validation_joints.empty:
             plot_joint_checkpoint_heatmap(
                 finetuned_validation_joints,
@@ -1249,9 +2026,7 @@ def plot_evaluation_summaries(
                 finetuned_scope_label,
             )
 
-    best_step = int(
-        validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
-    )
+    best_step = int(validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"])
     plot_best_checkpoint_joints(
         validation_joints,
         best_step,
@@ -1297,7 +2072,7 @@ def raw_trajectory_arrays(
     raw_predictions: pd.DataFrame,
     trajectory_id: int,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    missing_columns = set(RAW_PREDICTION_COLUMNS) - set(raw_predictions.columns)
+    missing_columns = set(LEGACY_RAW_PREDICTION_COLUMNS) - set(raw_predictions.columns)
     if missing_columns:
         raise ValueError(
             "Raw prediction CSV is missing columns: " + ", ".join(sorted(missing_columns))
@@ -1324,6 +2099,37 @@ def raw_trajectory_arrays(
     ground_truth = ordered["ground_truth"].to_numpy().reshape(shape)
     prediction = ordered["prediction"].to_numpy().reshape(shape)
     return ground_truth, prediction, labels
+
+
+def raw_measured_state_array(
+    raw_predictions: pd.DataFrame,
+    trajectory_id: int,
+) -> np.ndarray:
+    """Return measured state using the exact frame/joint ordering of a raw trajectory."""
+
+    if "measured_state" not in raw_predictions:
+        raise ValueError("Raw prediction data has no measured_state column")
+    trajectory = raw_predictions[raw_predictions["trajectory"] == trajectory_id]
+    if trajectory.empty:
+        raise KeyError(f"Trajectory {trajectory_id} is absent from the raw prediction CSV")
+    labels = trajectory["joint"].drop_duplicates().astype(str).tolist()
+    frames = sorted(int(frame) for frame in trajectory["frame"].unique())
+    indexed = trajectory.set_index(["frame", "joint"])
+    if not indexed.index.is_unique:
+        raise ValueError(f"Trajectory {trajectory_id} contains duplicate frame/joint rows")
+    expected_index = pd.MultiIndex.from_product([frames, labels], names=["frame", "joint"])
+    ordered = indexed.reindex(expected_index)
+    measured_state = (
+        ordered["measured_state"]
+        .to_numpy(dtype=float)
+        .reshape(
+            len(frames),
+            len(labels),
+        )
+    )
+    if not np.all(np.isfinite(measured_state)):
+        raise ValueError(f"Trajectory {trajectory_id} contains missing measured-state values")
+    return measured_state
 
 
 def select_saved_plot_ids(
@@ -1363,9 +2169,12 @@ def regenerate_trajectory_plots(
     args: argparse.Namespace,
     output_dir: Path,
     checkpoint_steps: list[int],
+    state_cache: dict[tuple, pd.DataFrame] | None = None,
 ) -> None:
     if args.skip_trajectory_plots or args.trajectory_plot_episodes == 0:
         return
+    if state_cache is None:
+        state_cache = {}
 
     split_specs = [
         ("validation", args.dataset_path, args.traj_ids),
@@ -1384,6 +2193,12 @@ def regenerate_trajectory_plots(
                 continue
 
             raw_predictions = pd.read_csv(raw_path, compression="gzip")
+            if dataset_path is not None:
+                raw_predictions = ensure_measured_state_in_raw_predictions(
+                    raw_predictions,
+                    dataset_path=dataset_path,
+                    state_cache=state_cache,
+                )
             available_ids = sorted(int(value) for value in raw_predictions["trajectory"].unique())
             plot_ids = select_saved_plot_ids(
                 dataset_path=dataset_path,
@@ -1403,6 +2218,16 @@ def regenerate_trajectory_plots(
             }
             plot_dir = checkpoint_dir if split == "validation" else checkpoint_dir / split
             plot_dir.mkdir(parents=True, exist_ok=True)
+            if args.velocity_analysis and dataset_path is None:
+                logging.warning(
+                    "Cannot regenerate %s target-velocity plots without its dataset path",
+                    split,
+                )
+                dataset_fps = None
+            elif args.velocity_analysis:
+                dataset_fps = load_dataset_fps(dataset_path)
+            else:
+                dataset_fps = None
             right_checkpoint_dir = output_dir / "right_arm_hand" / f"checkpoint-{step}"
             right_plot_dir = (
                 right_checkpoint_dir if split == "validation" else right_checkpoint_dir / split
@@ -1418,6 +2243,11 @@ def regenerate_trajectory_plots(
                     raw_predictions,
                     trajectory_id,
                 )
+                measured_state = (
+                    raw_measured_state_array(raw_predictions, trajectory_id)
+                    if dataset_path is not None
+                    else None
+                )
                 error = prediction - ground_truth
                 goal = trajectory_goals.get(trajectory_id)
                 plot_trajectory(
@@ -1428,7 +2258,20 @@ def regenerate_trajectory_plots(
                     plot_dir / f"trajectory_{trajectory_id:04d}_joints.png",
                     args.execution_horizon,
                     goal,
+                    measured_state=measured_state,
                 )
+                if dataset_fps is not None:
+                    plot_action_target_velocities(
+                        ground_truth,
+                        prediction,
+                        labels,
+                        f"{split_label(split)}: checkpoint {step}, trajectory {trajectory_id}",
+                        plot_dir / f"trajectory_{trajectory_id:04d}_joint_velocities.png",
+                        args.execution_horizon,
+                        dataset_fps,
+                        goal,
+                        measured_state=measured_state,
+                    )
                 plot_error_heatmap(
                     error,
                     labels,
@@ -1445,7 +2288,9 @@ def regenerate_trajectory_plots(
                     right_plot_dir,
                     trajectory_id,
                     args.execution_horizon,
+                    dataset_fps,
                     goal,
+                    measured_state=measured_state,
                 )
 
 
@@ -1459,6 +2304,18 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
 
     summary = pd.read_csv(summary_path)
     joints = pd.read_csv(joints_path)
+    state_cache: dict[tuple, pd.DataFrame] = {}
+    if args.velocity_analysis:
+        write_joint_position_velocity_statistics(
+            output_dir=output_dir,
+            summary=summary,
+            dataset_paths={
+                "validation": args.dataset_path,
+                "train_probe": args.train_dataset_path,
+            },
+            execution_horizon=args.execution_horizon,
+            state_cache=state_cache,
+        )
     if args.checkpoint_steps:
         selected_steps = set(args.checkpoint_steps)
         summary = summary[summary["checkpoint_step"].isin(selected_steps)]
@@ -1480,6 +2337,7 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
         args=args,
         output_dir=output_dir,
         checkpoint_steps=checkpoint_steps,
+        state_cache=state_cache,
     )
 
     print(f"Regenerated plots from saved CSVs in {output_dir}")
@@ -1521,9 +2379,7 @@ def main() -> None:
     for target_index, target in enumerate(targets, start=1):
         target_started_at = time.perf_counter()
         step = target.step
-        checkpoint_progress_label = (
-            f"checkpoint {target_index}/{target_count} step={step}"
-        )
+        checkpoint_progress_label = f"checkpoint {target_index}/{target_count} step={step}"
         checkpoint_dir = output_dir / target.output_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         logging.info(
@@ -1545,9 +2401,7 @@ def main() -> None:
         seed_inference(args.inference_seed)
         modality = policy.get_modality_config()
         action_keys = (
-            modality["action"].modality_keys
-            if args.modality_keys is None
-            else args.modality_keys
+            modality["action"].modality_keys if args.modality_keys is None else args.modality_keys
         )
         probe_specs = [("validation", args.dataset_path, args.traj_ids, 0, 0)]
         if args.train_dataset_path is not None:
@@ -1562,9 +2416,13 @@ def main() -> None:
             )
 
         for split, dataset_path, selected_ids, episode_count, seed in probe_specs:
-            loader = LeRobotEpisodeLoader(
-                dataset_path=str(dataset_path), modality_configs=modality
-            )
+            loader = LeRobotEpisodeLoader(dataset_path=str(dataset_path), modality_configs=modality)
+            dataset_fps = load_dataset_fps(dataset_path) if args.velocity_analysis else None
+            if dataset_fps is not None and not np.isclose(float(loader.fps), dataset_fps):
+                raise ValueError(
+                    f"Loader FPS {loader.fps} does not match {dataset_path}/meta/info.json "
+                    f"FPS {dataset_fps}"
+                )
             trajectory_ids = select_trajectory_ids(
                 dataset_path,
                 len(loader),
@@ -1613,27 +2471,27 @@ def main() -> None:
             )
             raw_predictions_path = raw_predictions_csv_path(checkpoint_dir, split)
 
-            probe_episode_rows, checkpoint_row, probe_joint_rows, canonical_labels = (
-                evaluate_probe(
-                    policy=policy,
-                    loader=loader,
-                    trajectory_ids=trajectory_ids,
-                    split=split,
-                    checkpoint_step_value=step,
-                    plot_dir=plot_dir,
-                    right_plot_dir=right_plot_dir,
-                    embodiment_tag=embodiment_tag,
-                    action_keys=action_keys,
-                    modality_keys=args.modality_keys,
-                    steps=args.steps,
-                    execution_horizon=args.execution_horizon,
-                    skip_trajectory_plots=args.skip_trajectory_plots,
-                    plot_trajectory_ids=plot_trajectory_ids,
-                    trajectory_goals=trajectory_goals,
-                    raw_predictions_path=raw_predictions_path,
-                    canonical_labels=canonical_labels,
-                    checkpoint_progress_label=checkpoint_progress_label,
-                )
+            probe_episode_rows, checkpoint_row, probe_joint_rows, canonical_labels = evaluate_probe(
+                policy=policy,
+                loader=loader,
+                trajectory_ids=trajectory_ids,
+                split=split,
+                checkpoint_step_value=step,
+                plot_dir=plot_dir,
+                right_plot_dir=right_plot_dir,
+                embodiment_tag=embodiment_tag,
+                action_keys=action_keys,
+                modality_keys=args.modality_keys,
+                steps=args.steps,
+                execution_horizon=args.execution_horizon,
+                dataset_fps=dataset_fps,
+                skip_trajectory_plots=args.skip_trajectory_plots,
+                plot_trajectory_ids=plot_trajectory_ids,
+                trajectory_goals=trajectory_goals,
+                raw_predictions_path=raw_predictions_path,
+                canonical_labels=canonical_labels,
+                checkpoint_progress_label=checkpoint_progress_label,
+                velocity_analysis=args.velocity_analysis,
             )
             logging.info("Saved frame-level %s data to %s", split, raw_predictions_path)
             episode_rows.extend(probe_episode_rows)
@@ -1664,6 +2522,16 @@ def main() -> None:
     episodes.to_csv(output_dir / "metrics_per_episode.csv", index=False)
     summary.to_csv(output_dir / "metrics_by_checkpoint.csv", index=False)
     joints.to_csv(output_dir / "metrics_per_joint.csv", index=False)
+    if args.velocity_analysis:
+        write_joint_position_velocity_statistics(
+            output_dir=output_dir,
+            summary=summary,
+            dataset_paths={
+                "validation": args.dataset_path,
+                "train_probe": args.train_dataset_path,
+            },
+            execution_horizon=args.execution_horizon,
+        )
 
     checkpoint_summary_csv = output_dir / "checkpoint_metric_summary.csv"
     summary.to_csv(checkpoint_summary_csv, index=False)
@@ -1693,6 +2561,11 @@ def main() -> None:
         "Frame-level train-probe CSVs: "
         f"{output_dir}/<checkpoint>/train_probe_frame_predictions.csv.gz"
     )
+    if args.velocity_analysis:
+        print(
+            "All-frame measured-state/action-target position/velocity statistics: "
+            f"{output_dir}/{JOINT_POSITION_VELOCITY_STATISTICS_FILENAME}"
+        )
     print(f"Results: {output_dir}")
     logging.info(
         "Evaluation complete: %d model target(s) in %s",

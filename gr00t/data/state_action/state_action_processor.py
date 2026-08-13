@@ -330,6 +330,49 @@ class StateActionProcessor:
 
         return unnormalized_values
 
+    @staticmethod
+    def _normalization_params_for_action_horizon(
+        params: dict[str, np.ndarray],
+        action: np.ndarray,
+        *,
+        joint_group: str,
+    ) -> dict[str, np.ndarray]:
+        """Align temporal normalization statistics with a shortened action chunk.
+
+        Action statistics are normally one-dimensional ``(D,)`` arrays, but
+        relative-action statistics can be stored per prediction step as
+        ``(H, D)`` arrays.  RTC re-anchors the unconsumed physical tail to the
+        current observation, so a tail of length ``L`` represents the next
+        ``L`` targets and must use statistics rows ``0:L``.  Passing the full
+        ``(H, D)`` boolean normalization mask to an ``(L, D)`` action otherwise
+        raises a NumPy shape-mismatch error whenever ``L < H``.
+        """
+
+        if action.ndim < 2:
+            raise ValueError(
+                f"Action '{joint_group}' must have a temporal and feature axis, got {action.shape}"
+            )
+
+        action_horizon = action.shape[-2]
+        action_dim = action.shape[-1]
+        aligned = dict(params)
+        for name, value in params.items():
+            value = np.asarray(value)
+            if value.ndim != 2:
+                continue
+            if value.shape[1] != action_dim:
+                raise ValueError(
+                    f"Temporal normalization parameter '{name}' for action '{joint_group}' "
+                    f"has feature dimension {value.shape[1]}, expected {action_dim}"
+                )
+            if value.shape[0] < action_horizon:
+                raise ValueError(
+                    f"Temporal normalization parameter '{name}' for action '{joint_group}' "
+                    f"has horizon {value.shape[0]}, shorter than action horizon {action_horizon}"
+                )
+            aligned[name] = value[:action_horizon]
+        return aligned
+
     def apply_action(
         self,
         action: dict[str, np.ndarray],
@@ -408,7 +451,11 @@ class StateActionProcessor:
                     f"Joint group '{joint_group}' not found in action dict for embodiment '{embodiment_tag}'"
                 )
 
-            params = self.norm_params[embodiment_tag]["action"][joint_group]
+            params = self._normalization_params_for_action_horizon(
+                self.norm_params[embodiment_tag]["action"][joint_group],
+                action[joint_group],
+                joint_group=joint_group,
+            )
             if (
                 self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None
                 and joint_group
@@ -463,8 +510,12 @@ class StateActionProcessor:
                     f"Joint group '{joint_group}' not found in action dict for embodiment '{embodiment_tag}'"
                 )
 
-            params = self.norm_params[embodiment_tag]["action"][joint_group]
             group_values = action[joint_group]
+            params = self._normalization_params_for_action_horizon(
+                self.norm_params[embodiment_tag]["action"][joint_group],
+                group_values,
+                joint_group=joint_group,
+            )
 
             if (
                 self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None

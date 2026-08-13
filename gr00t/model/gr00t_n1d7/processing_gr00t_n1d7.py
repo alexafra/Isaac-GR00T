@@ -55,6 +55,47 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.pr
 
 logger = logging.getLogger(__name__)
 
+
+def _is_surface_normals_view(view: str) -> bool:
+    """Return whether a video view stores encoded camera-frame surface normals."""
+
+    return "surface_normal" in view.lower()
+
+
+def _is_geometry_view(view: str) -> bool:
+    """Return whether photometric augmentation would corrupt a video view."""
+
+    normalized = view.lower()
+    return "depth" in normalized or _is_surface_normals_view(normalized)
+
+
+def _surface_normals_views(
+    modality_configs: dict[str, dict[str, ModalityConfig]],
+) -> list[str]:
+    views = {
+        view
+        for embodiment_config in modality_configs.values()
+        if "video" in embodiment_config
+        for view in embodiment_config["video"].modality_keys
+        if _is_surface_normals_view(view)
+    }
+    return sorted(views)
+
+
+def _without_torchvision_color_jitter(image_transform: transforms.Compose):
+    """Clone a torchvision Compose without photometric ColorJitter transforms."""
+
+    if not isinstance(image_transform, transforms.Compose):
+        return image_transform
+    return transforms.Compose(
+        [
+            transform
+            for transform in image_transform.transforms
+            if not isinstance(transform, transforms.ColorJitter)
+        ]
+    )
+
+
 ### Projector-index assignments, declared as ``{projector_index: {tags}}``.
 #
 # This grouped form is the source of truth: a tag only shares a projector with
@@ -246,6 +287,14 @@ class Gr00tN1d7Processor(BaseProcessor):
         letter_box_transform: bool = False,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
+
+        surface_normals_views = _surface_normals_views(self.modality_configs)
+        if surface_normals_views and random_rotation_angle not in (None, 0):
+            raise ValueError(
+                "Random image rotation cannot be applied to encoded surface normals without "
+                "also rotating their x/y vector components. Set random_rotation_angle to 0 or "
+                f"None for surface-normal views {surface_normals_views}."
+            )
 
         # Initialize StateActionProcessor for state/action normalization
         self.state_action_processor = StateActionProcessor(
@@ -727,7 +776,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                     view_images,
                     masks=view_masks,
                     replay=replay,
-                    skip_color_jitter="depth" in view.lower(),
+                    skip_color_jitter=_is_geometry_view(view),
                 )
                 temporal_stacked_images[view] = torch.stack(transformed_images)  # (T, C, H, W)
         else:
@@ -736,10 +785,14 @@ class Gr00tN1d7Processor(BaseProcessor):
                     "Mask transforms require albumentations. Set use_albumentations_transforms=True."
                 )
             # Use torchvision transforms
+            geometry_image_transform = _without_torchvision_color_jitter(image_transform)
             for view in image_keys:
                 assert view in images, f"{view} not in {images}"
+                view_transform = (
+                    geometry_image_transform if _is_geometry_view(view) else image_transform
+                )
                 temporal_stacked_images[view] = torch.stack(
-                    [image_transform(img) for img in images[view]]
+                    [view_transform(img) for img in images[view]]
                 )  # (T, C, H, W)
 
         for k, v in temporal_stacked_images.items():

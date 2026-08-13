@@ -155,8 +155,9 @@ def test_deployment_contract_hash_is_independent_of_feature_insertion_order(tmp_
     first = _write_deployment_dataset(tmp_path / "first")
     second = _write_deployment_dataset(tmp_path / "second", reverse_video_order=True)
 
-    assert _load_deployment_dataset_contract(first)["sha256"] == (
-        _load_deployment_dataset_contract(second)["sha256"]
+    assert (
+        _load_deployment_dataset_contract(first)["sha256"]
+        == (_load_deployment_dataset_contract(second)["sha256"])
     )
 
 
@@ -168,9 +169,7 @@ def test_deployment_contract_hash_is_independent_of_feature_insertion_order(tmp_
         ("valid_value_range", [255, 1], "valid_value_range"),
     ],
 )
-def test_deployment_contract_rejects_malformed_depth_encoding(
-    tmp_path, field, value, message
-):
+def test_deployment_contract_rejects_malformed_depth_encoding(tmp_path, field, value, message):
     encoding = {
         "source_key": "depth_0",
         "feature_key": "observation.images.depth_gray_view",
@@ -182,6 +181,105 @@ def test_deployment_contract_rejects_malformed_depth_encoding(
     }
     encoding[field] = value
     dataset = _write_deployment_dataset(tmp_path, depth_encoding=encoding)
+
+    with pytest.raises(ValueError, match=message):
+        _load_deployment_dataset_contract(dataset)
+
+
+def _surface_normals_encoding():
+    return {
+        "source_key": "depth_0",
+        "aligned_to": "color_0",
+        "feature_key": "observation.images.surface_normals_view",
+        "encoding": "camera_xyz_uint8",
+        "encoding_version": 1,
+        "depth_scale_source": "episode.info.depth.scale_m_per_unit",
+        "default_scale_m_per_unit": 0.001,
+        "intrinsics": {
+            "model": "pinhole",
+            "width": 640,
+            "height": 480,
+            "fx": 605.421508789062,
+            "fy": 605.590515136719,
+            "cx": 321.856811523438,
+            "cy": 242.249740600586,
+        },
+        "axis_order": ["x", "y", "z"],
+        "coordinate_frame": "camera_optical_x_right_y_down_z_forward",
+        "orientation": "camera_facing_dot_normal_point_lte_zero",
+        "method": "central_difference_3d",
+        "neighbor_offset_pixels": 1,
+        "max_neighbor_depth_delta_m": 0.05,
+        "invalid_value": [0, 0, 0],
+        "valid_component_range": [1, 255],
+    }
+
+
+def _write_surface_normals_dataset(tmp_path, *, encoding=None, include_metadata=True):
+    dataset = tmp_path / "dataset"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    info = {
+        "robot_type": "TestBot",
+        "fps": 30,
+        "features": {
+            "observation.state": {"names": [["joint_a", "joint_b"]]},
+            "action": {"names": [["joint_a", "joint_b"]]},
+            "observation.images.ego_view": {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+            },
+            "observation.images.surface_normals_view": {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+            },
+        },
+    }
+    if include_metadata:
+        info["surface_normals_encoding"] = encoding or _surface_normals_encoding()
+    (meta / "info.json").write_text(json.dumps(info))
+    return dataset
+
+
+def test_load_deployment_dataset_contract_includes_surface_normals(tmp_path):
+    dataset = _write_surface_normals_dataset(tmp_path)
+
+    contract = _load_deployment_dataset_contract(dataset)
+
+    assert contract["video_shapes"]["surface_normals_view"] == [480, 640, 3]
+    assert contract["surface_normals_encoding"] == _surface_normals_encoding()
+    assert len(contract["sha256"]) == 64
+
+
+def test_surface_normals_view_requires_versioned_encoding_metadata(tmp_path):
+    dataset = _write_surface_normals_dataset(tmp_path, include_metadata=False)
+
+    with pytest.raises(ValueError, match="requires a surface_normals_encoding object"):
+        _load_deployment_dataset_contract(dataset)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(encoding_version=2), "encoding_version"),
+        (
+            lambda value: value["intrinsics"].update(width=848),
+            "intrinsics resolution",
+        ),
+        (
+            lambda value: value.update(feature_key="observation.images.wrong"),
+            "feature_key",
+        ),
+        (
+            lambda value: value.update(max_neighbor_depth_delta_m=0.0),
+            "max_neighbor_depth_delta_m",
+        ),
+    ],
+)
+def test_deployment_contract_rejects_malformed_surface_normals_encoding(tmp_path, mutate, message):
+    encoding = _surface_normals_encoding()
+    mutate(encoding)
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
 
     with pytest.raises(ValueError, match=message):
         _load_deployment_dataset_contract(dataset)

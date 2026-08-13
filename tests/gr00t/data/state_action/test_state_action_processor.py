@@ -219,6 +219,73 @@ class TestActionNormalization:
             atol=1e-6,
         )
 
+    def test_shortened_relative_rtc_tail_uses_prefix_of_temporal_statistics(self):
+        embodiment = "relative_rtc_temporal_stats"
+        trained_horizon = 32
+        tail_horizon = 16
+        modality_configs = {
+            embodiment: {
+                "state": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
+                "action": ModalityConfig(
+                    delta_indices=list(range(trained_horizon)),
+                    modality_keys=["joint"],
+                    action_configs=[
+                        ActionConfig(
+                            rep=ActionRepresentation.RELATIVE,
+                            type=ActionType.NON_EEF,
+                            format=ActionFormat.DEFAULT,
+                        )
+                    ],
+                ),
+            }
+        }
+        unit_stats = {
+            "min": [-1.0],
+            "max": [1.0],
+            "mean": [0.0],
+            "std": [1.0],
+            "q01": [-1.0],
+            "q99": [1.0],
+        }
+        temporal_midpoints = np.arange(trained_horizon, dtype=np.float32)[:, None]
+        temporal_stats = {
+            "min": (temporal_midpoints - 1.0).tolist(),
+            "max": (temporal_midpoints + 1.0).tolist(),
+            "mean": temporal_midpoints.tolist(),
+            "std": np.ones_like(temporal_midpoints).tolist(),
+            "q01": (temporal_midpoints - 1.0).tolist(),
+            "q99": (temporal_midpoints + 1.0).tolist(),
+        }
+        statistics = {
+            embodiment: {
+                "state": {"joint": unit_stats},
+                "action": {"joint": unit_stats},
+                "relative_action": {"joint": temporal_stats},
+            }
+        }
+        relative_processor = StateActionProcessor(
+            modality_configs=modality_configs,
+            statistics=statistics,
+            use_relative_action=True,
+            clip_outliers=False,
+        )
+        state = {"joint": np.array([[0.5]], dtype=np.float32)}
+        physical_tail = {
+            "joint": temporal_midpoints[:tail_horizon] + state["joint"][-1],
+        }
+
+        normalized = relative_processor.apply_action(
+            physical_tail,
+            embodiment,
+            state=state,
+            clip_outliers=False,
+        )
+
+        assert normalized["joint"].shape == (tail_horizon, 1)
+        np.testing.assert_allclose(normalized["joint"], 0.0, atol=1e-6)
+        recovered = relative_processor.unapply_action(normalized, embodiment, state=state)
+        np.testing.assert_allclose(recovered["joint"], physical_tail["joint"], atol=1e-6)
+
     def test_action_roundtrip(self, processor, modality_keys, statistics):
         _, action_keys = modality_keys
         # Use values within the normalization range to avoid clipping

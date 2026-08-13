@@ -17,15 +17,22 @@
 
 from pathlib import Path
 
+from gr00t.data.types import ModalityConfig
 from gr00t.model.gr00t_n1d7.image_augmentations import (
     apply_with_replay,
     build_image_transformations,
     build_image_transformations_albumentations,
 )
+from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import (
+    Gr00tN1d7Processor,
+    _is_geometry_view,
+    _without_torchvision_color_jitter,
+)
 import numpy as np
 from PIL import Image
 import pytest
 import torch
+import torchvision.transforms.v2 as transforms
 
 
 FIXTURE_DIR = Path(__file__).parent.parent.parent / "fixtures" / "processor_config"
@@ -139,6 +146,73 @@ class TestAlbumentationsTransforms:
 
         assert torch.all(color_images[0] == 50)
         assert torch.all(depth_images[0] == 100)
+
+    def test_surface_normals_are_a_geometry_view(self):
+        assert _is_geometry_view("depth_gray_view")
+        assert _is_geometry_view("surface_normals_view")
+        assert not _is_geometry_view("ego_view")
+
+    def test_processor_skips_color_jitter_for_surface_normals(self):
+        train_transform, _ = build_image_transformations_albumentations(
+            image_target_size=(16, 16),
+            image_crop_size=(16, 16),
+            random_rotation_angle=None,
+            color_jitter_params={
+                "brightness": (0.5, 0.5),
+                "contrast": 0.0,
+                "saturation": 0.0,
+                "hue": 0.0,
+            },
+            shortest_image_edge=None,
+            crop_fraction=None,
+        )
+        processor = object.__new__(Gr00tN1d7Processor)
+        processor.use_albumentations = True
+
+        def return_images(images, language):
+            return images
+
+        processor._apply_vlm_processing = return_images
+        image = Image.fromarray(np.full((16, 16, 3), 100, dtype=np.uint8))
+
+        result = processor._get_vlm_inputs(
+            image_keys=["ego_view", "surface_normals_view"],
+            images={"ego_view": [image], "surface_normals_view": [image]},
+            masks=None,
+            image_transform=train_transform,
+            language="test",
+        )
+
+        assert np.all(result[0] == 50)
+        assert np.all(result[1] == 100)
+
+    def test_torchvision_color_jitter_is_removed_for_geometry_views(self):
+        transform = transforms.Compose(
+            [
+                transforms.Resize((16, 16)),
+                transforms.ColorJitter(brightness=(0.5, 0.5)),
+            ]
+        )
+
+        geometry_transform = _without_torchvision_color_jitter(transform)
+
+        assert [type(value).__name__ for value in geometry_transform.transforms] == ["Resize"]
+
+    def test_surface_normals_reject_unadjusted_random_rotation(self):
+        modality_configs = {
+            "new_embodiment": {
+                "video": ModalityConfig(
+                    delta_indices=[0],
+                    modality_keys=["ego_view", "surface_normals_view"],
+                )
+            }
+        }
+
+        with pytest.raises(ValueError, match="rotating their x/y vector components"):
+            Gr00tN1d7Processor(
+                modality_configs=modality_configs,
+                random_rotation_angle=5,
+            )
 
     def test_letterbox_pad_is_not_in_transform_pipeline(self):
         transform_names = [

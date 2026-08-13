@@ -33,6 +33,9 @@ import yaml
 
 DEFAULT_MODEL_SERVER_PORT = 5555
 IMAGE_FEATURE_PREFIX = "observation.images."
+SURFACE_NORMALS_VIEW = "surface_normals_view"
+SURFACE_NORMALS_ENCODING = "camera_xyz_uint8"
+SURFACE_NORMALS_ENCODING_VERSION = 1
 
 
 def _load_video_shapes(features: dict) -> dict[str, list[int]]:
@@ -49,7 +52,10 @@ def _load_video_shapes(features: dict) -> dict[str, list[int]]:
         if (
             not isinstance(shape, list)
             or len(shape) != 3
-            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in shape)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in shape
+            )
         ):
             raise ValueError(
                 f"Deployment image feature {feature_key!r} must have a positive integer HWC shape"
@@ -96,9 +102,7 @@ def _load_depth_encoding(info: dict, video_shapes: dict[str, list[int]]) -> dict
             raise ValueError(f"Dataset depth_encoding.{field} is missing or malformed")
 
     if raw_encoding["feature_key"] != f"{IMAGE_FEATURE_PREFIX}depth_gray_view":
-        raise ValueError(
-            "Dataset depth_encoding.feature_key does not identify depth_gray_view"
-        )
+        raise ValueError("Dataset depth_encoding.feature_key does not identify depth_gray_view")
     near_m = float(raw_encoding["near_m"])
     far_m = float(raw_encoding["far_m"])
     if not math.isfinite(near_m) or not math.isfinite(far_m) or far_m <= near_m:
@@ -122,6 +126,129 @@ def _load_depth_encoding(info: dict, video_shapes: dict[str, list[int]]) -> dict
     }
 
 
+def _load_surface_normals_encoding(info: dict, video_shapes: dict[str, list[int]]) -> dict | None:
+    """Validate the versioned transform used for the model-visible normals view."""
+
+    has_normals_view = SURFACE_NORMALS_VIEW in video_shapes
+    raw_encoding = info.get("surface_normals_encoding")
+    if not has_normals_view:
+        if raw_encoding is not None:
+            raise ValueError(
+                "Dataset declares surface_normals_encoding but has no "
+                f"{IMAGE_FEATURE_PREFIX}{SURFACE_NORMALS_VIEW}"
+            )
+        return None
+    if not isinstance(raw_encoding, dict):
+        raise ValueError(
+            f"Dataset {SURFACE_NORMALS_VIEW} requires a surface_normals_encoding object"
+        )
+
+    expected_strings = {
+        "source_key": "depth_0",
+        "aligned_to": "color_0",
+        "feature_key": f"{IMAGE_FEATURE_PREFIX}{SURFACE_NORMALS_VIEW}",
+        "encoding": SURFACE_NORMALS_ENCODING,
+        "depth_scale_source": "episode.info.depth.scale_m_per_unit",
+        "coordinate_frame": "camera_optical_x_right_y_down_z_forward",
+        "orientation": "camera_facing_dot_normal_point_lte_zero",
+        "method": "central_difference_3d",
+    }
+    for field, expected in expected_strings.items():
+        if raw_encoding.get(field) != expected:
+            raise ValueError(f"Dataset surface_normals_encoding.{field} must be {expected!r}")
+
+    encoding_version = raw_encoding.get("encoding_version")
+    if (
+        isinstance(encoding_version, bool)
+        or not isinstance(encoding_version, int)
+        or encoding_version != SURFACE_NORMALS_ENCODING_VERSION
+    ):
+        raise ValueError(
+            "Dataset surface_normals_encoding.encoding_version must be the supported "
+            f"version {SURFACE_NORMALS_ENCODING_VERSION}"
+        )
+
+    default_scale = raw_encoding.get("default_scale_m_per_unit")
+    if (
+        isinstance(default_scale, bool)
+        or not isinstance(default_scale, (int, float))
+        or not math.isfinite(default_scale)
+        or default_scale <= 0
+    ):
+        raise ValueError(
+            "Dataset surface_normals_encoding.default_scale_m_per_unit must be positive and finite"
+        )
+
+    intrinsics = raw_encoding.get("intrinsics")
+    if not isinstance(intrinsics, dict) or intrinsics.get("model") != "pinhole":
+        raise ValueError(
+            "Dataset surface_normals_encoding.intrinsics must describe a pinhole camera"
+        )
+    normalized_intrinsics = {"model": "pinhole"}
+    for field in ("width", "height"):
+        value = intrinsics.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"Dataset surface_normals_encoding.intrinsics.{field} must be a positive integer"
+            )
+        normalized_intrinsics[field] = value
+    for field in ("fx", "fy", "cx", "cy"):
+        value = intrinsics.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"Dataset surface_normals_encoding.intrinsics.{field} must be finite")
+        if field in ("fx", "fy") and value <= 0:
+            raise ValueError(
+                f"Dataset surface_normals_encoding.intrinsics.{field} must be positive"
+            )
+        normalized_intrinsics[field] = float(value)
+
+    view_height, view_width, _ = video_shapes[SURFACE_NORMALS_VIEW]
+    if (normalized_intrinsics["height"], normalized_intrinsics["width"]) != (
+        view_height,
+        view_width,
+    ):
+        raise ValueError(
+            "Dataset surface_normals_encoding intrinsics resolution does not match "
+            f"{SURFACE_NORMALS_VIEW} shape"
+        )
+
+    if raw_encoding.get("axis_order") != ["x", "y", "z"]:
+        raise ValueError("Dataset surface_normals_encoding.axis_order must be ['x', 'y', 'z']")
+    neighbor_offset = raw_encoding.get("neighbor_offset_pixels")
+    if isinstance(neighbor_offset, bool) or neighbor_offset != 1:
+        raise ValueError("Dataset surface_normals_encoding.neighbor_offset_pixels must be 1")
+    max_depth_delta = raw_encoding.get("max_neighbor_depth_delta_m")
+    if (
+        isinstance(max_depth_delta, bool)
+        or not isinstance(max_depth_delta, (int, float))
+        or not math.isfinite(max_depth_delta)
+        or max_depth_delta <= 0
+    ):
+        raise ValueError(
+            "Dataset surface_normals_encoding.max_neighbor_depth_delta_m must be positive and finite"
+        )
+    if raw_encoding.get("invalid_value") != [0, 0, 0]:
+        raise ValueError("Dataset surface_normals_encoding.invalid_value must be [0, 0, 0]")
+    if raw_encoding.get("valid_component_range") != [1, 255]:
+        raise ValueError("Dataset surface_normals_encoding.valid_component_range must be [1, 255]")
+
+    return {
+        **expected_strings,
+        "encoding_version": encoding_version,
+        "default_scale_m_per_unit": float(default_scale),
+        "intrinsics": normalized_intrinsics,
+        "axis_order": ["x", "y", "z"],
+        "neighbor_offset_pixels": neighbor_offset,
+        "max_neighbor_depth_delta_m": float(max_depth_delta),
+        "invalid_value": [0, 0, 0],
+        "valid_component_range": [1, 255],
+    }
+
+
 def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
     """Load the hardware-facing parts of a LeRobot dataset contract."""
 
@@ -134,6 +261,7 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
         action_names = features["action"]["names"]
         video_shapes = _load_video_shapes(features)
         depth_encoding = _load_depth_encoding(info, video_shapes)
+        surface_normals_encoding = _load_surface_normals_encoding(info, video_shapes)
         if len(state_names) == 1 and isinstance(state_names[0], list):
             state_names = state_names[0]
         if len(action_names) == 1 and isinstance(action_names[0], list):
@@ -149,6 +277,8 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
         }
         if depth_encoding is not None:
             contract["depth_encoding"] = depth_encoding
+        if surface_normals_encoding is not None:
+            contract["surface_normals_encoding"] = surface_normals_encoding
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Cannot build a deployment contract from {info_path}: {exc}") from exc
     canonical = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
