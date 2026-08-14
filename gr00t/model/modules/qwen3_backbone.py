@@ -138,6 +138,9 @@ class Qwen3Backbone(torch.nn.Module):
         model_name: str = "nvidia/Cosmos-Reason2-2B",
         tune_llm: bool = False,
         tune_visual: bool = False,
+        tune_vision_patch_embed: bool = False,  # earlyfusion
+        vision_input_channels: int = 3,  # earlyfusion
+        vision_patch_embed_init: str = "original_rgb",  # earlyfusion
         select_layer: int = -1,
         reproject_vision: bool = True,
         use_flash_attention: bool = False,
@@ -194,8 +197,9 @@ class Qwen3Backbone(torch.nn.Module):
         while len(self.model.language_model.layers) > select_layer:
             self.model.language_model.layers.pop(-1)
 
+        self.expand_vision_input_channels(vision_input_channels, vision_patch_embed_init)  # fmt: skip  # earlyfusion
         self.select_layer = select_layer
-        self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
+        self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers, tune_vision_patch_embed)  # fmt: skip  # earlyfusion
         if load_bf16 and trainable_params_fp32:
             # cast trainable parameters to fp32
             for n, p in self.named_parameters():
@@ -209,6 +213,34 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
         self._apply_vision_patch_embed_channels_last()
+
+    def expand_vision_input_channels(self, input_channels: int, initialization: str) -> None:  # fmt: skip  # earlyfusion
+        if input_channels not in (3, 4, 6):  # earlyfusion
+            raise ValueError(f"vision_input_channels must be 3, 4, or 6; got {input_channels}")  # fmt: skip  # earlyfusion
+        patch_embed = self.model.visual.patch_embed  # earlyfusion
+        old = patch_embed.proj  # earlyfusion
+        if old.in_channels == input_channels:  # earlyfusion
+            return  # earlyfusion
+        if old.in_channels != 3:  # earlyfusion
+            raise ValueError(f"Cannot expand vision patch embedding from {old.in_channels} channels")  # fmt: skip  # earlyfusion
+        expected = {4: "rgb_mean", 6: "zeros"}.get(input_channels)  # earlyfusion
+        if initialization != expected:  # earlyfusion
+            raise ValueError(f"vision_patch_embed_init must be {expected!r} for {input_channels} channels")  # fmt: skip  # earlyfusion
+        new = torch.nn.Conv3d(input_channels, old.out_channels, old.kernel_size, old.stride, old.padding, old.dilation, old.groups, old.bias is not None, old.padding_mode, device=old.weight.device, dtype=old.weight.dtype)  # fmt: skip  # earlyfusion
+        with torch.no_grad():  # earlyfusion
+            new.weight.zero_()  # earlyfusion
+            new.weight[:, :3].copy_(old.weight)  # earlyfusion
+            if input_channels == 4:  # earlyfusion
+                new.weight[:, 3:4].copy_(old.weight.mean(dim=1, keepdim=True))  # earlyfusion
+            if old.bias is not None:  # earlyfusion
+                new.bias.copy_(old.bias)  # earlyfusion
+        new.weight.requires_grad_(old.weight.requires_grad)  # earlyfusion
+        if old.bias is not None:  # earlyfusion
+            new.bias.requires_grad_(old.bias.requires_grad)  # earlyfusion
+        patch_embed.proj = new  # earlyfusion
+        patch_embed.in_channels = input_channels  # earlyfusion
+        self.model.config.vision_config.in_channels = input_channels  # earlyfusion
+        self.model.visual.config.in_channels = input_channels  # earlyfusion
 
     def _apply_vision_patch_embed_channels_last(self) -> None:
         """Force the Qwen3-VL vision patch-embed ``Conv3d`` to ``channels_last_3d``.
@@ -246,15 +278,18 @@ class Qwen3Backbone(torch.nn.Module):
                 patched,
             )
 
-    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int):
+    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int, tune_vision_patch_embed: bool = False):  # fmt: skip  # earlyfusion
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
+        self.tune_vision_patch_embed = tune_vision_patch_embed  # earlyfusion
         for p in self.parameters():
             p.requires_grad = True
         if not tune_llm:
             self.model.language_model.requires_grad_(False)
         if not tune_visual:
             self.model.visual.requires_grad_(False)
+        if tune_vision_patch_embed:  # earlyfusion
+            self.model.visual.patch_embed.proj.requires_grad_(True)  # earlyfusion
 
         if tune_top_llm_layers > 0:
             for layer in self.model.language_model.layers[-tune_top_llm_layers:]:

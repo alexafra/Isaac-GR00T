@@ -52,6 +52,8 @@ class FinetuneConfig:
     tune_visual: bool = False
     """If True, fine-tune the visual encoder (e.g., ViT or CNN backbone)."""
 
+    tune_vision_patch_embed: bool = True  # earlyfusion
+    """If True, fine-tune the vision patch embedding for every input configuration."""  # earlyfusion
     tune_projector: bool = True
     """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
 

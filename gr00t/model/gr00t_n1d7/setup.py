@@ -83,6 +83,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
                 tune_visual=self.config.model.tune_visual,
+                tune_vision_patch_embed=self.config.model.tune_vision_patch_embed,  # earlyfusion
                 tune_projector=self.config.model.tune_projector,
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
@@ -118,6 +119,24 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     "Checkpoint weight mismatch for "
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
                 )
+            source_channels = model.config.vision_input_channels  # earlyfusion
+            target_channels = self.model_config.vision_input_channels  # earlyfusion
+            source_layout = list(model.config.vision_channel_layout)  # earlyfusion
+            target_layout = list(self.model_config.vision_channel_layout)  # earlyfusion
+            source_init = model.config.vision_patch_embed_init  # earlyfusion
+            target_init = self.model_config.vision_patch_embed_init  # earlyfusion
+            if source_channels != target_channels:  # earlyfusion
+                if source_channels != 3 or target_channels not in (4, 6):  # earlyfusion
+                    raise RuntimeError(f"Cannot migrate vision input from {source_channels} to {target_channels} channels")  # fmt: skip  # earlyfusion
+                model.backbone.expand_vision_input_channels(target_channels, self.model_config.vision_patch_embed_init)  # fmt: skip  # earlyfusion
+                model.backbone._apply_vision_patch_embed_channels_last()  # earlyfusion
+                model.config.vision_input_channels = target_channels  # earlyfusion
+                model.config.vision_channel_layout = target_layout  # earlyfusion
+                model.config.vision_patch_embed_init = self.model_config.vision_patch_embed_init  # fmt: skip  # earlyfusion
+                model.collator.vision_input_channels = target_channels  # earlyfusion
+                model.collator.vision_channel_layout = target_layout  # earlyfusion
+            elif source_channels > 3 and (source_layout != target_layout or source_init != target_init):  # fmt: skip  # earlyfusion
+                raise RuntimeError(f"Checkpoint vision contract {(source_layout, source_init)} does not match requested {(target_layout, target_init)}")  # fmt: skip  # earlyfusion
 
         else:
             model = self.model_class(

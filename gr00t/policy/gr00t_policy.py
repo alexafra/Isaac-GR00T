@@ -54,6 +54,31 @@ _RTC_REQUIRED_OPTION_KEYS = frozenset(
         "rtc_frozen_steps",
     }
 )
+_RGB_VISION_LAYOUT = ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
+_VISION_PATCH_INIT = {3: "original_rgb", 4: "rgb_mean", 6: "zeros"}  # earlyfusion
+
+
+def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> dict[str, Any]:  # fmt: skip  # earlyfusion
+    fusion = getattr(video_config, "channel_fusion", None)  # earlyfusion
+    layout = _RGB_VISION_LAYOUT.copy()  # earlyfusion
+    if fusion:  # earlyfusion
+        layout = [  # fmt: skip  # earlyfusion
+            f"{source.key}:{channel}"  # earlyfusion
+            for source in fusion  # earlyfusion
+            for channel in source.channels  # earlyfusion
+        ]  # earlyfusion
+    channels = getattr(model_config, "vision_input_channels", 3)  # earlyfusion
+    model_layout = getattr(model_config, "vision_channel_layout", _RGB_VISION_LAYOUT)  # earlyfusion
+    patch_init = getattr(model_config, "vision_patch_embed_init", "original_rgb")  # earlyfusion
+    expected_channels = len(layout) if fusion else 3  # earlyfusion
+    expected_init = _VISION_PATCH_INIT.get(expected_channels)  # earlyfusion
+    if isinstance(channels, bool) or channels != expected_channels:  # earlyfusion
+        raise ValueError(f"Early-fusion model/processor channel mismatch: model={channels!r}, processor={expected_channels}")  # fmt: skip  # earlyfusion
+    if list(model_layout) != layout:  # earlyfusion
+        raise ValueError(f"Early-fusion model/processor layout mismatch: model={model_layout!r}, processor={layout!r}")  # fmt: skip  # earlyfusion
+    if patch_init != expected_init:  # earlyfusion
+        raise ValueError(f"Early-fusion patch initialization mismatch: got {patch_init!r}, expected {expected_init!r}")  # fmt: skip  # earlyfusion
+    return {"version": 1, "mode": "early_channel_fusion" if fusion else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": patch_init, "wire_video_keys": list(video_config.modality_keys)}  # fmt: skip  # earlyfusion
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -191,6 +216,7 @@ class Gr00tPolicy(BasePolicy):
             for k, v in all_modality_configs[self.embodiment_tag.value].items()
             if k != "rl_info"
         }
+        self.vision_input_contract = _vision_input_contract(self.model.config, self.modality_configs["video"])  # fmt: skip  # earlyfusion
         self.collate_fn = self.processor.collator
 
         # Extract and validate language configuration
@@ -749,6 +775,9 @@ class Gr00tPolicy(BasePolicy):
 
     def get_modality_config(self) -> dict[str, ModalityConfig]:
         return self.modality_configs
+
+    def get_vision_input_contract(self) -> dict[str, Any]:  # earlyfusion
+        return dict(self.vision_input_contract)  # earlyfusion
 
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Reset the policy to its initial state.

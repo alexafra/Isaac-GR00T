@@ -81,6 +81,19 @@ class ActionConfig:
     state_key: str | None = None
 
 
+@dataclass(frozen=True)  # earlyfusion
+class VideoChannelSource:  # earlyfusion
+    key: str  # earlyfusion
+    channels: tuple[int, ...]  # earlyfusion
+
+    def __post_init__(self):  # earlyfusion
+        object.__setattr__(self, "channels", tuple(self.channels))  # earlyfusion
+        if not self.key or not self.channels or len(set(self.channels)) != len(self.channels):  # fmt: skip  # earlyfusion
+            raise ValueError(f"Invalid channel-fusion source: {self!r}")  # earlyfusion
+        if any(not isinstance(channel, int) or channel not in range(3) for channel in self.channels):  # fmt: skip  # earlyfusion
+            raise ValueError(f"Channel-fusion channels must be unique RGB indices 0..2: {self!r}")  # fmt: skip  # earlyfusion
+
+
 @dataclass
 class ModalityConfig:
     """Configuration for a modality defining how data should be sampled and loaded.
@@ -98,6 +111,16 @@ class ModalityConfig:
     mean_std_embedding_keys: list[str] | None = None
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     action_configs: list[ActionConfig] | None = None
+    channel_fusion: list[VideoChannelSource] | None = None  # earlyfusion
+
+    @property  # earlyfusion
+    def vision_input_channels(self) -> int:  # earlyfusion
+        return sum(len(source.channels) for source in self.channel_fusion) if self.channel_fusion else 3  # fmt: skip  # earlyfusion
+
+    @property  # earlyfusion
+    def vision_channel_layout(self) -> list[str]:  # earlyfusion
+        sources = self.channel_fusion or [VideoChannelSource(self.modality_keys[0], (0, 1, 2))]  # fmt: skip  # earlyfusion
+        return [f"{source.key}:{channel}" for source in sources for channel in source.channels]  # fmt: skip  # earlyfusion
 
     def __post_init__(self):
         """Validate fields and set default values."""
@@ -124,3 +147,13 @@ class ModalityConfig:
                     )
                 parsed_action_configs.append(action_config)
             self.action_configs = parsed_action_configs
+        if self.channel_fusion is not None:  # earlyfusion
+            self.channel_fusion = [  # earlyfusion
+                VideoChannelSource(**source) if isinstance(source, dict) else source  # earlyfusion
+                for source in self.channel_fusion  # earlyfusion
+            ]  # earlyfusion
+            source_keys = [source.key for source in self.channel_fusion]  # earlyfusion
+            if source_keys != self.modality_keys or self.channel_fusion[0].channels != (0, 1, 2):  # fmt: skip  # earlyfusion
+                raise ValueError("channel_fusion must cover modality_keys in order and start with RGB channels 0,1,2")  # fmt: skip  # earlyfusion
+            if self.vision_input_channels not in (4, 6):  # earlyfusion
+                raise ValueError("channel_fusion must produce exactly 4 or 6 input channels")  # fmt: skip  # earlyfusion

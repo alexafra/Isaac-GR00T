@@ -44,6 +44,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     backbone_embedding_dim: int = 2048  # project_to_dim; must match Cosmos-Reason2-2B hidden size
     tune_llm: bool = False
     tune_visual: bool = False
+    tune_vision_patch_embed: bool = False  # earlyfusion
+    vision_input_channels: int = 3  # earlyfusion
+    vision_channel_layout: list[str] = field(  # earlyfusion
+        default_factory=lambda: ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
+    )  # earlyfusion
+    vision_patch_embed_init: str = "original_rgb"  # earlyfusion
     select_layer: int = 12
     reproject_vision: bool = False
     use_flash_attention: bool = True

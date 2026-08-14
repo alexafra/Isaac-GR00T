@@ -74,9 +74,18 @@ if __name__ == "__main__":
     )
     config.load_config_path = None
 
+    video_config = config.data.modality_configs[embodiment_tag]["video"]  # earlyfusion
+    if video_config.channel_fusion:  # earlyfusion
+        config.data.modality_configs = {embodiment_tag: config.data.modality_configs[embodiment_tag]}  # fmt: skip  # earlyfusion
+        config.model.vision_channel_layout = video_config.vision_channel_layout  # earlyfusion
+        config.model.vision_input_channels = video_config.vision_input_channels  # earlyfusion
+        config.model.vision_patch_embed_init = "rgb_mean" if config.model.vision_input_channels == 4 else "zeros"  # fmt: skip  # earlyfusion
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
+    config.model.tune_vision_patch_embed = ft_config.tune_vision_patch_embed  # earlyfusion
+    if config.model.vision_input_channels == 6 and not config.model.tune_vision_patch_embed:  # fmt: skip  # earlyfusion
+        raise ValueError("6-channel zero-initialized normals require --tune-vision-patch-embed")  # fmt: skip  # earlyfusion
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob

@@ -69,6 +69,34 @@ def _is_geometry_view(view: str) -> bool:
     return "depth" in normalized or _is_surface_normals_view(normalized)
 
 
+def _vision_processor_kwargs(input_channels: int) -> dict[str, Any]:  # earlyfusion
+    if input_channels == 3:  # earlyfusion
+        return {}  # earlyfusion
+    return {  # earlyfusion
+        "images_kwargs": {  # earlyfusion
+            "do_convert_rgb": False,  # earlyfusion
+            "input_data_format": "channels_first",  # earlyfusion
+            "image_mean": [0.5] * input_channels,  # earlyfusion
+            "image_std": [0.5] * input_channels,  # earlyfusion
+        }  # earlyfusion
+    }  # earlyfusion
+
+
+def _early_fusion_contract(modality_configs) -> tuple[int, list[str] | None]:  # earlyfusion
+    contracts = {  # earlyfusion
+        (  # earlyfusion
+            video.vision_input_channels,  # earlyfusion
+            tuple(video.vision_channel_layout) if video.channel_fusion else None,  # earlyfusion
+        )  # fmt: skip  # earlyfusion
+        for config in modality_configs.values()  # earlyfusion
+        if (video := config.get("video")) is not None  # earlyfusion
+    }  # earlyfusion
+    if len(contracts) > 1:  # earlyfusion
+        raise ValueError(f"All modalities must share one vision-input contract: {contracts}")  # fmt: skip  # earlyfusion
+    channels, layout = next(iter(contracts), (3, None))  # earlyfusion
+    return channels, list(layout) if layout else None  # earlyfusion
+
+
 def _surface_normals_views(
     modality_configs: dict[str, dict[str, ModalityConfig]],
 ) -> list[str]:
@@ -203,6 +231,8 @@ class Gr00tN1d7DataCollator:
         model_name: str,
         model_type: str = "qwen",
         transformers_loading_kwargs: dict = {},
+        vision_input_channels: int = 3,  # earlyfusion
+        vision_channel_layout: list[str] | None = None,  # earlyfusion
     ):
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
@@ -210,6 +240,8 @@ class Gr00tN1d7DataCollator:
         self.processor.tokenizer.padding_side = "left"
         self.model_type = model_type
         self.model_name = model_name
+        self.vision_input_channels = vision_input_channels  # earlyfusion
+        self.vision_channel_layout = vision_channel_layout  # earlyfusion
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
@@ -222,6 +254,8 @@ class Gr00tN1d7DataCollator:
                 text_list = []
                 image_inputs = []
                 for v in values:
+                    if v.get("vision_input_channels", 3) != self.vision_input_channels:  # fmt: skip  # earlyfusion
+                        raise ValueError("VLM images do not match the model vision-input channels")  # fmt: skip  # earlyfusion
                     curr_text_list = [v["text"]]
 
                     text_list += curr_text_list
@@ -233,6 +267,7 @@ class Gr00tN1d7DataCollator:
                     images=image_inputs,
                     return_tensors="pt",
                     padding=True,
+                    **_vision_processor_kwargs(self.vision_input_channels),  # earlyfusion
                 )
                 for k, v in vlm_inputs.items():
                     batch[k] = v
@@ -376,6 +411,8 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_name=model_name,
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            vision_input_channels=_early_fusion_contract(self.modality_configs)[0],  # earlyfusion
+            vision_channel_layout=_early_fusion_contract(self.modality_configs)[1],  # earlyfusion
         )
         self.train()
 
@@ -534,7 +571,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_observation["state"] = normalized_states
 
         # Process images: observation values are (B, T, H, W, C) numpy arrays
-        image_keys = modality_config["video"].modality_keys
+        video_config = modality_config["video"]  # earlyfusion
+        image_keys = video_config.modality_keys  # earlyfusion
         images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
         images = torch.stack(
             [images_dict[view] for view in image_keys], dim=2
@@ -555,6 +593,15 @@ class Gr00tN1d7Processor(BaseProcessor):
             # Rearrange (B, T, V, H, W, C) → (B, T*V, C, H, W) for torchvision
             images_perm = images.permute(0, 1, 2, 5, 3, 4).reshape(B, T * V, img_C, img_H, img_W)
             transformed_images = self.eval_image_transform(images_perm).numpy()
+        if video_config.channel_fusion:  # earlyfusion
+            transformed_grid = torch.from_numpy(transformed_images).reshape(B, T, V, -1, transformed_images.shape[-2], transformed_images.shape[-1])  # fmt: skip  # earlyfusion
+            transformed_images = torch.cat(  # fmt: skip  # earlyfusion
+                [  # earlyfusion
+                    transformed_grid[:, :, index, list(source.channels)]  # earlyfusion
+                    for index, source in enumerate(video_config.channel_fusion)  # earlyfusion
+                ],  # fmt: skip  # earlyfusion
+                dim=2,  # earlyfusion
+            ).numpy()  # earlyfusion
 
         language_key = modality_config["language"].modality_keys[0]
         language = [
@@ -568,7 +615,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             vc = vlm_inputs["vlm_content"]
             texts.append(vc["text"])
             all_images.extend(vc["images"])
-        tokenized = self.processor(text=texts, images=all_images, return_tensors="pt", padding=True)
+        tokenized = self.processor(text=texts, images=all_images, return_tensors="pt", padding=True, **_vision_processor_kwargs(video_config.vision_input_channels))  # fmt: skip  # earlyfusion
         for k, v in tokenized.items():
             transformed_observation[k] = v
 
@@ -599,15 +646,14 @@ class Gr00tN1d7Processor(BaseProcessor):
                 video: [T, C, H, W]
         Returns: vlm_content format for collation
         """
-        # Convert images to PIL format
-        pil_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images]
+        vlm_images = list(images) if images.shape[1] != 3 else [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images]  # fmt: skip  # earlyfusion
 
         # Create conversation with images and text
         conversation = [
             {
                 "role": "user",
                 "content": [
-                    *[{"type": "image", "image": img} for img in pil_images],
+                    *[{"type": "image", "image": img} for img in vlm_images],  # earlyfusion
                     {"type": "text", "text": language},
                 ],
             }
@@ -619,10 +665,11 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
 
         # Return vlm_content format for collation
-        return {
+        return {  # fmt: skip  # earlyfusion
             "vlm_content": {
                 "text": text,
-                "images": pil_images,
+                "images": vlm_images,  # earlyfusion
+                "vision_input_channels": images.shape[1],  # earlyfusion
                 "conversation": conversation,
             }
         }
@@ -722,7 +769,8 @@ class Gr00tN1d7Processor(BaseProcessor):
             image_transform = self.train_image_transform
         else:
             image_transform = self.eval_image_transform
-        image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
+        video_config = self.modality_configs[embodiment_tag.value]["video"]  # earlyfusion
+        image_keys = video_config.modality_keys  # earlyfusion
 
         if self.formalize_language:
             language = content.text.lower()
@@ -736,6 +784,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             masks=content.masks,
             image_transform=image_transform,
             language=language,
+            channel_fusion=video_config.channel_fusion,  # earlyfusion
         )
 
         transformed_inputs = {
@@ -757,6 +806,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         masks: dict[str, list[np.ndarray]] | None,
         image_transform: transforms.Compose | A.Compose,
         language: str,
+        channel_fusion: list[Any] | None = None,  # earlyfusion
     ):
         temporal_stacked_images = {}
 
@@ -780,6 +830,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 )
                 temporal_stacked_images[view] = torch.stack(transformed_images)  # (T, C, H, W)
         else:
+            if channel_fusion and self.training:  # earlyfusion
+                raise ValueError("Early fusion training requires synchronized albumentations transforms")  # fmt: skip  # earlyfusion
             if masks is not None:
                 raise ValueError(
                     "Mask transforms require albumentations. Set use_albumentations_transforms=True."
@@ -807,6 +859,14 @@ class Gr00tN1d7Processor(BaseProcessor):
             .flatten(0, 1)
             .numpy()
         )  # (T*V, C, H, W), processor expects numpy array
+        if channel_fusion:  # earlyfusion
+            stacked_images = torch.cat(  # earlyfusion
+                [  # earlyfusion
+                    temporal_stacked_images[source.key][:, list(source.channels)]  # earlyfusion
+                    for source in channel_fusion  # earlyfusion
+                ],  # earlyfusion
+                dim=1,  # fmt: skip  # earlyfusion
+            ).numpy()  # earlyfusion
 
         vlm_inputs = self._apply_vlm_processing(stacked_images, language)
         return vlm_inputs
@@ -921,10 +981,21 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         # Directly override other processor kwargs
         if kwargs:
-            # Override modality configs while keeping pretrained embodiment configs
+            # Replace inactive pretrained modalities only for a fused shared vision stem.  # earlyfusion
             modality_configs = kwargs.pop("modality_configs", {})
-            for embodiment_tag, modality_config in modality_configs.items():
-                processor_kwargs["modality_configs"][embodiment_tag] = modality_config
+            fusion_override = any(  # earlyfusion
+                getattr(video, "channel_fusion", None)  # earlyfusion
+                or (  # earlyfusion
+                    isinstance(video, dict) and video.get("channel_fusion")  # earlyfusion
+                )  # fmt: skip  # earlyfusion
+                for config_override in modality_configs.values()  # earlyfusion
+                if (video := config_override.get("video")) is not None  # earlyfusion
+            )  # earlyfusion
+            if fusion_override:  # earlyfusion
+                processor_kwargs["modality_configs"] = modality_configs  # earlyfusion
+            else:  # earlyfusion
+                for embodiment_tag, modality_config in modality_configs.items():  # earlyfusion
+                    processor_kwargs["modality_configs"][embodiment_tag] = modality_config  # fmt: skip  # earlyfusion
             override_keys = [
                 "random_rotation_angle",
                 "color_jitter_params",

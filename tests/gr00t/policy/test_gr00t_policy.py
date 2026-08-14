@@ -23,7 +23,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from gr00t.data.types import ModalityConfig
+from gr00t.data.types import ModalityConfig, VideoChannelSource  # earlyfusion
+from gr00t.policy.gr00t_policy import _vision_input_contract  # earlyfusion
 import numpy as np
 import pytest
 import torch
@@ -37,6 +38,15 @@ VIDEO_KEYS = ["observation.images.rgb.head_256_256", "observation.images.rgb.lef
 STATE_KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 ACTION_KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 LANGUAGE_KEY = "annotation.human.action.task_description"
+
+
+def test_early_fusion_contract_is_exact_and_rejects_model_mismatch():  # earlyfusion
+    video = ModalityConfig(delta_indices=[0], modality_keys=["ego_view", "depth_gray_view"], channel_fusion=[VideoChannelSource("ego_view", (0, 1, 2)), VideoChannelSource("depth_gray_view", (0,))])  # fmt: skip  # earlyfusion
+    model = SimpleNamespace(vision_input_channels=4, vision_channel_layout=["ego_view:0", "ego_view:1", "ego_view:2", "depth_gray_view:0"], vision_patch_embed_init="rgb_mean")  # fmt: skip  # earlyfusion
+    contract = _vision_input_contract(model, video)  # earlyfusion
+    assert contract == {"version": 1, "mode": "early_channel_fusion", "input_channels": 4, "channel_layout": model.vision_channel_layout, "patch_embed_init": "rgb_mean", "wire_video_keys": ["ego_view", "depth_gray_view"]}  # fmt: skip  # earlyfusion
+    with pytest.raises(ValueError, match="model/processor channel mismatch"):  # earlyfusion
+        _vision_input_contract(SimpleNamespace(vision_input_channels=6, vision_channel_layout=model.vision_channel_layout, vision_patch_embed_init="zeros"), video)  # fmt: skip  # earlyfusion
 
 
 def _build_modality_configs():
@@ -166,6 +176,7 @@ class TestGr00tPolicyInit:
     def test_policy_can_load_processor_from_separate_path(self):
         mock_model = MagicMock()
         mock_model.to.return_value = mock_model
+        mock_model.config = SimpleNamespace(vision_input_channels=3, vision_channel_layout=["ego_view:0", "ego_view:1", "ego_view:2"], vision_patch_embed_init="original_rgb")  # fmt: skip  # earlyfusion
         mock_processor = MagicMock()
         mock_processor.get_modality_configs.return_value = _build_modality_configs()
         mock_processor.collator = MagicMock()

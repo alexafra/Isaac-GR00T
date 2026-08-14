@@ -492,6 +492,7 @@ def main(config: ServerConfig):
         "embodiment_name": config.embodiment_tag.name,
     }
     if config.model_path is not None and not config.use_sim_policy_wrapper:
+        policy_metadata["vision_input_contract"] = policy.get_vision_input_contract()  # earlyfusion
         # Explicit capability handshake for clients that need model-side RTC
         # inpainting. ReplayPolicy and older servers deliberately omit it so a
         # real-robot client can fail before arming rather than silently falling

@@ -531,6 +531,9 @@ class Gr00tN1d7(PreTrainedModel):
             model_name=config.model_name,
             tune_llm=config.tune_llm,
             tune_visual=config.tune_visual,
+            tune_vision_patch_embed=config.tune_vision_patch_embed,  # earlyfusion
+            vision_input_channels=config.vision_input_channels,  # earlyfusion
+            vision_patch_embed_init=config.vision_patch_embed_init,  # earlyfusion
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,
@@ -548,6 +551,8 @@ class Gr00tN1d7(PreTrainedModel):
             model_name=config.model_name,
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            vision_input_channels=config.vision_input_channels,  # earlyfusion
+            vision_channel_layout=config.vision_channel_layout,  # earlyfusion
         )
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:

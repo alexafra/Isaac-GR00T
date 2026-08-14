@@ -390,6 +390,7 @@ def test_checkpoint_action_output_contract_requires_boolean_processor_flag(tmp_p
 
 def test_hugging_face_model_id_does_not_require_local_deployment_metadata(monkeypatch):
     captured = {}
+    vision_contract = {"version": 1, "mode": "separate_views"}  # earlyfusion
 
     class DummyServer:
         def __init__(self, **kwargs):
@@ -404,7 +405,7 @@ def test_hugging_face_model_id_does_not_require_local_deployment_metadata(monkey
         def run(self):
             pass
 
-    monkeypatch.setattr(server_module, "Gr00tPolicy", lambda **_kwargs: object())
+    monkeypatch.setattr(server_module, "Gr00tPolicy", lambda **_kwargs: type("Policy", (), {"get_vision_input_contract": lambda _self: vision_contract})())  # fmt: skip  # earlyfusion
     monkeypatch.setattr(server_module, "PolicyServer", DummyServer)
     monkeypatch.setattr(
         server_module,
@@ -415,6 +416,7 @@ def test_hugging_face_model_id_does_not_require_local_deployment_metadata(monkey
     main(ServerConfig(model_path="nvidia/GR00T-N1.7-3B", device="cpu"))
 
     assert "action_output_contract" not in captured["policy_metadata"]
+    assert captured["policy_metadata"]["vision_input_contract"] == vision_contract  # earlyfusion
     assert captured["policy_metadata"]["rtc"] == {
         "protocol_version": 1,
         "physical_action_tail": True,
