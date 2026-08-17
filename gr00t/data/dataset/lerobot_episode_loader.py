@@ -37,7 +37,7 @@ import json
 import logging
 from pathlib import Path
 import random
-from typing import Any
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -438,6 +438,25 @@ class LeRobotEpisodeLoader:
             )
             video_path = self.dataset_path / video_filename
 
+            lz4_config = self.info_meta.get("surface_normals_lz4")
+            if lz4_config and original_key == lz4_config.get("feature_key"):
+                if lz4_config.get("storage") != "plain_lz4_chunks":
+                    raise ValueError(
+                        "Only plain_lz4_chunks surface-normal storage is supported; "
+                        f"found {lz4_config.get('storage')}"
+                    )
+                from gr00t.utils.lz4_frame_utils import get_plain_lz4_frames_by_indices
+
+                storage_root = Path(lz4_config["root"])
+                if not storage_root.is_absolute():
+                    storage_root = self.dataset_path / storage_root
+                video_data[image_key] = get_plain_lz4_frames_by_indices(
+                    storage_root,
+                    episode_index,
+                    indices,
+                )
+                continue
+
             # Decode video frames at specified timestamps
             video_data[image_key] = get_frames_by_indices(
                 str(video_path),
@@ -562,16 +581,25 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def __getitem__(self, idx: int) -> pd.DataFrame:
+    def load_episode(
+        self,
+        idx: int,
+        frame_indices: Iterable[int] | Callable[[int], Iterable[int]] | None = None,
+    ) -> pd.DataFrame:
         """
-        Load complete episode data as a processed DataFrame.
+        Load episode data, optionally decoding only selected visual frames.
 
         Combines parquet data loading and video decoding to create a unified DataFrame
-        containing all modality data for the episode. Video frames are converted to
-        PIL Images and stored in the DataFrame.
+        containing all modality data for the episode. When ``frame_indices`` is provided,
+        video and mask columns remain aligned to the complete episode but unrequested rows
+        contain ``None``. This lets evaluation retain every action target while decoding
+        only the observation frames at which inference actually runs.
 
         Args:
             idx: Episode index to load
+            frame_indices: Visual-frame positions to decode, or a callable receiving the
+                actual episode length and returning those positions. ``None`` decodes all
+                frames and preserves the normal ``loader[idx]`` behavior.
 
         Returns:
             DataFrame with columns for all modalities and timestamps, with video frames
@@ -598,27 +626,63 @@ class LeRobotEpisodeLoader:
 
         # Use actual dataframe length (might be less than nominal)
         actual_length = min(len(df), nominal_length)
-        df = df.iloc[:actual_length]
+        df = df.iloc[:actual_length].copy()
+
+        if callable(frame_indices):
+            frame_indices = frame_indices(actual_length)
+        if frame_indices is None:
+            requested_indices = np.arange(actual_length, dtype=np.int64)
+        else:
+            requested_indices = np.asarray(list(frame_indices), dtype=np.int64)
+            if requested_indices.ndim != 1:
+                raise ValueError(
+                    f"frame_indices must be one-dimensional, got {requested_indices.shape}"
+                )
+            requested_indices = np.unique(requested_indices)
+            invalid_indices = requested_indices[
+                (requested_indices < 0) | (requested_indices >= actual_length)
+            ]
+            if invalid_indices.size:
+                raise IndexError(
+                    f"Visual frame indices {invalid_indices.tolist()} are outside episode "
+                    f"range 0..{actual_length - 1}"
+                )
 
         # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
+        video_data = self._load_video_data(episode_id, requested_indices)
 
-        # Add video frames to dataframe as PIL Images
+        # Keep sparse visual data aligned to the complete episode. Evaluation only indexes
+        # requested positions; training and ordinary loader[idx] calls still request all.
         for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
+            assert len(video_data[key]) == len(requested_indices), (
+                f"Video data for {key} has length {len(video_data[key])} but "
+                f"{len(requested_indices)} frame(s) were requested"
             )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
+            frames = np.empty(actual_length, dtype=object)
+            frames[:] = None
+            for frame_index, frame in zip(requested_indices, video_data[key]):
+                frames[frame_index] = frame
+            df[f"video.{key}"] = frames
 
         # Load synchronized mask data
-        mask_data = self._load_mask_data(episode_id, np.arange(actual_length))
+        mask_data = self._load_mask_data(episode_id, requested_indices)
         for key in mask_data.keys():
-            assert len(mask_data[key]) == len(df), (
-                f"Mask data for {key} has length {len(mask_data[key])} but dataframe has length {len(df)}"
+            assert len(mask_data[key]) == len(requested_indices), (
+                f"Mask data for {key} has length {len(mask_data[key])} but "
+                f"{len(requested_indices)} frame(s) were requested"
             )
-            df[f"mask.{key}"] = [mask for mask in mask_data[key]]
+            masks = np.empty(actual_length, dtype=object)
+            masks[:] = None
+            for frame_index, mask in zip(requested_indices, mask_data[key]):
+                masks[frame_index] = mask
+            df[f"mask.{key}"] = masks
 
         return df
+
+    def __getitem__(self, idx: int) -> pd.DataFrame:
+        """Load a complete episode, including every visual frame."""
+
+        return self.load_episode(idx)
 
     def get_initial_actions(self):
         """

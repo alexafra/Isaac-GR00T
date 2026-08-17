@@ -10,7 +10,7 @@ the policy.
 """
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
-from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead, sample_initial_action_noise
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -76,6 +76,34 @@ def _action_input(config: Gr00tN1d7Config, previous: torch.Tensor) -> BatchFeatu
             "action_mask": torch.ones_like(previous),
         }
     )
+
+
+def test_per_sample_noise_is_identical_when_batch_grouping_changes() -> None:
+    seeds = [101, 202, 303]
+    batched = sample_initial_action_noise(
+        batch_size=3,
+        action_horizon=4,
+        action_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        noise_seeds=seeds,
+    )
+    separate = torch.cat(
+        [
+            sample_initial_action_noise(
+                batch_size=1,
+                action_horizon=4,
+                action_dim=2,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                noise_seeds=[seed],
+            )
+            for seed in seeds
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(batched, separate, rtol=0.0, atol=0.0)
 
 
 def test_rtc_copies_the_selected_previous_suffix_into_the_new_prefix() -> None:

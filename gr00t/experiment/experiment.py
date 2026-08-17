@@ -335,6 +335,8 @@ def run(config: Config):
 
     # Train
     logging.info("🚀 Starting training...")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     if config.training.enable_profiling:
         from functools import partial
 
@@ -366,9 +368,20 @@ def run(config: Config):
     else:
         trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
-    # Save final model
-    trainer.save_model()
-    logging.info(f"Model saved to {output_dir}")
+    if torch.cuda.is_available():
+        gib = 1024**3
+        logging.info(
+            "Peak CUDA memory: allocated=%.2f GiB, reserved=%.2f GiB",
+            torch.cuda.max_memory_allocated() / gib,
+            torch.cuda.max_memory_reserved() / gib,
+        )
+
+    # Save final model unless this is an explicitly storage-light dry run.
+    if config.training.skip_final_model_save:
+        logging.info("Skipping final model save (skip_final_model_save=True)")
+    else:
+        trainer.save_model()
+        logging.info(f"Model saved to {output_dir}")
 
     if config.training.assert_loss_less_than is not None:
         final_loss = trainer.loss

@@ -31,7 +31,7 @@ def _backbone_with_rgb_patch_embed():  # earlyfusion
 
 
 def test_early_fusion_conv3d_expansion_preserves_pretrained_parameters():  # earlyfusion
-    for channels, initialization in ((4, "rgb_mean"), (6, "zeros")):  # earlyfusion
+    for channels, initialization in ((4, "rgb_mean"), (6, "zeros"), (6, "rgb_mean")):  # earlyfusion
         backbone = _backbone_with_rgb_patch_embed()  # earlyfusion
         old_weight = backbone.model.visual.patch_embed.proj.weight.detach().clone()  # earlyfusion
         old_bias = backbone.model.visual.patch_embed.proj.bias.detach().clone()  # earlyfusion
@@ -39,8 +39,9 @@ def test_early_fusion_conv3d_expansion_preserves_pretrained_parameters():  # ear
         expanded = backbone.model.visual.patch_embed.proj  # earlyfusion
         assert torch.equal(expanded.weight[:, :3], old_weight)  # earlyfusion
         assert torch.equal(expanded.bias, old_bias)  # earlyfusion
-        if channels == 4:  # earlyfusion
-            assert torch.equal(expanded.weight[:, 3:4], old_weight.mean(dim=1, keepdim=True))  # fmt: skip  # earlyfusion
+        if initialization == "rgb_mean":  # earlyfusion
+            expected = old_weight.mean(dim=1, keepdim=True).expand(-1, channels - 3, -1, -1, -1)  # fmt: skip  # earlyfusion
+            assert torch.equal(expanded.weight[:, 3:], expected)  # earlyfusion
         else:  # earlyfusion
             assert torch.count_nonzero(expanded.weight[:, 3:]) == 0  # earlyfusion
 

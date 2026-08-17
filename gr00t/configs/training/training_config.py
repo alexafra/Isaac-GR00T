@@ -71,6 +71,7 @@ class TrainingConfig:
     # Model saving
     save_vl_model: bool = False  # Control whether to save VL model and processor in callbacks
     save_only_model: bool = False  # Skip optimizer/scheduler/RNG states — cannot resume training
+    skip_final_model_save: bool = False  # Dry runs: skip trainer.save_model() after training
 
     # Default False so a rerun against an existing output_dir starts fresh.
     resume_from_checkpoint: bool = False

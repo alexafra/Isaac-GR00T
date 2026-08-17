@@ -75,16 +75,19 @@ if __name__ == "__main__":
     config.load_config_path = None
 
     video_config = config.data.modality_configs[embodiment_tag]["video"]  # earlyfusion
+    if ft_config.vision_patch_embed_init is not None and not video_config.channel_fusion:  # fmt: skip  # earlyfusion
+        raise ValueError("--vision-patch-embed-init is only valid for early-fusion modality configs")  # earlyfusion
     if video_config.channel_fusion:  # earlyfusion
         config.data.modality_configs = {embodiment_tag: config.data.modality_configs[embodiment_tag]}  # fmt: skip  # earlyfusion
         config.model.vision_channel_layout = video_config.vision_channel_layout  # earlyfusion
         config.model.vision_input_channels = video_config.vision_input_channels  # earlyfusion
-        config.model.vision_patch_embed_init = "rgb_mean" if config.model.vision_input_channels == 4 else "zeros"  # fmt: skip  # earlyfusion
+        default_patch_init = "rgb_mean" if config.model.vision_input_channels == 4 else "zeros"  # fmt: skip  # earlyfusion
+        config.model.vision_patch_embed_init = ft_config.vision_patch_embed_init or default_patch_init  # fmt: skip  # earlyfusion
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
     config.model.tune_vision_patch_embed = ft_config.tune_vision_patch_embed  # earlyfusion
-    if config.model.vision_input_channels == 6 and not config.model.tune_vision_patch_embed:  # fmt: skip  # earlyfusion
+    if config.model.vision_input_channels == 6 and config.model.vision_patch_embed_init == "zeros" and not config.model.tune_vision_patch_embed:  # fmt: skip  # earlyfusion
         raise ValueError("6-channel zero-initialized normals require --tune-vision-patch-embed")  # fmt: skip  # earlyfusion
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
@@ -104,7 +107,7 @@ if __name__ == "__main__":
     else:
         config.model.extra_augmentation_config = None
 
-    config.model.load_bf16 = False
+    config.model.load_bf16 = ft_config.load_bf16
     config.model.reproject_vision = False
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.backbone_trainable_params_fp32 = True
@@ -118,6 +121,7 @@ if __name__ == "__main__":
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
+    config.training.gradient_checkpointing = ft_config.gradient_checkpointing
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
     config.training.save_total_limit = ft_config.save_total_limit
@@ -134,6 +138,7 @@ if __name__ == "__main__":
     config.data.ds_weights_alpha = ft_config.ds_weights_alpha
 
     config.training.save_only_model = ft_config.save_only_model
+    config.training.skip_final_model_save = ft_config.skip_final_model_save
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
 

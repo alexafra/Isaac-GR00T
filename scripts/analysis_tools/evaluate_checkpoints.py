@@ -87,9 +87,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train-probe-seed", type=int, default=42)
     parser.add_argument("--checkpoint-steps", type=int, nargs="*")
+    parser.add_argument(
+        "--run-root-step",
+        type=int,
+        help=(
+            "Evaluate the final weights stored directly in RUN_DIR and label them with this "
+            "training step. Useful when checkpoint retention removed the final checkpoint-* "
+            "directory but Trainer saved the final model at the run root."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=0, help="0 evaluates each complete episode")
     parser.add_argument("--execution-horizon", type=int, default=16)
     parser.add_argument("--denoising-steps", type=int, default=4)
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of open-loop observation points sent through the policy together. "
+            "Larger values reduce evaluation overhead but can use more GPU memory."
+        ),
+    )
     parser.add_argument(
         "--inference-seed",
         type=int,
@@ -118,6 +136,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.train_dataset_path is None and (args.train_traj_ids or args.train_probe_episodes):
         parser.error("--train-traj-ids and --train-probe-episodes require --train-dataset-path")
+    if args.inference_batch_size <= 0:
+        parser.error("--inference-batch-size must be positive")
     return args
 
 
@@ -263,8 +283,14 @@ def find_evaluation_targets(
     run_dir: Path,
     selected_steps: list[int] | None,
     base_model_path: Path | None,
+    run_root_step: int | None = None,
 ) -> list[EvaluationTarget]:
-    """Resolve physical checkpoints plus an optional run-compatible step-0 baseline."""
+    """Resolve physical checkpoints, optional final root weights, and a step-0 baseline."""
+
+    if run_root_step is not None and run_root_step <= 0:
+        raise ValueError(f"--run-root-step must be positive, got {run_root_step}")
+    if run_root_step is not None and re.fullmatch(r"checkpoint-\d+", run_dir.name):
+        raise ValueError("--run-root-step requires RUN_DIR to be a training-run root")
 
     if re.fullmatch(r"checkpoint-\d+", run_dir.name):
         checkpoints = [run_dir]
@@ -279,6 +305,29 @@ def find_evaluation_targets(
     targets = [
         EvaluationTarget(step=checkpoint_step(path), model_path=path) for path in checkpoints
     ]
+
+    include_run_root = run_root_step is not None and (
+        selected is None or run_root_step in selected
+    )
+    if include_run_root:
+        if any(target.step == run_root_step for target in targets):
+            raise ValueError(
+                f"RUN_DIR and a physical checkpoint both represent step {run_root_step}; "
+                "omit --run-root-step for that run"
+            )
+        required_root_files = [run_dir / "config.json", run_dir / "processor"]
+        missing_root_files = [path for path in required_root_files if not path.exists()]
+        has_root_weights = any(run_dir.glob("model*.safetensors")) or (
+            run_dir / "pytorch_model.bin"
+        ).is_file()
+        if missing_root_files or not has_root_weights:
+            missing = [str(path) for path in missing_root_files]
+            if not has_root_weights:
+                missing.append(f"{run_dir}/model*.safetensors (or pytorch_model.bin)")
+            raise FileNotFoundError(
+                "Cannot evaluate final weights from the run root; missing: " + ", ".join(missing)
+            )
+        targets.append(EvaluationTarget(step=run_root_step, model_path=run_dir))
 
     include_base = base_model_path is not None and (selected is None or 0 in selected)
     if include_base:
@@ -1195,6 +1244,34 @@ RAW_PREDICTION_FILENAMES = {
     "validation": "validation_frame_predictions.csv.gz",
     "train_probe": "train_probe_frame_predictions.csv.gz",
 }
+GOAL_METRICS_FILENAME = "metrics_by_goal.csv"
+HORIZON_POSITION_METRICS_FILENAME = "metrics_by_horizon_position.csv"
+ERROR_SUMMARY_COLUMNS = [
+    "split",
+    "checkpoint_step",
+    "episodes",
+    "frames",
+    "samples",
+    "mae",
+    "mse",
+    "rmse",
+    "median_absolute_error",
+    "p95_absolute_error",
+    "bias",
+    "max_absolute_error",
+]
+GOAL_METRICS_COLUMNS = [
+    "split",
+    "checkpoint_step",
+    "goal",
+    *ERROR_SUMMARY_COLUMNS[2:],
+]
+HORIZON_POSITION_METRICS_COLUMNS = [
+    "split",
+    "checkpoint_step",
+    "horizon_position",
+    *ERROR_SUMMARY_COLUMNS[2:],
+]
 RIGHT_ACTION_PREFIXES = ("right_arm[", "right_hand[")
 JOINT_POSITION_VELOCITY_STATISTICS_FILENAME = "joint_position_velocity_statistics.csv"
 JOINT_POSITION_VELOCITY_STATISTICS_COLUMNS = [
@@ -1242,6 +1319,259 @@ def raw_predictions_csv_path(checkpoint_dir: Path, split: str) -> Path:
     except KeyError as exc:
         raise ValueError(f"Unsupported raw-prediction split: {split}") from exc
     return checkpoint_dir / filename
+
+
+def latest_checkpoint_steps(checkpoint_steps: list[int], plot_count: int = 2) -> list[int]:
+    """Return the numerically latest checkpoint steps to receive plots."""
+
+    if plot_count < 0:
+        raise ValueError(f"Plot count must be non-negative, got {plot_count}")
+    if plot_count == 0:
+        return []
+    return sorted({int(step) for step in checkpoint_steps})[-plot_count:]
+
+
+def _validate_error_rows(raw_predictions: pd.DataFrame) -> None:
+    required = {
+        "checkpoint_step",
+        "trajectory",
+        "frame",
+        "joint",
+        "error",
+        "absolute_error",
+    }
+    missing = required - set(raw_predictions.columns)
+    if missing:
+        raise ValueError("Raw prediction CSV is missing columns: " + ", ".join(sorted(missing)))
+    if raw_predictions.empty:
+        raise ValueError("Raw prediction CSV contains no rows")
+    errors = raw_predictions["error"].to_numpy(dtype=float)
+    absolute_errors = raw_predictions["absolute_error"].to_numpy(dtype=float)
+    if not np.all(np.isfinite(errors)) or not np.all(np.isfinite(absolute_errors)):
+        raise ValueError("Raw prediction CSV contains non-finite errors")
+    if not np.allclose(absolute_errors, np.abs(errors), rtol=1e-6, atol=1e-8):
+        raise ValueError("Raw prediction absolute_error values disagree with abs(error)")
+
+
+def _summarize_error_groups(
+    raw_predictions: pd.DataFrame,
+    group_columns: list[str],
+) -> pd.DataFrame:
+    _validate_error_rows(raw_predictions)
+    rows = []
+    grouper = group_columns[0] if len(group_columns) == 1 else group_columns
+    for group_values, group in raw_predictions.groupby(grouper, sort=True, dropna=False):
+        if len(group_columns) == 1:
+            group_values = (group_values,)
+        error = group["error"].to_numpy(dtype=float)
+        absolute_error = np.abs(error)
+        mse = float(np.mean(error**2))
+        row = dict(zip(group_columns, group_values, strict=True))
+        row.update(
+            {
+                "episodes": int(group["trajectory"].nunique()),
+                "frames": int(len(group[["trajectory", "frame"]].drop_duplicates())),
+                "samples": int(len(group)),
+                "mae": float(np.mean(absolute_error)),
+                "mse": mse,
+                "rmse": float(np.sqrt(mse)),
+                "median_absolute_error": float(np.median(absolute_error)),
+                "p95_absolute_error": float(np.percentile(absolute_error, 95)),
+                "bias": float(np.mean(error)),
+                "max_absolute_error": float(np.max(absolute_error)),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def goal_metrics_from_raw_predictions(
+    raw_predictions: pd.DataFrame,
+    *,
+    split: str,
+    episode_tasks: dict[int, list[str]],
+) -> pd.DataFrame:
+    """Summarize each recorded goal without combining or reweighting goals."""
+
+    _validate_error_rows(raw_predictions)
+    memberships = []
+    for trajectory_value in raw_predictions["trajectory"].drop_duplicates():
+        trajectory = int(trajectory_value)
+        if float(trajectory_value) != trajectory:
+            raise ValueError(f"Trajectory ID must be integral, got {trajectory_value!r}")
+        goals = list(dict.fromkeys(str(goal) for goal in episode_tasks.get(trajectory, []) if goal))
+        if not goals:
+            goals = ["(missing goal metadata)"]
+        memberships.extend({"trajectory": trajectory, "goal": goal} for goal in goals)
+
+    expanded = raw_predictions.merge(
+        pd.DataFrame(memberships),
+        on="trajectory",
+        how="left",
+        validate="many_to_many",
+    )
+    expanded["split"] = split
+    result = _summarize_error_groups(
+        expanded,
+        ["split", "checkpoint_step", "goal"],
+    )
+    return result.reindex(columns=GOAL_METRICS_COLUMNS)
+
+
+def horizon_position_metrics_from_raw_predictions(
+    raw_predictions: pd.DataFrame,
+    *,
+    split: str,
+    execution_horizon: int,
+) -> pd.DataFrame:
+    """Summarize errors by zero-based action offset within each predicted chunk."""
+
+    if execution_horizon <= 0:
+        raise ValueError(f"Execution horizon must be positive, got {execution_horizon}")
+    _validate_error_rows(raw_predictions)
+    frame_values = pd.to_numeric(raw_predictions["frame"], errors="raise").to_numpy(dtype=float)
+    if np.any(frame_values < 0) or not np.all(frame_values == np.floor(frame_values)):
+        raise ValueError("Raw prediction frame indices must be non-negative integers")
+    positioned = raw_predictions.copy()
+    positioned["split"] = split
+    positioned["horizon_position"] = frame_values.astype(np.int64) % execution_horizon
+    result = _summarize_error_groups(
+        positioned,
+        ["split", "checkpoint_step", "horizon_position"],
+    )
+    return result.reindex(columns=HORIZON_POSITION_METRICS_COLUMNS)
+
+
+def write_extended_evaluation_metrics(
+    *,
+    output_dir: Path,
+    summary: pd.DataFrame,
+    dataset_paths: dict[str, Path | None],
+    execution_horizon: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Write goal and predicted-horizon-position diagnostic CSVs."""
+
+    required_summary_columns = {"split", "checkpoint_step"}
+    missing_summary_columns = required_summary_columns - set(summary.columns)
+    if missing_summary_columns:
+        raise ValueError(
+            "Checkpoint summary is missing columns: "
+            + ", ".join(sorted(missing_summary_columns))
+    )
+    goal_frames = []
+    horizon_frames = []
+    task_cache: dict[tuple[str, int], dict[int, list[str]]] = {}
+    for split_value, step_value in (
+        summary[["split", "checkpoint_step"]]
+        .drop_duplicates()
+        .sort_values(["split", "checkpoint_step"])
+        .itertuples(index=False, name=None)
+    ):
+        split = str(split_value)
+        step = int(step_value)
+        raw_path = raw_predictions_csv_path(output_dir / f"checkpoint-{step}", split)
+        if not raw_path.is_file():
+            logging.warning("Cannot calculate extended metrics; missing %s", raw_path)
+            continue
+        raw_predictions = pd.read_csv(raw_path, compression="gzip")
+        _validate_error_rows(raw_predictions)
+        raw_steps = set(pd.to_numeric(raw_predictions["checkpoint_step"], errors="raise").astype(int))
+        if raw_steps != {step}:
+            raise ValueError(
+                f"{raw_path} contains checkpoint steps {sorted(raw_steps)}, expected only {step}"
+            )
+
+        dataset_path = dataset_paths.get(split)
+        if dataset_path is None:
+            episode_tasks: dict[int, list[str]] = {}
+        else:
+            dataset_key = (str(dataset_path.resolve()), int(raw_predictions["trajectory"].max()) + 1)
+            episode_tasks = task_cache.get(dataset_key, {})
+            if dataset_key not in task_cache:
+                episode_tasks = _load_episode_tasks(dataset_path, dataset_key[1])
+                task_cache[dataset_key] = episode_tasks
+
+        goal_frames.append(
+            goal_metrics_from_raw_predictions(
+                raw_predictions,
+                split=split,
+                episode_tasks=episode_tasks,
+            )
+        )
+        horizon_frames.append(
+            horizon_position_metrics_from_raw_predictions(
+                raw_predictions,
+                split=split,
+                execution_horizon=execution_horizon,
+            )
+        )
+
+    goals = (
+        pd.concat(goal_frames, ignore_index=True).sort_values(
+            ["split", "checkpoint_step", "goal"]
+        )
+        if goal_frames
+        else pd.DataFrame(columns=GOAL_METRICS_COLUMNS)
+    )
+    horizon_positions = (
+        pd.concat(horizon_frames, ignore_index=True).sort_values(
+            ["split", "checkpoint_step", "horizon_position"]
+        )
+        if horizon_frames
+        else pd.DataFrame(columns=HORIZON_POSITION_METRICS_COLUMNS)
+    )
+
+    goals.to_csv(output_dir / GOAL_METRICS_FILENAME, index=False)
+    horizon_positions.to_csv(output_dir / HORIZON_POSITION_METRICS_FILENAME, index=False)
+    logging.info(
+        "Saved goal and horizon-position metrics under %s",
+        output_dir,
+    )
+    return goals, horizon_positions
+
+
+def plot_horizon_position_metrics(
+    horizon_metrics: pd.DataFrame,
+    checkpoint_steps: list[int],
+    path: Path,
+) -> None:
+    selected = horizon_metrics[
+        horizon_metrics["checkpoint_step"].isin(checkpoint_steps)
+    ].copy()
+    if selected.empty:
+        logging.warning(
+            "Skipping execution-horizon error plot because no selected metrics are available"
+        )
+        return
+    splits = list(dict.fromkeys(selected["split"].astype(str)))
+    figure, axes = plt.subplots(
+        len(splits),
+        1,
+        figsize=(11, 4.8 * len(splits)),
+        squeeze=False,
+    )
+    for axis, split in zip(axes[:, 0], splits, strict=True):
+        split_metrics = selected[selected["split"] == split]
+        for step, checkpoint in split_metrics.groupby("checkpoint_step", sort=True):
+            checkpoint = checkpoint.sort_values("horizon_position")
+            axis.plot(
+                checkpoint["horizon_position"].to_numpy(dtype=int) + 1,
+                checkpoint["mae"],
+                marker="o",
+                linewidth=SUMMARY_LINE_WIDTH,
+                markersize=SUMMARY_MARKER_SIZE,
+                label=f"checkpoint {int(step)}",
+            )
+        positions = sorted(int(value) + 1 for value in split_metrics["horizon_position"].unique())
+        axis.set_xticks(positions)
+        axis.set_xlabel("Predicted action position within execution chunk (1 = first)")
+        axis.set_ylabel("Unnormalized action MAE")
+        axis.set_title(f"{split_label(split)} error by predicted horizon position")
+        axis.grid(alpha=0.25)
+        axis.legend()
+    figure.tight_layout()
+    save_figure_with_parent(figure, path, dpi=180)
+    plt.close(figure)
 
 
 def right_summary_from_raw_predictions(
@@ -1752,6 +2082,8 @@ def evaluate_probe(
     canonical_labels: list[str] | None,
     checkpoint_progress_label: str,
     velocity_analysis: bool = False,
+    inference_batch_size: int = 1,
+    inference_seed: int | None = None,
 ) -> tuple[list[dict], dict, list[dict], list[str]]:
     episode_rows = []
     joint_rows = []
@@ -1764,20 +2096,36 @@ def evaluate_probe(
     trajectory_count = len(trajectory_ids)
     for trajectory_index, traj_id in enumerate(trajectory_ids, start=1):
         trajectory_started_at = time.perf_counter()
-        trajectory = loader[traj_id]
+        if hasattr(loader, "load_episode"):
+            trajectory = loader.load_episode(
+                traj_id,
+                frame_indices=lambda trajectory_length: (
+                    open_loop_eval.required_visual_frame_indices(
+                        trajectory_length=trajectory_length,
+                        steps=steps if steps > 0 else trajectory_length,
+                        execution_horizon=execution_horizon,
+                        modality_configs=loader.modality_configs,
+                    )
+                ),
+            )
+        else:
+            # Retain compatibility with simple external/mocked episode loaders.
+            trajectory = loader[traj_id]
         evaluation_steps = steps if steps > 0 else len(trajectory)
         evaluation_steps = min(evaluation_steps, len(trajectory))
         inference_count = ceil(evaluation_steps / execution_horizon)
+        inference_request_count = ceil(inference_count / inference_batch_size)
         progress_label = (
             f"{checkpoint_progress_label} | {split} episode "
             f"{trajectory_index}/{trajectory_count} traj={traj_id}"
         )
         goal = trajectory_goals.get(traj_id)
         logging.info(
-            "[%s] starting: %d frame(s), %d inference request(s), goal=%r",
+            "[%s] starting: %d frame(s), %d inference point(s) in %d request(s), goal=%r",
             progress_label,
             evaluation_steps,
             inference_count,
+            inference_request_count,
             goal,
         )
         labels = action_labels(trajectory, action_keys)
@@ -1809,6 +2157,9 @@ def evaluate_probe(
                 execution_horizon=execution_horizon,
                 save_plot_path=None,
                 progress_label=progress_label,
+                trajectory=trajectory,
+                inference_batch_size=inference_batch_size,
+                inference_seed=inference_seed,
             )
         finally:
             open_loop_eval.plot_trajectory_results = original_plotter
@@ -2043,6 +2394,7 @@ def plot_right_evaluation_summaries(
     joints: pd.DataFrame,
     *,
     save_metrics: bool,
+    plot_checkpoint_steps: set[int] | None = None,
 ) -> int | None:
     right_summary = right_summary_from_raw_predictions(output_dir, summary)
     scoped_joints = right_joint_rows(joints)
@@ -2059,13 +2411,34 @@ def plot_right_evaluation_summaries(
         right_summary.to_csv(right_output_dir / "metrics_by_checkpoint.csv", index=False)
         right_summary.to_csv(right_output_dir / "checkpoint_metric_summary.csv", index=False)
         scoped_joints.to_csv(right_output_dir / "metrics_per_joint.csv", index=False)
-    return plot_evaluation_summaries(
+    validation_right_summary = right_summary[right_summary["split"] == "validation"]
+    best_step = (
+        int(
+            validation_right_summary.loc[
+                validation_right_summary["mae"].idxmin(), "checkpoint_step"
+            ]
+        )
+        if not validation_right_summary.empty
+        else None
+    )
+    if plot_checkpoint_steps is not None:
+        right_summary = right_summary[
+            right_summary["checkpoint_step"].isin(plot_checkpoint_steps)
+        ]
+        scoped_joints = scoped_joints[
+            scoped_joints["checkpoint_step"].isin(plot_checkpoint_steps)
+        ]
+    if right_summary.empty or scoped_joints.empty:
+        logging.warning("Skipping right-arm/hand plots because no selected checkpoints remain")
+        return best_step
+    plot_evaluation_summaries(
         right_output_dir,
         right_summary,
         scoped_joints,
         labels,
         scope_label="Right arm + right hand",
     )
+    return best_step
 
 
 def raw_trajectory_arrays(
@@ -2305,6 +2678,15 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
     summary = pd.read_csv(summary_path)
     joints = pd.read_csv(joints_path)
     state_cache: dict[tuple, pd.DataFrame] = {}
+    _, horizon_metrics = write_extended_evaluation_metrics(
+        output_dir=output_dir,
+        summary=summary,
+        dataset_paths={
+            "validation": args.dataset_path,
+            "train_probe": args.train_dataset_path,
+        },
+        execution_horizon=args.execution_horizon,
+    )
     if args.velocity_analysis:
         write_joint_position_velocity_statistics(
             output_dir=output_dir,
@@ -2324,23 +2706,38 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
         if missing_steps:
             raise ValueError(f"Saved metrics do not contain checkpoints: {sorted(missing_steps)}")
     checkpoint_steps = sorted(int(step) for step in summary["checkpoint_step"].unique())
-    validation_joints = joints[joints["split"] == "validation"]
+    plot_checkpoint_steps = latest_checkpoint_steps(checkpoint_steps)
+    plot_step_set = set(plot_checkpoint_steps)
+    plot_summary = summary[summary["checkpoint_step"].isin(plot_step_set)]
+    plot_joints = joints[joints["checkpoint_step"].isin(plot_step_set)]
+    validation_summary = summary[summary["split"] == "validation"]
+    best_step = int(
+        validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
+    )
+    validation_joints = plot_joints[plot_joints["split"] == "validation"]
     labels = validation_joints["joint"].drop_duplicates().astype(str).tolist()
-    best_step = plot_evaluation_summaries(output_dir, summary, joints, labels)
+    plot_evaluation_summaries(output_dir, plot_summary, plot_joints, labels)
     right_best_step = plot_right_evaluation_summaries(
         output_dir,
         summary,
         joints,
         save_metrics=not bool(args.checkpoint_steps),
+        plot_checkpoint_steps=plot_step_set,
+    )
+    plot_horizon_position_metrics(
+        horizon_metrics,
+        plot_checkpoint_steps,
+        output_dir / "error_by_horizon_position.png",
     )
     regenerate_trajectory_plots(
         args=args,
         output_dir=output_dir,
-        checkpoint_steps=checkpoint_steps,
+        checkpoint_steps=plot_checkpoint_steps,
         state_cache=state_cache,
     )
 
     print(f"Regenerated plots from saved CSVs in {output_dir}")
+    print(f"Plots limited to latest checkpoint(s): {plot_checkpoint_steps}")
     print(f"Lowest validation MAE: checkpoint {best_step}")
     if right_best_step is not None:
         print(f"Lowest right-side validation MAE: checkpoint {right_best_step}")
@@ -2361,6 +2758,7 @@ def main() -> None:
         args.run_dir,
         args.checkpoint_steps,
         args.base_model_path,
+        args.run_root_step,
     )
     embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     episode_rows = []
@@ -2369,10 +2767,13 @@ def main() -> None:
     canonical_labels = None
     evaluation_started_at = time.perf_counter()
     target_count = len(targets)
+    plot_checkpoint_steps = latest_checkpoint_steps([target.step for target in targets])
+    plot_step_set = set(plot_checkpoint_steps)
     logging.info(
-        "Evaluation plan: %d model target(s), checkpoint steps=%s, output=%s",
+        "Evaluation plan: %d model target(s), checkpoint steps=%s, plots=%s, output=%s",
         target_count,
         [target.step for target in targets],
+        plot_checkpoint_steps,
         output_dir,
     )
 
@@ -2435,7 +2836,11 @@ def main() -> None:
                 episode_id: " / ".join(dict.fromkeys(tasks))
                 for episode_id, tasks in episode_tasks.items()
             }
-            if args.skip_trajectory_plots or args.trajectory_plot_episodes == 0:
+            if (
+                step not in plot_step_set
+                or args.skip_trajectory_plots
+                or args.trajectory_plot_episodes == 0
+            ):
                 plot_trajectory_ids = set()
             elif selected_ids:
                 # Explicit trajectory selections remain explicit for plotting too.
@@ -2492,6 +2897,8 @@ def main() -> None:
                 canonical_labels=canonical_labels,
                 checkpoint_progress_label=checkpoint_progress_label,
                 velocity_analysis=args.velocity_analysis,
+                inference_batch_size=args.inference_batch_size,
+                inference_seed=args.inference_seed,
             )
             logging.info("Saved frame-level %s data to %s", split, raw_predictions_path)
             episode_rows.extend(probe_episode_rows)
@@ -2522,6 +2929,15 @@ def main() -> None:
     episodes.to_csv(output_dir / "metrics_per_episode.csv", index=False)
     summary.to_csv(output_dir / "metrics_by_checkpoint.csv", index=False)
     joints.to_csv(output_dir / "metrics_per_joint.csv", index=False)
+    _, horizon_metrics = write_extended_evaluation_metrics(
+        output_dir=output_dir,
+        summary=summary,
+        dataset_paths={
+            "validation": args.dataset_path,
+            "train_probe": args.train_dataset_path,
+        },
+        execution_horizon=args.execution_horizon,
+    )
     if args.velocity_analysis:
         write_joint_position_velocity_statistics(
             output_dir=output_dir,
@@ -2535,10 +2951,16 @@ def main() -> None:
 
     checkpoint_summary_csv = output_dir / "checkpoint_metric_summary.csv"
     summary.to_csv(checkpoint_summary_csv, index=False)
-    best_step = plot_evaluation_summaries(
+    plot_summary = summary[summary["checkpoint_step"].isin(plot_step_set)]
+    plot_joints = joints[joints["checkpoint_step"].isin(plot_step_set)]
+    validation_summary = summary[summary["split"] == "validation"]
+    best_step = int(
+        validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
+    )
+    plot_evaluation_summaries(
         output_dir,
-        summary,
-        joints,
+        plot_summary,
+        plot_joints,
         canonical_labels or [],
     )
     right_best_step = plot_right_evaluation_summaries(
@@ -2546,13 +2968,22 @@ def main() -> None:
         summary,
         joints,
         save_metrics=True,
+        plot_checkpoint_steps=plot_step_set,
+    )
+    plot_horizon_position_metrics(
+        horizon_metrics,
+        plot_checkpoint_steps,
+        output_dir / "error_by_horizon_position.png",
     )
 
     print(summary.to_string(index=False))
     print(f"\nLowest validation MAE: checkpoint {best_step}")
     if right_best_step is not None:
         print(f"Lowest right-side validation MAE: checkpoint {right_best_step}")
+    print(f"Plots limited to latest checkpoint(s): {plot_checkpoint_steps}")
     print(f"Checkpoint summary CSV: {checkpoint_summary_csv}")
+    print(f"Goal metrics CSV: {output_dir / GOAL_METRICS_FILENAME}")
+    print(f"Horizon-position metrics CSV: {output_dir / HORIZON_POSITION_METRICS_FILENAME}")
     print(
         "Frame-level validation CSVs: "
         f"{output_dir}/<checkpoint>/validation_frame_predictions.csv.gz"

@@ -241,6 +241,21 @@ class TestGr00tPolicyGetAction:
         assert "options" not in call_kwargs
         assert "action" not in call_kwargs["inputs"]
 
+    def test_synchronous_inference_forwards_valid_per_sample_noise_seeds(self, policy):
+        policy.model.get_action.return_value = BatchFeature(
+            data={"action_pred": torch.randn(2, 16, 7)}
+        )
+
+        _action, info = policy.get_action(
+            _make_observation(batch_size=2),
+            options={"inference_mode": "synchronous", "noise_seeds": [101, 202]},
+        )
+
+        call_kwargs = policy.model.get_action.call_args.kwargs
+        assert call_kwargs["options"] == {"noise_seeds": [101, 202]}
+        assert "action" not in call_kwargs["inputs"]
+        assert info == {"noise_seeds_applied": True}
+
     def test_rtc_reencodes_variable_physical_tail_and_derives_model_options(self, policy):
         tail_horizon = 5
         previous_action = {

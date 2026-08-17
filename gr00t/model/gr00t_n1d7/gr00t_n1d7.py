@@ -35,6 +35,39 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 logger = logging.getLogger(__name__)
 
 
+def sample_initial_action_noise(
+    *,
+    batch_size: int,
+    action_horizon: int,
+    action_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    noise_seeds: list[int] | None = None,
+) -> torch.Tensor:
+    """Sample flow noise, optionally from an independent generator per batch row."""
+
+    shape = (batch_size, action_horizon, action_dim)
+    if noise_seeds is None:
+        return torch.randn(size=shape, dtype=dtype, device=device)
+    if len(noise_seeds) != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} per-sample noise seeds, got {len(noise_seeds)}"
+        )
+    rows = []
+    for seed in noise_seeds:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        rows.append(
+            torch.randn(
+                size=(action_horizon, action_dim),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+        )
+    return torch.stack(rows, dim=0)
+
+
 class Gr00tN1d7ActionHead(nn.Module):
     """Action head component for flow matching diffusion policy."""
 
@@ -346,10 +379,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
+        actions = sample_initial_action_noise(
+            batch_size=batch_size,
+            action_horizon=self.config.action_horizon,
+            action_dim=self.action_dim,
             dtype=vl_embeds.dtype,
             device=device,
+            noise_seeds=options.get("noise_seeds") if options is not None else None,
         )
 
         dt = 1.0 / self.num_inference_timesteps

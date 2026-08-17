@@ -15,6 +15,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import hashlib
 import logging
 from pathlib import Path
 import re
@@ -129,9 +130,68 @@ def plot_trajectory_results(
     plt.close()  # Close the figure to free memory
 
 
-def parse_action_gr00t(action: dict[str, Any]) -> dict[str, Any]:
-    # Unbatch and add prefix
-    return {f"action.{key}": action[key][0] for key in action}
+def parse_action_gr00t(action: dict[str, Any], batch_index: int = 0) -> dict[str, Any]:
+    """Select one batch item and add the action prefix used by evaluation."""
+
+    return {f"action.{key}": action[key][batch_index] for key in action}
+
+
+def required_visual_frame_indices(
+    *,
+    trajectory_length: int,
+    steps: int,
+    execution_horizon: int,
+    modality_configs: dict[str, Any],
+) -> np.ndarray:
+    """Return the video/mask rows needed by open-loop inference, in decode order."""
+
+    if execution_horizon <= 0:
+        raise ValueError(f"execution_horizon must be positive, got {execution_horizon}")
+    actual_steps = min(steps, trajectory_length)
+    indices: set[int] = set()
+    for modality in ("video", "mask"):
+        config = modality_configs.get(modality)
+        if config is None:
+            continue
+        for step_count in range(0, actual_steps, execution_horizon):
+            indices.update(step_count + int(delta) for delta in config.delta_indices)
+    ordered = np.asarray(sorted(indices), dtype=np.int64)
+    invalid = ordered[(ordered < 0) | (ordered >= trajectory_length)]
+    if invalid.size:
+        raise IndexError(
+            f"Evaluation requires visual frame indices {invalid.tolist()} outside trajectory "
+            f"range 0..{trajectory_length - 1}"
+        )
+    return ordered
+
+
+def batch_policy_observations(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Join already-batched single observations without changing their order."""
+
+    if not observations:
+        raise ValueError("Cannot batch an empty observation list")
+    batched: dict[str, Any] = {}
+    for modality, first_values in observations[0].items():
+        batched[modality] = {}
+        for key, first_value in first_values.items():
+            values = [observation[modality][key] for observation in observations]
+            if isinstance(first_value, np.ndarray):
+                batched[modality][key] = np.concatenate(values, axis=0)
+            elif isinstance(first_value, list):
+                batched[modality][key] = [item for value in values for item in value]
+            else:
+                raise TypeError(
+                    f"Cannot batch observation {modality}.{key} of type "
+                    f"{type(first_value).__name__}"
+                )
+    return batched
+
+
+def inference_noise_seed(base_seed: int, trajectory_id: int, step_count: int) -> int:
+    """Derive a stable per-observation seed independent of inference batching."""
+
+    payload = f"{int(base_seed)}:{int(trajectory_id)}:{int(step_count)}".encode("ascii")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") % (2**63)
 
 
 def evaluate_single_trajectory(
@@ -144,16 +204,23 @@ def evaluate_single_trajectory(
     execution_horizon=16,
     save_plot_path=None,
     progress_label: str | None = None,
+    trajectory: pd.DataFrame | None = None,
+    inference_batch_size: int = 1,
+    inference_seed: int | None = None,
 ):
+    if inference_batch_size <= 0:
+        raise ValueError(f"inference_batch_size must be positive, got {inference_batch_size}")
     # Ensure steps doesn't exceed trajectory length
-    traj = loader[traj_id]
+    traj = loader[traj_id] if trajectory is None else trajectory
     traj_length = len(traj)
     actual_steps = min(steps, traj_length)
     logging.info(
         f"Using {actual_steps} steps (requested: {steps}, trajectory length: {traj_length})"
     )
     progress_label = progress_label or f"trajectory {traj_id}"
-    total_inferences = (actual_steps + execution_horizon - 1) // execution_horizon
+    inference_steps = list(range(0, actual_steps, execution_horizon))
+    total_inferences = len(inference_steps)
+    total_requests = (total_inferences + inference_batch_size - 1) // inference_batch_size
     trajectory_started_at = time.perf_counter()
 
     pred_action_across_time = []
@@ -173,51 +240,89 @@ def evaluate_single_trajectory(
 
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
-    for inference_index, step_count in enumerate(
-        range(0, actual_steps, execution_horizon), start=1
+    for request_index, batch_start in enumerate(
+        range(0, total_inferences, inference_batch_size), start=1
     ):
-        data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
-        obs = {}
-        for k, v in data_point.states.items():
-            obs[f"state.{k}"] = v  # (T, D)
-        for k, v in data_point.images.items():
-            obs[f"video.{k}"] = np.array(v)  # (T, H, W, C)
-        for language_key in loader.modality_configs["language"].modality_keys:
-            obs[language_key] = data_point.text
-        parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
+        batch_steps = inference_steps[batch_start : batch_start + inference_batch_size]
+        observations = []
+        for step_count in batch_steps:
+            data_point = extract_step_data(traj, step_count, modality_configs, embodiment_tag)
+            obs = {}
+            for k, v in data_point.states.items():
+                obs[f"state.{k}"] = v  # (T, D)
+            for k, v in data_point.images.items():
+                obs[f"video.{k}"] = np.array(v)  # (T, H, W, C)
+            for language_key in loader.modality_configs["language"].modality_keys:
+                obs[language_key] = data_point.text
+            observations.append(parse_observation_gr00t(obs, loader.modality_configs))
+
+        parsed_obs = batch_policy_observations(observations)
         inference_started_at = time.perf_counter()
-        _action_chunk, _ = policy.get_action(parsed_obs)
+        if inference_seed is None:
+            _action_chunk, _ = policy.get_action(parsed_obs)
+        else:
+            noise_seeds = [
+                inference_noise_seed(inference_seed, traj_id, step_count)
+                for step_count in batch_steps
+            ]
+            _action_chunk, _ = policy.get_action(
+                parsed_obs,
+                options={
+                    "inference_mode": "synchronous",
+                    "noise_seeds": noise_seeds,
+                },
+            )
         inference_seconds = time.perf_counter() - inference_started_at
         elapsed_seconds = time.perf_counter() - trajectory_started_at
-        completed_frame = min(step_count + execution_horizon, actual_steps)
-        remaining_inferences = total_inferences - inference_index
-        estimated_remaining_seconds = elapsed_seconds / inference_index * remaining_inferences
-        logging.info(
-            "[%s] inference %d/%d complete: frames %d-%d/%d (%.1f%%), "
-            "request %.3fs, episode elapsed %.1fs, episode ETA %.1fs",
-            progress_label,
-            inference_index,
-            total_inferences,
-            step_count + 1,
-            completed_frame,
-            actual_steps,
-            100.0 * completed_frame / actual_steps,
-            inference_seconds,
-            elapsed_seconds,
-            estimated_remaining_seconds,
-        )
-        action_chunk = parse_action_gr00t(_action_chunk)
-        for j in range(execution_horizon):
-            # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
-            # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
-            concat_pred_action = np.concatenate(
-                [
-                    np.atleast_1d(np.atleast_1d(action_chunk[f"action.{key}"])[j])
-                    for key in action_keys
-                ],
-                axis=0,
+        completed_frame = min(batch_steps[-1] + execution_horizon, actual_steps)
+        remaining_requests = total_requests - request_index
+        estimated_remaining_seconds = elapsed_seconds / request_index * remaining_requests
+        if inference_batch_size == 1:
+            logging.info(
+                "[%s] inference %d/%d complete: frames %d-%d/%d (%.1f%%), "
+                "request %.3fs, episode elapsed %.1fs, episode ETA %.1fs",
+                progress_label,
+                batch_start + 1,
+                total_inferences,
+                batch_steps[0] + 1,
+                completed_frame,
+                actual_steps,
+                100.0 * completed_frame / actual_steps,
+                inference_seconds,
+                elapsed_seconds,
+                estimated_remaining_seconds,
             )
-            pred_action_across_time.append(concat_pred_action)
+        else:
+            logging.info(
+                "[%s] inference batch %d/%d complete: observations %d-%d/%d, "
+                "frames through %d/%d (%.1f%%), request %.3fs, episode elapsed %.1fs, "
+                "episode ETA %.1fs",
+                progress_label,
+                request_index,
+                total_requests,
+                batch_start + 1,
+                batch_start + len(batch_steps),
+                total_inferences,
+                completed_frame,
+                actual_steps,
+                100.0 * completed_frame / actual_steps,
+                inference_seconds,
+                elapsed_seconds,
+                estimated_remaining_seconds,
+            )
+
+        for batch_index, _step_count in enumerate(batch_steps):
+            action_chunk = parse_action_gr00t(_action_chunk, batch_index=batch_index)
+            for j in range(execution_horizon):
+                # The np.atleast_1d handles scalar action groups.
+                concat_pred_action = np.concatenate(
+                    [
+                        np.atleast_1d(action_chunk[f"action.{key}"][j])
+                        for key in action_keys
+                    ],
+                    axis=0,
+                )
+                pred_action_across_time.append(concat_pred_action)
 
     def extract_state_joints(traj: pd.DataFrame, columns: list[str]):
         np_dict = {}

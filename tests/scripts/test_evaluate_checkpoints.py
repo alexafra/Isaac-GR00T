@@ -91,6 +91,24 @@ def test_velocity_analysis_cli_is_opt_in(tmp_path, monkeypatch, enabled):
     assert evaluate_checkpoints.parse_args().velocity_analysis is enabled
 
 
+def test_inference_batch_size_cli_is_configurable(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_checkpoints",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--dataset-path",
+            str(tmp_path / "validation"),
+            "--inference-batch-size",
+            "8",
+        ],
+    )
+
+    assert evaluate_checkpoints.parse_args().inference_batch_size == 8
+
+
 def test_plot_selection_exceeds_soft_target_to_cover_every_task(tmp_path):
     episode_tasks = [["a"], ["a"], ["b"], ["b"], ["c"], ["d"]]
     _write_episode_metadata(tmp_path, episode_tasks)
@@ -176,6 +194,32 @@ def test_evaluation_target_selection_can_choose_only_base_or_only_checkpoint(tmp
 
     assert [(target.step, target.model_path) for target in base_only] == [(0, base_model)]
     assert [(target.step, target.model_path) for target in checkpoint_only] == [(2000, checkpoint)]
+
+
+def test_evaluation_targets_can_include_final_weights_from_run_root(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_run_processor(run_dir)
+    (run_dir / "config.json").write_text("{}")
+    (run_dir / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    checkpoint = run_dir / "checkpoint-25000"
+    checkpoint.mkdir()
+
+    targets = find_evaluation_targets(run_dir, [25000, 30000], None, 30000)
+
+    assert [(target.step, target.model_path) for target in targets] == [
+        (25000, checkpoint),
+        (30000, run_dir),
+    ]
+
+
+def test_run_root_step_rejects_duplicate_physical_checkpoint(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "checkpoint-30000").mkdir()
+
+    with pytest.raises(ValueError, match="both represent step 30000"):
+        find_evaluation_targets(run_dir, [30000], None, 30000)
 
 
 def test_base_evaluation_requires_run_processor_statistics(tmp_path):
@@ -269,8 +313,11 @@ def test_figure_save_recreates_parent_if_it_disappears_during_first_write(tmp_pa
 def test_evaluate_probe_passes_checkpoint_split_and_episode_progress(
     tmp_path, monkeypatch, caplog, velocity_analysis
 ):
+    loaded_trajectory_ids = []
+
     class FakeLoader:
         def __getitem__(self, trajectory_id):
+            loaded_trajectory_ids.append(trajectory_id)
             value = np.asarray([float(trajectory_id)], dtype=np.float32)
             return pd.DataFrame(
                 {
@@ -280,9 +327,12 @@ def test_evaluate_probe_passes_checkpoint_split_and_episode_progress(
             )
 
     progress_labels = []
+    inference_batch_sizes = []
 
     def fake_evaluate_single_trajectory(**kwargs):
         progress_labels.append(kwargs["progress_label"])
+        inference_batch_sizes.append(kwargs["inference_batch_size"])
+        assert kwargs["trajectory"] is not None
         trajectory_id = kwargs["traj_id"]
         ground_truth = np.full((3, 1), trajectory_id, dtype=np.float32)
         prediction = ground_truth + 0.25
@@ -345,8 +395,11 @@ def test_evaluate_probe_passes_checkpoint_split_and_episode_progress(
         canonical_labels=None,
         checkpoint_progress_label="checkpoint 2/11 step=2000",
         velocity_analysis=velocity_analysis,
+        inference_batch_size=3,
     )
 
+    assert loaded_trajectory_ids == [4, 9]
+    assert inference_batch_sizes == [3, 3]
     assert progress_labels == [
         "checkpoint 2/11 step=2000 | validation episode 1/2 traj=4",
         "checkpoint 2/11 step=2000 | validation episode 2/2 traj=9",
@@ -1056,3 +1109,149 @@ def test_main_plots_only_skips_checkpoint_loading(tmp_path, monkeypatch):
     evaluate_checkpoints.main()
 
     assert calls == [(args, args.output_dir)]
+
+
+def test_latest_checkpoint_steps_selects_only_two_numerically_latest():
+    assert evaluate_checkpoints.latest_checkpoint_steps([20_000, 0, 4_000, 16_000]) == [
+        16_000,
+        20_000,
+    ]
+    assert evaluate_checkpoints.latest_checkpoint_steps([8_000]) == [8_000]
+
+
+def test_goal_and_horizon_position_metrics_use_every_scalar_error():
+    episode_zero = raw_action_frame(
+        checkpoint_step_value=10,
+        trajectory_id=0,
+        ground_truth=np.zeros((4, 1)),
+        prediction=np.array([[1.0], [2.0], [3.0], [4.0]]),
+        labels=["right_arm[0]"],
+    )
+    episode_one = raw_action_frame(
+        checkpoint_step_value=10,
+        trajectory_id=1,
+        ground_truth=np.zeros((4, 1)),
+        prediction=np.zeros((4, 1)),
+        labels=["right_arm[0]"],
+    )
+    raw = pd.concat([episode_zero, episode_one], ignore_index=True)
+
+    goals = evaluate_checkpoints.goal_metrics_from_raw_predictions(
+        raw,
+        split="validation",
+        episode_tasks={0: ["pick", "shared"], 1: ["place", "shared"]},
+    ).set_index("goal")
+    assert goals.loc["pick", "mae"] == pytest.approx(2.5)
+    assert goals.loc["place", "mae"] == pytest.approx(0.0)
+    assert goals.loc["shared", "mae"] == pytest.approx(1.25)
+    assert goals.loc["shared", "episodes"] == 2
+    assert goals.loc["shared", "frames"] == 8
+
+    positions = evaluate_checkpoints.horizon_position_metrics_from_raw_predictions(
+        raw,
+        split="validation",
+        execution_horizon=2,
+    ).set_index("horizon_position")
+    assert positions.loc[0, "mae"] == pytest.approx(1.0)
+    assert positions.loc[0, "mse"] == pytest.approx(2.5)
+    assert positions.loc[1, "mae"] == pytest.approx(1.5)
+    assert positions.loc[1, "mse"] == pytest.approx(5.0)
+
+
+def test_horizon_position_plot_excludes_older_checkpoints(tmp_path, monkeypatch):
+    saved_figures = []
+    monkeypatch.setattr(
+        "matplotlib.figure.Figure.savefig",
+        lambda figure, *_args, **_kwargs: saved_figures.append(figure),
+    )
+    metrics = pd.DataFrame(
+        [
+            {
+                "split": "validation",
+                "checkpoint_step": step,
+                "horizon_position": position,
+                "mae": step / 1000 + position,
+            }
+            for step in (10, 20, 30)
+            for position in (0, 1)
+        ]
+    )
+
+    evaluate_checkpoints.plot_horizon_position_metrics(
+        metrics,
+        [20, 30],
+        tmp_path / "horizon.png",
+    )
+
+    line_labels = {line.get_label() for line in saved_figures[0].axes[0].lines}
+    assert line_labels == {"checkpoint 20", "checkpoint 30"}
+
+
+def test_plots_only_scopes_every_checkpoint_plot_to_latest_two(tmp_path, monkeypatch):
+    output_dir = tmp_path / "evaluation"
+    output_dir.mkdir()
+    summary = pd.DataFrame(
+        [
+            {"split": "validation", "checkpoint_step": step, "mae": step / 1000}
+            for step in (10, 20, 30)
+        ]
+    )
+    joints = pd.DataFrame(
+        [
+            {
+                "split": "validation",
+                "checkpoint_step": step,
+                "joint": "right_arm[0]",
+                "mae": step / 1000,
+            }
+            for step in (10, 20, 30)
+        ]
+    )
+    summary.to_csv(output_dir / "metrics_by_checkpoint.csv", index=False)
+    joints.to_csv(output_dir / "metrics_per_joint.csv", index=False)
+    plot_calls = {}
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "write_extended_evaluation_metrics",
+        lambda **_kwargs: (pd.DataFrame(), pd.DataFrame()),
+    )
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "plot_evaluation_summaries",
+        lambda _output, scoped_summary, _joints, _labels: plot_calls.update(
+            aggregate=sorted(scoped_summary["checkpoint_step"].unique())
+        ),
+    )
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "plot_right_evaluation_summaries",
+        lambda *_args, **kwargs: plot_calls.update(
+            right=sorted(kwargs["plot_checkpoint_steps"])
+        ),
+    )
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "plot_horizon_position_metrics",
+        lambda _metrics, steps, _path: plot_calls.update(horizon=steps),
+    )
+    monkeypatch.setattr(
+        evaluate_checkpoints,
+        "regenerate_trajectory_plots",
+        lambda **kwargs: plot_calls.update(trajectories=kwargs["checkpoint_steps"]),
+    )
+    args = Namespace(
+        checkpoint_steps=None,
+        dataset_path=tmp_path / "validation",
+        execution_horizon=8,
+        train_dataset_path=None,
+        velocity_analysis=False,
+    )
+
+    regenerate_plots(args, output_dir)
+
+    assert plot_calls == {
+        "aggregate": [20, 30],
+        "right": [20, 30],
+        "horizon": [20, 30],
+        "trajectories": [20, 30],
+    }

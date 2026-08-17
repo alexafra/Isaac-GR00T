@@ -993,6 +993,11 @@ class Gr00tN1d7Processor(BaseProcessor):
             )  # earlyfusion
             if fusion_override:  # earlyfusion
                 processor_kwargs["modality_configs"] = modality_configs  # earlyfusion
+                processor_kwargs["statistics"] = {  # earlyfusion
+                    embodiment_tag: statistics  # earlyfusion
+                    for embodiment_tag, statistics in processor_kwargs["statistics"].items()  # earlyfusion
+                    if embodiment_tag in modality_configs  # earlyfusion
+                }  # earlyfusion
             else:  # earlyfusion
                 for embodiment_tag, modality_config in modality_configs.items():  # earlyfusion
                     processor_kwargs["modality_configs"][embodiment_tag] = modality_config  # fmt: skip  # earlyfusion

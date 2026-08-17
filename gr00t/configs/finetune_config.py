@@ -54,11 +54,19 @@ class FinetuneConfig:
 
     tune_vision_patch_embed: bool = True  # earlyfusion
     """If True, fine-tune the vision patch embedding for every input configuration."""  # earlyfusion
+
+    vision_patch_embed_init: str | None = None  # earlyfusion
+    """Optional early-fusion initialization override: rgb_mean or zeros.
+    If unset, 4-channel fusion uses rgb_mean and 6-channel fusion uses zeros."""
     tune_projector: bool = True
     """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
 
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
+
+    load_bf16: bool = False
+    """Load the VLM backbone weights in BF16 instead of FP32. Frozen backbone
+    parameters stay in BF16; trainable backbone parameters are kept in FP32."""
 
     state_dropout_prob: float = 0.2
     """
@@ -139,6 +147,9 @@ class FinetuneConfig:
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to
     produce the post-accumulation per-optimizer-step batch."""
 
+    gradient_checkpointing: bool = False
+    """Recompute intermediate activations during backward to reduce VRAM use."""
+
     output_dir: str = "./outputs"
     """Directory where model checkpoints, logs, and outputs are saved."""
 
@@ -188,6 +199,10 @@ class FinetuneConfig:
 
     save_only_model: bool = False
     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""
+
+    skip_final_model_save: bool = False
+    """Skip the final model-weight save. Intended for short compatibility and
+    memory dry runs; experiment configuration and processor files are still saved."""
 
     resume_from_checkpoint: bool = False
     """If True, resume from the latest ``checkpoint-*`` in ``output_dir``. Default

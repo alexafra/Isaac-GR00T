@@ -223,15 +223,16 @@ class Qwen3Backbone(torch.nn.Module):
             return  # earlyfusion
         if old.in_channels != 3:  # earlyfusion
             raise ValueError(f"Cannot expand vision patch embedding from {old.in_channels} channels")  # fmt: skip  # earlyfusion
-        expected = {4: "rgb_mean", 6: "zeros"}.get(input_channels)  # earlyfusion
-        if initialization != expected:  # earlyfusion
-            raise ValueError(f"vision_patch_embed_init must be {expected!r} for {input_channels} channels")  # fmt: skip  # earlyfusion
+        allowed = {4: ("rgb_mean",), 6: ("zeros", "rgb_mean")}[input_channels]  # earlyfusion
+        if initialization not in allowed:  # earlyfusion
+            raise ValueError(f"vision_patch_embed_init must be one of {allowed!r} for {input_channels} channels")  # fmt: skip  # earlyfusion
         new = torch.nn.Conv3d(input_channels, old.out_channels, old.kernel_size, old.stride, old.padding, old.dilation, old.groups, old.bias is not None, old.padding_mode, device=old.weight.device, dtype=old.weight.dtype)  # fmt: skip  # earlyfusion
         with torch.no_grad():  # earlyfusion
             new.weight.zero_()  # earlyfusion
             new.weight[:, :3].copy_(old.weight)  # earlyfusion
-            if input_channels == 4:  # earlyfusion
-                new.weight[:, 3:4].copy_(old.weight.mean(dim=1, keepdim=True))  # earlyfusion
+            if initialization == "rgb_mean":  # earlyfusion
+                rgb_mean = old.weight.mean(dim=1, keepdim=True)  # earlyfusion
+                new.weight[:, 3:].copy_(rgb_mean.expand(-1, input_channels - 3, -1, -1, -1))  # fmt: skip  # earlyfusion
             if old.bias is not None:  # earlyfusion
                 new.bias.copy_(old.bias)  # earlyfusion
         new.weight.requires_grad_(old.weight.requires_grad)  # earlyfusion

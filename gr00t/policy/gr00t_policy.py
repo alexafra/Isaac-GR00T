@@ -38,6 +38,7 @@ from .policy import BasePolicy, PolicyWrapper
 
 _RTC_MODE = "rtc"
 _SYNCHRONOUS_MODE = "synchronous"
+_SYNCHRONOUS_OPTION_KEYS = frozenset({"inference_mode", "noise_seeds"})
 _RTC_OPTION_KEYS = frozenset(
     {
         "inference_mode",
@@ -312,12 +313,39 @@ class Gr00tPolicy(BasePolicy):
             # Preserve the historical behavior for unrelated policy options.
             return None, None, {}, None
         if mode == _SYNCHRONOUS_MODE:
-            unexpected = set(options) - {"inference_mode"}
+            unexpected = set(options) - _SYNCHRONOUS_OPTION_KEYS
             if unexpected:
                 raise ValueError(
                     f"Synchronous inference does not accept RTC options: {sorted(unexpected)}"
                 )
-            return None, None, {}, None
+            noise_seeds = options.get("noise_seeds")
+            if noise_seeds is None:
+                return None, None, {}, None
+            if not isinstance(noise_seeds, (list, tuple)):
+                raise ValueError("Synchronous noise_seeds must be a list of integers")
+            if len(noise_seeds) != len(states):
+                raise ValueError(
+                    f"Synchronous noise_seeds has {len(noise_seeds)} values for "
+                    f"batch size {len(states)}"
+                )
+            parsed_noise_seeds = []
+            for seed in noise_seeds:
+                if isinstance(seed, bool) or not isinstance(seed, Integral):
+                    raise ValueError(
+                        f"Synchronous noise seeds must be integers, got {seed!r}"
+                    )
+                seed = int(seed)
+                if not 0 <= seed < 2**63:
+                    raise ValueError(
+                        f"Synchronous noise seeds must be in [0, 2**63), got {seed}"
+                    )
+                parsed_noise_seeds.append(seed)
+            return (
+                None,
+                {"noise_seeds": parsed_noise_seeds},
+                {"noise_seeds_applied": True},
+                None,
+            )
         if mode != _RTC_MODE:
             raise ValueError(
                 f"Policy option 'inference_mode' must be 'synchronous' or 'rtc', got {mode!r}"
