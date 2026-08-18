@@ -49,6 +49,16 @@ def test_early_fusion_contract_is_exact_and_rejects_model_mismatch():  # earlyfu
         _vision_input_contract(SimpleNamespace(vision_input_channels=6, vision_channel_layout=model.vision_channel_layout, vision_patch_embed_init="zeros"), video)  # fmt: skip  # earlyfusion
 
 
+def test_six_channel_contract_accepts_both_supported_initializations():  # earlyfusion
+    video = ModalityConfig(delta_indices=[0], modality_keys=["ego_view", "surface_normals_view"], channel_fusion=[VideoChannelSource("ego_view", (0, 1, 2)), VideoChannelSource("surface_normals_view", (0, 1, 2))])  # fmt: skip  # earlyfusion
+    layout = ["ego_view:0", "ego_view:1", "ego_view:2", "surface_normals_view:0", "surface_normals_view:1", "surface_normals_view:2"]  # fmt: skip  # earlyfusion
+    for initialization in ("zeros", "rgb_mean"):  # earlyfusion
+        contract = _vision_input_contract(SimpleNamespace(vision_input_channels=6, vision_channel_layout=layout, vision_patch_embed_init=initialization), video)  # fmt: skip  # earlyfusion
+        assert contract["patch_embed_init"] == initialization  # earlyfusion
+    with pytest.raises(ValueError, match="patch initialization mismatch"):  # earlyfusion
+        _vision_input_contract(SimpleNamespace(vision_input_channels=6, vision_channel_layout=layout, vision_patch_embed_init="original_rgb"), video)  # fmt: skip  # earlyfusion
+
+
 def _build_modality_configs():
     return {
         EMBODIMENT: {

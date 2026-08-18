@@ -56,7 +56,11 @@ _RTC_REQUIRED_OPTION_KEYS = frozenset(
     }
 )
 _RGB_VISION_LAYOUT = ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
-_VISION_PATCH_INIT = {3: "original_rgb", 4: "rgb_mean", 6: "zeros"}  # earlyfusion
+_VISION_PATCH_INITS = {  # earlyfusion
+    3: frozenset({"original_rgb"}),  # earlyfusion
+    4: frozenset({"rgb_mean"}),  # earlyfusion
+    6: frozenset({"zeros", "rgb_mean"}),  # earlyfusion
+}  # earlyfusion
 
 
 def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> dict[str, Any]:  # fmt: skip  # earlyfusion
@@ -72,13 +76,13 @@ def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> d
     model_layout = getattr(model_config, "vision_channel_layout", _RGB_VISION_LAYOUT)  # earlyfusion
     patch_init = getattr(model_config, "vision_patch_embed_init", "original_rgb")  # earlyfusion
     expected_channels = len(layout) if fusion else 3  # earlyfusion
-    expected_init = _VISION_PATCH_INIT.get(expected_channels)  # earlyfusion
+    allowed_inits = _VISION_PATCH_INITS.get(expected_channels, frozenset())  # earlyfusion
     if isinstance(channels, bool) or channels != expected_channels:  # earlyfusion
         raise ValueError(f"Early-fusion model/processor channel mismatch: model={channels!r}, processor={expected_channels}")  # fmt: skip  # earlyfusion
     if list(model_layout) != layout:  # earlyfusion
         raise ValueError(f"Early-fusion model/processor layout mismatch: model={model_layout!r}, processor={layout!r}")  # fmt: skip  # earlyfusion
-    if patch_init != expected_init:  # earlyfusion
-        raise ValueError(f"Early-fusion patch initialization mismatch: got {patch_init!r}, expected {expected_init!r}")  # fmt: skip  # earlyfusion
+    if patch_init not in allowed_inits:  # earlyfusion
+        raise ValueError(f"Early-fusion patch initialization mismatch: got {patch_init!r}, allowed {sorted(allowed_inits)!r}")  # fmt: skip  # earlyfusion
     return {"version": 1, "mode": "early_channel_fusion" if fusion else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": patch_init, "wire_video_keys": list(video_config.modality_keys)}  # fmt: skip  # earlyfusion
 
 
