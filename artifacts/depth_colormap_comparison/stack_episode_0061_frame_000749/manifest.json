@@ -1,0 +1,52 @@
+{
+  "source": {
+    "episode": "episode_0061",
+    "frame_index": 749,
+    "rgb_path": "/home/alex/Development/Datasets/processed_raw/stack_cups_09_08/episode_0061/colors/000749_color_0.jpg",
+    "rgb_sha256": "ceedfada13be301f4d4ec2eb4f3df35a82bde79a0d1bd09a17a81b677ed29586",
+    "depth_path": "/home/alex/Development/Datasets/processed_raw/stack_cups_09_08/episode_0061/depths/000749_depth_0.png",
+    "depth_sha256": "e59683f8ba5c727c726589e401025b79818ae9a0a013bcc28a47e90ee9a955be"
+  },
+  "encoding": {
+    "scale_m_per_unit": 0.0010000000474974513,
+    "near_m": 0.25,
+    "far_m": 1.0,
+    "invalid_source_value": 0,
+    "invalid_output_rgb": [
+      0,
+      0,
+      0
+    ],
+    "mapping_direction": "near_to_far",
+    "colour_maps": [
+      "current_gray",
+      "turbo",
+      "viridis",
+      "cividis",
+      "plasma",
+      "inferno",
+      "magma",
+      "jet"
+    ],
+    "matplotlib_version": "3.10.1"
+  },
+  "frame": {
+    "height": 480,
+    "width": 640,
+    "invalid_pixels": 16825,
+    "invalid_fraction": 0.054768880208333336,
+    "valid_depth_min_m": 0.2670000126818195,
+    "valid_depth_max_m": 0.873000041465275
+  },
+  "outputs": {
+    "cividis.png": "54a35a61c662bac3760fa6644002ee1978a2491a28507645d095e77a6bbb9589",
+    "current_gray.png": "10a0b3110a3c721f0ac5ad58193b39275878d5e91c86e659b480006e4b4446ff",
+    "depth_colormap_comparison.png": "1ce08ee0d24977ec616bd15b4f966cf20bc3a68f0dc37ff03be81c1835e60988",
+    "inferno.png": "86731d4a61f32a3b60a013cd60257e9e0e62b599a39235fd5f1bef447bfcabd0",
+    "jet.png": "fb603699d29b69fbe232bef28da7746e368e9539d8e01f5cc2e7e460e5d8d15a",
+    "magma.png": "26e85a4d08f6afb14c2d12b22c06d7a30d7878c5ddcb97dcf623ef1c2051930c",
+    "plasma.png": "543e9498611969e8f4f4e336a171825559bace2b09f76301fed9ae44487582c7",
+    "turbo.png": "fe6fa9960341de648476daf4ba7a50e9dd31857cdfcac74b0f2413a0c02f4b14",
+    "viridis.png": "27aaf15af1422242a0bd7ec4e36b4d82cdc7f3cc828c9d93c8be1289ac6e5f33"
+  }
+}
