@@ -210,15 +210,69 @@ names, DFX provenance, video contract, and action semantics before accepting a
 policy. RGB, separate-view, fusion, depth-only, and normals-only checkpoints
 are supported.
 
-## Live deployment status
+## 8. Supervised live deployment
 
-The current committed client supports Inspire DFX shadow validation but still
-fails closed for Inspire `--actuate`. Live support requires a separate guarded
-DFX command backend. It will follow teleop's combined 100 Hz DFX position
-writer while retaining the policy client's arm release, feedback freshness,
-lost-counter, range, slew, HOLD, and heartbeat protections.
+Stop XR teleoperation and every other arm/hand publisher first. Restrain and
+support the robot, clear the workspace, keep the terminal focused, and have an
+operator on the physical emergency stop.
 
-The DFX protocol has no explicit hand stop acknowledgement: shutdown stops
-publishing and relies on the bridge's command-lease timeout, as existing teleop
-does. Real actuation must remain gated by `--allow-unqualified-real`, physical
-emergency-stop control, a restrained robot, and direct supervision.
+```bash
+cd /home/alex/Development/unitree_lerobot
+/home/alex/miniconda3/envs/unitree_lerobot/bin/python \
+  -m unitree_lerobot.eval_robot.eval_groot_g1 \
+  --actuate \
+  --allow-unqualified-real \
+  --end-effector inspire-dfx \
+  --task stack-three-cups \
+  --policy-host 127.0.0.1 \
+  --policy-port 5555 \
+  --image-host 192.168.123.164 \
+  --network-interface enp132s0 \
+  --initialization measured \
+  --no-warmup1 \
+  --warmup2 \
+  --future-goal-warmup2 \
+  --no-return-to-start \
+  --gravity-feedforward \
+  --inference-mode rtc \
+  --execution-horizon 8 \
+  --max-chunks 2 \
+  --command-conditioning xr
+```
+
+This uses the existing guarded actuator state machine. `r` advances the
+displayed ACTUATE, RUN, WARMUP2, and CONTINUE gates. During policy execution,
+`s` discards timed work and enters powered position HOLD. `q` or Ctrl-C ramps
+arm authority down and exits. `s` is intentionally not a pause key during the
+bounded Warmup2 interpolation; `q` remains the immediate orderly abort.
+
+Construction sends no hand command. Arming first takes arm authority at the
+fresh measured arm pose with zero feed-forward torque, then writes a measured
+combined-hand hold, and only then ramps in gravity compensation. The held hand
+target is refreshed through arming so the DFX lease does not lapse. Warmup2
+moves only to the first target of a fresh policy chunk; that chunk is discarded
+and the policy is reset and re-observed before normal execution.
+
+The final 100 Hz command conditioner and DFX writer independently constrain
+each finger command to at most 0.2 normalized units from the last accepted
+command. This is an unqualified per-write discontinuity bound, not a
+manufacturer speed or acceleration limit. The arm gravity model is the same
+`g1_body29_hand14.urdf` used by Inspire teleop; this provides teleop parity but
+is not an Inspire-specific payload identification.
+
+Inspire hand tracking error is diagnostic only because no qualified normalized
+error cutoff exists. Lost counters, freshness, `[0, 1]` bounds, step limits,
+heartbeat, and DDS write success are hard gates; the existing arm tracking
+limits remain hard gates.
+
+DFX has no explicit hand stop or acknowledgement. On release, the client keeps
+only the last successfully accepted hand hold alive until after arm authority
+reaches zero, then closes the DFX publisher without sending a stop packet. If
+no hand packet ever succeeded, cleanup never acquires a new hand lease. The
+bridge is then expected to let its roughly one-second command lease expire.
+
+`--allow-unqualified-real` is mandatory. It records explicit acceptance of the
+teleop-derived 0.2 bound, lease-only hand shutdown, and teleop-parity
+gravity model; it is not safety certification. The detailed actuation and
+feedback-loss behavior is documented in
+`/home/alex/Development/unitree_lerobot/docs/groot_g1_inspire_dfx_shadow.md`.
