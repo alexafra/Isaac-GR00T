@@ -29,6 +29,17 @@ import gr00t.policy.gr00t_policy as policy_module
 import pytest
 
 
+def _write_two_joint_modality(dataset):
+    (dataset / "meta" / "modality.json").write_text(
+        json.dumps(
+            {
+                "state": {"joints": {"start": 0, "end": 2}},
+                "action": {"joints": {"start": 0, "end": 2}},
+            }
+        )
+    )
+
+
 def test_dataset_layout_json_raises_actionable(tmp_path):
     # A dataset's meta/modality.json (start/end layout), not ModalityConfig fields.
     p = tmp_path / "modality.json"
@@ -65,8 +76,11 @@ def test_load_deployment_dataset_contract(tmp_path):
                 "robot_type": "TestBot",
                 "fps": 30,
                 "features": {
-                    "observation.state": {"names": [["joint_a", "joint_b"]]},
-                    "action": {"names": [["joint_a", "joint_b"]]},
+                    "observation.state": {
+                        "shape": [2],
+                        "names": [["joint_a", "joint_b"]],
+                    },
+                    "action": {"shape": [2], "names": [["joint_a", "joint_b"]]},
                     "observation.images.ego_view": {
                         "dtype": "video",
                         "shape": [480, 640, 3],
@@ -75,6 +89,7 @@ def test_load_deployment_dataset_contract(tmp_path):
             }
         )
     )
+    _write_two_joint_modality(dataset)
 
     contract = _load_deployment_dataset_contract(dataset)
 
@@ -82,10 +97,50 @@ def test_load_deployment_dataset_contract(tmp_path):
     assert contract["fps"] == 30.0
     assert contract["observation_state_names"] == ["joint_a", "joint_b"]
     assert contract["action_names"] == ["joint_a", "joint_b"]
+    assert contract["observation_state_shape"] == [2]
+    assert contract["action_shape"] == [2]
+    assert contract["state_layout"] == {"joints": {"start": 0, "end": 2, "dim": 2}}
+    assert contract["action_layout"] == {"joints": {"start": 0, "end": 2, "dim": 2}}
     assert contract["ego_view_shape"] == [480, 640, 3]
     assert contract["video_shapes"] == {"ego_view": [480, 640, 3]}
     assert "depth_encoding" not in contract
     assert len(contract["sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("state_layout", "message"),
+    [
+        ({"first": {"start": 0, "end": 1}}, "ends at 1, expected 2"),
+        (
+            {
+                "first": {"start": 0, "end": 2},
+                "overlap": {"start": 1, "end": 2},
+            },
+            "exactly partition",
+        ),
+        ({"too_long": {"start": 0, "end": 3}}, "0 <= start < end <= 2"),
+    ],
+)
+def test_deployment_contract_rejects_invalid_state_layout(tmp_path, state_layout, message):
+    dataset = _write_deployment_dataset(tmp_path)
+    modality_path = dataset / "meta" / "modality.json"
+    modality = json.loads(modality_path.read_text())
+    modality["state"] = state_layout
+    modality_path.write_text(json.dumps(modality))
+
+    with pytest.raises(ValueError, match=message):
+        _load_deployment_dataset_contract(dataset)
+
+
+def test_deployment_contract_rejects_name_dimension_mismatch(tmp_path):
+    dataset = _write_deployment_dataset(tmp_path)
+    info_path = dataset / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["action"]["shape"] = [3]
+    info_path.write_text(json.dumps(info))
+
+    with pytest.raises(ValueError, match="one non-empty name per dimension"):
+        _load_deployment_dataset_contract(dataset)
 
 
 def _write_deployment_dataset(tmp_path, *, reverse_video_order=False, depth_encoding=None):
@@ -108,8 +163,11 @@ def _write_deployment_dataset(tmp_path, *, reverse_video_order=False, depth_enco
         "robot_type": "TestBot",
         "fps": 30,
         "features": {
-            "observation.state": {"names": [["joint_a", "joint_b"]]},
-            "action": {"names": [["joint_a", "joint_b"]]},
+            "observation.state": {
+                "shape": [2],
+                "names": [["joint_a", "joint_b"]],
+            },
+            "action": {"shape": [2], "names": [["joint_a", "joint_b"]]},
             **dict(image_features),
         },
         "depth_encoding": depth_encoding
@@ -128,6 +186,7 @@ def _write_deployment_dataset(tmp_path, *, reverse_video_order=False, depth_enco
         "raw_depth_encoding": {"scale_m_per_unit": 0.001},
     }
     (meta / "info.json").write_text(json.dumps(info))
+    _write_two_joint_modality(dataset)
     return dataset
 
 
@@ -223,8 +282,11 @@ def _write_surface_normals_dataset(tmp_path, *, encoding=None, include_metadata=
         "robot_type": "TestBot",
         "fps": 30,
         "features": {
-            "observation.state": {"names": [["joint_a", "joint_b"]]},
-            "action": {"names": [["joint_a", "joint_b"]]},
+            "observation.state": {
+                "shape": [2],
+                "names": [["joint_a", "joint_b"]],
+            },
+            "action": {"shape": [2], "names": [["joint_a", "joint_b"]]},
             "observation.images.ego_view": {
                 "dtype": "video",
                 "shape": [480, 640, 3],
@@ -238,6 +300,7 @@ def _write_surface_normals_dataset(tmp_path, *, encoding=None, include_metadata=
     if include_metadata:
         info["surface_normals_encoding"] = encoding or _surface_normals_encoding()
     (meta / "info.json").write_text(json.dumps(info))
+    _write_two_joint_modality(dataset)
     return dataset
 
 

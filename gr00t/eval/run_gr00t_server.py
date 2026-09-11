@@ -38,6 +38,195 @@ SURFACE_NORMALS_ENCODING = "camera_xyz_uint8"
 SURFACE_NORMALS_ENCODING_VERSION = 1
 
 
+def _load_end_effector_contract(info: dict) -> dict | None:
+    """Validate optional end-effector provenance carried by converted datasets."""
+
+    raw = info.get("end_effector")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("Dataset end_effector must be an object")
+
+    schema_version = raw.get("schema_version")
+    hand_dof = raw.get("hand_dof")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
+        raise ValueError("Dataset end_effector.schema_version must be integer 1")
+    if isinstance(hand_dof, bool) or not isinstance(hand_dof, int) or hand_dof <= 0:
+        raise ValueError("Dataset end_effector.hand_dof must be a positive integer")
+
+    for field in ("type", "protocol", "value_unit", "zero_semantics"):
+        value = raw.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Dataset end_effector.{field} must be a non-empty string")
+    one_semantics = raw.get("one_semantics")
+    if one_semantics is not None and (not isinstance(one_semantics, str) or not one_semantics):
+        raise ValueError("Dataset end_effector.one_semantics must be null or a non-empty string")
+    if raw.get("canonical_order") != "left_then_right":
+        raise ValueError("Dataset end_effector.canonical_order must be 'left_then_right'")
+
+    value_range = raw.get("value_range")
+    if (
+        not isinstance(value_range, list)
+        or len(value_range) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in value_range
+        )
+        or value_range[0] > value_range[1]
+    ):
+        raise ValueError("Dataset end_effector.value_range must contain two ordered finite numbers")
+
+    normalized = dict(raw)
+    normalized["value_range"] = [float(value) for value in value_range]
+    for side in ("left", "right"):
+        field = f"{side}_joint_names"
+        names = raw.get(field)
+        if (
+            not isinstance(names, list)
+            or len(names) != hand_dof
+            or any(not isinstance(name, str) or not name for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise ValueError(
+                f"Dataset end_effector.{field} must contain {hand_dof} unique non-empty names"
+            )
+        normalized[field] = list(names)
+    return normalized
+
+
+def _validate_end_effector_layout(
+    end_effector: dict,
+    layouts: dict[str, dict],
+    feature_names: dict[str, list[str]],
+) -> None:
+    """Bind end-effector provenance to the hand slices and feature names."""
+
+    hand_dof = end_effector["hand_dof"]
+    for section, names in feature_names.items():
+        layout = layouts[section]
+        for side in ("left", "right"):
+            group_name = f"{side}_hand"
+            group = layout.get(group_name)
+            if not isinstance(group, dict) or group.get("dim") != hand_dof:
+                raise ValueError(
+                    f"Dataset modality.json.{section}.{group_name} must have dimension {hand_dof}"
+                )
+            expected_names = end_effector[f"{side}_joint_names"]
+            actual_names = names[group["start"] : group["end"]]
+            if actual_names != expected_names:
+                raise ValueError(
+                    f"Dataset {section} names for {group_name} do not match end_effector provenance"
+                )
+        if layout["left_hand"]["start"] >= layout["right_hand"]["start"]:
+            raise ValueError(
+                f"Dataset modality.json.{section} must place left_hand before right_hand"
+            )
+
+
+def _load_vector_feature(feature: dict, feature_key: str) -> tuple[list[int], list[str]]:
+    """Validate and normalize a one-dimensional state/action feature contract."""
+
+    if not isinstance(feature, dict):
+        raise ValueError(f"Deployment feature {feature_key!r} must be an object")
+    shape = feature.get("shape")
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 1
+        or not isinstance(shape[0], int)
+        or isinstance(shape[0], bool)
+        or shape[0] <= 0
+    ):
+        raise ValueError(
+            f"Deployment feature {feature_key!r} must have a positive one-dimensional shape"
+        )
+
+    names = feature.get("names")
+    if isinstance(names, dict):
+        if set(names) != {"motors"}:
+            raise ValueError(
+                f"Deployment feature {feature_key!r} names object must contain only 'motors'"
+            )
+        names = names["motors"]
+    if isinstance(names, list) and len(names) == 1 and isinstance(names[0], list):
+        names = names[0]
+    if (
+        not isinstance(names, list)
+        or len(names) != shape[0]
+        or any(not isinstance(name, str) or not name for name in names)
+    ):
+        raise ValueError(
+            f"Deployment feature {feature_key!r} must provide one non-empty name per dimension"
+        )
+    return list(shape), list(names)
+
+
+def _load_modality_layout(meta_dir: Path, feature_dims: dict[str, int]) -> dict[str, dict]:
+    """Load state/action slices and prove that each exactly partitions its vector."""
+
+    modality_path = meta_dir / "modality.json"
+    with open(modality_path) as file:
+        modality = json.load(file)
+    if not isinstance(modality, dict):
+        raise ValueError("Dataset modality.json must contain a JSON object")
+
+    normalized: dict[str, dict] = {}
+    for section, feature_dim in feature_dims.items():
+        groups = modality.get(section)
+        if not isinstance(groups, dict) or not groups:
+            raise ValueError(f"Dataset modality.json.{section} must be a non-empty object")
+
+        ordered_groups: list[tuple[int, str, int]] = []
+        for group_name, raw_slice in groups.items():
+            if not isinstance(group_name, str) or not group_name:
+                raise ValueError(f"Dataset modality.json.{section} has an empty group name")
+            if not isinstance(raw_slice, dict):
+                raise ValueError(f"Dataset modality.json.{section}.{group_name} must be an object")
+            start = raw_slice.get("start")
+            end = raw_slice.get("end")
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < 0
+                or end <= start
+                or end > feature_dim
+            ):
+                raise ValueError(
+                    f"Dataset modality.json.{section}.{group_name} must satisfy "
+                    f"0 <= start < end <= {feature_dim}"
+                )
+            ordered_groups.append((start, group_name, end))
+
+        ordered_groups.sort()
+        cursor = 0
+        section_contract: dict[str, dict[str, int]] = {}
+        for start, group_name, end in ordered_groups:
+            if start != cursor:
+                raise ValueError(
+                    f"Dataset modality.json.{section} must exactly partition [0, {feature_dim}); "
+                    f"expected the next slice at {cursor}, got {group_name!r} at {start}"
+                )
+            section_contract[group_name] = {
+                "start": start,
+                "end": end,
+                "dim": end - start,
+            }
+            cursor = end
+        if cursor != feature_dim:
+            raise ValueError(
+                f"Dataset modality.json.{section} ends at {cursor}, expected {feature_dim}"
+            )
+        normalized[section] = section_contract
+    return normalized
+
+
 def _load_video_shapes(features: dict) -> dict[str, list[int]]:
     """Return a stable view-name -> HWC mapping for LeRobot image features."""
 
@@ -257,24 +446,42 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
         with open(info_path) as file:
             info = json.load(file)
         features = info["features"]
-        state_names = features["observation.state"]["names"]
-        action_names = features["action"]["names"]
+        state_shape, state_names = _load_vector_feature(
+            features["observation.state"], "observation.state"
+        )
+        action_shape, action_names = _load_vector_feature(features["action"], "action")
+        modality_layout = _load_modality_layout(
+            info_path.parent,
+            {"state": state_shape[0], "action": action_shape[0]},
+        )
         video_shapes = _load_video_shapes(features)
+        end_effector = _load_end_effector_contract(info)
+        if end_effector is not None:
+            _validate_end_effector_layout(
+                end_effector,
+                modality_layout,
+                {
+                    "state": state_names,
+                    "action": action_names,
+                },
+            )
         depth_encoding = _load_depth_encoding(info, video_shapes)
         surface_normals_encoding = _load_surface_normals_encoding(info, video_shapes)
-        if len(state_names) == 1 and isinstance(state_names[0], list):
-            state_names = state_names[0]
-        if len(action_names) == 1 and isinstance(action_names[0], list):
-            action_names = action_names[0]
         contract = {
             "robot_type": str(info["robot_type"]),
             "fps": float(info["fps"]),
+            "observation_state_shape": state_shape,
+            "action_shape": action_shape,
             "observation_state_names": list(state_names),
             "action_names": list(action_names),
+            "state_layout": modality_layout["state"],
+            "action_layout": modality_layout["action"],
             # Retained for clients deployed before the multi-view contract.
             "ego_view_shape": list(video_shapes["ego_view"]),
             "video_shapes": video_shapes,
         }
+        if end_effector is not None:
+            contract["end_effector"] = end_effector
         if depth_encoding is not None:
             contract["depth_encoding"] = depth_encoding
         if surface_normals_encoding is not None:
