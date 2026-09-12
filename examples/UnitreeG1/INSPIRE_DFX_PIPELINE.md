@@ -69,6 +69,33 @@ The conversion wrapper replaces the directory passed to it. Do not use the
 only raw copy. A split parent contains `train`, `validation`, and `test`; for
 training, the resulting dataset path is its `train` directory.
 
+### Explicit one-off RGB-only conversion
+
+RGB-D remains the conversion default. For a genuinely depth-free trial, use
+`--color-only` in both preflight and conversion:
+
+```bash
+REPO_ID=inspire_stack_three_cups_rgb_30hz
+
+bash /home/alex/Development/scripts/convert_to_lerobot2.sh \
+  --preflight-only \
+  --end-effector inspire-dfx \
+  --color-only \
+  "$RAW_COPY" "$REPO_ID" 6
+
+bash /home/alex/Development/scripts/convert_to_lerobot2.sh \
+  --end-effector inspire-dfx \
+  --color-only \
+  "$RAW_COPY" "$REPO_ID" 6
+```
+
+This output contains `ego_view` only: no depth video, depth encodings, or raw
+depth sidecars. It can be trained only with the RGB configuration
+`g1_inspire_headonly_config.py`. `--color-only` cannot be combined with
+`--include-surface-normals`.
+
+### Standard RGB-D and surface-normal conversion
+
 ```bash
 RAW_COPY=/home/alex/Development/Datasets/raw/inspire_stack_three_cups_split_copy
 REPO_ID=inspire_stack_three_cups_30hz
@@ -85,9 +112,10 @@ bash /home/alex/Development/scripts/convert_to_lerobot2.sh \
   "$RAW_COPY" "$REPO_ID" 6
 ```
 
-Every frame requires `raw_depth_0`; surface normals additionally require
-aligned `depth_0`. The preflight verifies exact DFX provenance and native 26D
-state/action values before replacement.
+Standard RGB-D conversion requires both aligned `depth_0`, which produces the
+model-visible gray-depth view, and `raw_depth_0`, which is preserved losslessly.
+The preflight verifies those files, `color_0`, exact DFX provenance, and native
+26D state/action values before replacement.
 
 ## 4. Generate statistics
 
@@ -116,6 +144,10 @@ Choose one of these modality configurations:
 | RGB + normals, separate views | `g1_inspire_head_3_channel_surface_normals_config.py` |
 | Normals only | `g1_inspire_head_surface_normals_only_config.py` |
 | RGB + normals early fusion | `g1_inspire_head_6_channel_surface_normals_fusion_config.py` |
+
+For a dataset converted with `--color-only`, select the first row only. The
+statistics command above remains unchanged because statistics are calculated
+from float state/action features rather than video features.
 
 Example for six-channel RGB + surface-normal fusion:
 
