@@ -21,12 +21,71 @@ from gr00t.eval.run_gr00t_server import (
     ServerConfig,
     _load_checkpoint_action_output_contract,
     _load_deployment_dataset_contract,
+    _load_deployment_task_contract,
     _load_json_modality_configs,
     _verify_checkpoint_dataset_path,
     main,
 )
 import gr00t.policy.gr00t_policy as policy_module
 import pytest
+
+
+def _write_tasks(dataset, instructions):
+    meta = dataset / "meta"
+    info_path = meta / "info.json"
+    info = json.loads(info_path.read_text()) if info_path.exists() else {}
+    info["total_tasks"] = len(instructions)
+    info_path.write_text(json.dumps(info))
+    (meta / "tasks.jsonl").write_text(
+        "".join(
+            json.dumps({"task_index": index, "task": instruction}) + "\n"
+            for index, instruction in enumerate(instructions)
+        )
+    )
+
+
+def test_load_deployment_task_contract_has_exact_ordered_allowlist_and_hash(tmp_path):
+    dataset = tmp_path / "dataset"
+    (dataset / "meta").mkdir(parents=True)
+    instructions = ["pick up the red cup.", "put down the red cup."]
+    _write_tasks(dataset, instructions)
+
+    contract = _load_deployment_task_contract(dataset)
+
+    assert contract == {
+        "schema_version": 1,
+        "instructions": instructions,
+        "sha256": "1dc8e65b8210cd017ad48081d860208805ad4638785496059eef743fd1d633e7",
+    }
+
+
+@pytest.mark.parametrize(
+    ("records", "total_tasks", "message"),
+    [
+        ([{"task_index": 1, "task": "pick"}], 1, "contiguous from zero"),
+        ([{"task_index": 0, "task": "pick"}], 2, "record count"),
+        (
+            [
+                {"task_index": 0, "task": "same"},
+                {"task_index": 1, "task": "same"},
+            ],
+            2,
+            "duplicate instruction",
+        ),
+        ([{"task_index": 0, "task": "bad\ntext"}], 1, "printable"),
+    ],
+)
+def test_deployment_task_contract_rejects_ambiguous_or_malformed_tasks(
+    tmp_path, records, total_tasks, message
+):
+    dataset = tmp_path / "dataset"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(json.dumps({"total_tasks": total_tasks}))
+    (meta / "tasks.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    with pytest.raises(ValueError, match=message):
+        _load_deployment_task_contract(dataset)
 
 
 def _write_two_joint_modality(dataset):
@@ -485,6 +544,66 @@ def test_hugging_face_model_id_does_not_require_local_deployment_metadata(monkey
         "physical_action_tail": True,
         "backend": "pytorch",
     }
+
+
+def test_checkpoint_bound_task_contract_is_advertised_in_policy_metadata(tmp_path, monkeypatch):
+    captured = {}
+    model = tmp_path / "checkpoint"
+    dataset = tmp_path / "dataset"
+    model.mkdir()
+    dataset.mkdir()
+    expected_task_contract = {
+        "schema_version": 1,
+        "instructions": ["pick up the red cup.", "put down the red cup."],
+        "sha256": "1dc8e65b8210cd017ad48081d860208805ad4638785496059eef743fd1d633e7",
+    }
+
+    class DummyPolicy:
+        @staticmethod
+        def get_vision_input_contract():
+            return {"version": 1}
+
+    class DummyServer:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(server_module, "Gr00tPolicy", lambda **_kwargs: DummyPolicy())
+    monkeypatch.setattr(server_module, "PolicyServer", DummyServer)
+    monkeypatch.setattr(server_module, "_verify_checkpoint_dataset_path", lambda *_args: None)
+    monkeypatch.setattr(
+        server_module,
+        "_load_checkpoint_action_output_contract",
+        lambda *_args: {"semantics": "absolute_joint_position"},
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_load_deployment_dataset_contract",
+        lambda *_args: {"robot_type": "test"},
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_load_deployment_task_contract",
+        lambda *_args: expected_task_contract,
+    )
+
+    main(
+        ServerConfig(
+            model_path=str(model),
+            deployment_dataset_path=str(dataset),
+            device="cpu",
+        )
+    )
+
+    assert captured["policy_metadata"]["task_contract"] == expected_task_contract
 
 
 def test_sim_policy_wrapper_does_not_advertise_physical_tail_rtc(monkeypatch):

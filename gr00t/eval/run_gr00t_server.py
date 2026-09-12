@@ -36,6 +36,98 @@ IMAGE_FEATURE_PREFIX = "observation.images."
 SURFACE_NORMALS_VIEW = "surface_normals_view"
 SURFACE_NORMALS_ENCODING = "camera_xyz_uint8"
 SURFACE_NORMALS_ENCODING_VERSION = 1
+TASK_CONTRACT_SCHEMA_VERSION = 1
+
+
+def _task_contract_sha256(instructions: list[str]) -> str:
+    """Hash the versioned, ordered instruction allowlist sent to clients."""
+
+    canonical = json.dumps(
+        {
+            "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+            "instructions": instructions,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _load_deployment_task_contract(dataset_path: Path) -> dict:
+    """Load an exact, ordered task allowlist from a checkpoint-bound dataset."""
+
+    tasks_path = dataset_path / "meta" / "tasks.jsonl"
+    info_path = dataset_path / "meta" / "info.json"
+    try:
+        with open(info_path) as file:
+            info = json.load(file)
+        expected_count = info["total_tasks"]
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count <= 0
+        ):
+            raise ValueError("Dataset info.json total_tasks must be a positive integer")
+
+        records: list[dict] = []
+        with open(tasks_path) as file:
+            for line_number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Dataset tasks.jsonl line {line_number} is not valid JSON: {exc.msg}"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"Dataset tasks.jsonl line {line_number} must contain an object"
+                    )
+                records.append(record)
+
+        if len(records) != expected_count:
+            raise ValueError(
+                "Dataset tasks.jsonl record count does not match info.json total_tasks: "
+                f"got {len(records)}, expected {expected_count}"
+            )
+
+        instructions: list[str] = []
+        for expected_index, record in enumerate(records):
+            task_index = record.get("task_index")
+            if (
+                isinstance(task_index, bool)
+                or not isinstance(task_index, int)
+                or task_index != expected_index
+            ):
+                raise ValueError(
+                    "Dataset tasks.jsonl task_index values must be contiguous from zero; "
+                    f"record {expected_index} has {task_index!r}"
+                )
+            instruction = record.get("task")
+            if (
+                not isinstance(instruction, str)
+                or not instruction
+                or len(instruction) > 256
+                or any(ord(character) < 32 for character in instruction)
+            ):
+                raise ValueError(
+                    f"Dataset tasks.jsonl task {expected_index} must be 1..256 printable characters"
+                )
+            instructions.append(instruction)
+        if len(set(instructions)) != len(instructions):
+            raise ValueError("Dataset tasks.jsonl contains duplicate instruction text")
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot build a deployment task contract from {tasks_path}: {exc}"
+        ) from exc
+
+    return {
+        "schema_version": TASK_CONTRACT_SCHEMA_VERSION,
+        "instructions": instructions,
+        "sha256": _task_contract_sha256(instructions),
+    }
 
 
 def _load_end_effector_contract(info: dict) -> dict | None:
@@ -723,6 +815,7 @@ def main(config: ServerConfig):
         policy_metadata["dataset_contract"] = _load_deployment_dataset_contract(
             deployment_dataset_path
         )
+        policy_metadata["task_contract"] = _load_deployment_task_contract(deployment_dataset_path)
 
     with PolicyServer(
         policy=policy,
