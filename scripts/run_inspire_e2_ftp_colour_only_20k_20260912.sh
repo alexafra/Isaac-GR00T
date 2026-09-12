@@ -7,6 +7,9 @@ OUTPUT_DIR="/home/alex/Development/Models/inspire_e2_ftp_colour_only_rgb_redcup_
 LOG_DIR="/home/alex/Development/logs/groot/training"
 LOG_FILE="${LOG_DIR}/inspire_e2_ftp_colour_only_rgb_20k_20260912T150904Z.log"
 LOCK_FILE="/tmp/groot-inspire-e2-ftp-colour-only-20k-20260912.lock"
+GLOBAL_BATCH_SIZE="${GROOT_GLOBAL_BATCH_SIZE:-32}"
+GRADIENT_ACCUMULATION_STEPS="${GROOT_GRADIENT_ACCUMULATION_STEPS:-1}"
+DATALOADER_NUM_WORKERS="${GROOT_DATALOADER_NUM_WORKERS:-4}"
 
 mode="${1:-fresh}"
 if [[ "${mode}" != "fresh" && "${mode}" != "resume" ]]; then
@@ -88,6 +91,9 @@ cd "${REPO_ROOT}"
     echo "output=${OUTPUT_DIR}"
     echo "visual_input=RGB colour only"
     echo "end_effector=Inspire RH56E2 / Unitree inspire_ftp"
+    echo "global_batch_size=${GLOBAL_BATCH_SIZE}"
+    echo "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
+    echo "dataloader_num_workers=${DATALOADER_NUM_WORKERS}"
     date --iso-8601=seconds
 
     .venv/bin/python -m gr00t.experiment.launch_finetune \
@@ -102,9 +108,9 @@ cd "${REPO_ROOT}"
         --load-bf16 \
         --num-gpus 1 \
         --output-dir "${OUTPUT_DIR}" \
-        --global-batch-size 32 \
-        --gradient-accumulation-steps 1 \
-        --dataloader-num-workers 4 \
+        --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+        --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
+        --dataloader-num-workers "${DATALOADER_NUM_WORKERS}" \
         --episode-sampling-rate 0.1 \
         --optim adafactor \
         --learning-rate 1e-4 \
