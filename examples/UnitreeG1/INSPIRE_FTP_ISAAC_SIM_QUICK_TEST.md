@@ -13,8 +13,9 @@ Do not run the simulator client while this workstation can reach a physical
 Unitree robot. DDS domain 1 is not a physical safety boundary. Disconnect the
 robot Ethernet/network, and stop any real teleop or robot command publisher.
 
-Check that training produced a complete 20,000-step checkpoint and that its
-dataset is FTP-labelled, 26D, and RGB-only:
+Check that training produced the selected checkpoint and that its dataset is
+FTP-labelled, 26D, and RGB-only. The wrapper defaults to checkpoint 15,000
+because it had the lower held-out validation MSE:
 
 ```bash
 cd /home/alex/Development/Isaac-GR00T
@@ -23,7 +24,15 @@ bash scripts/run_inspire_e2_ftp_colour_only_isaac_smoke.sh check
 
 It must print `READY` before continuing.
 
+To compare checkpoint 20,000 instead, prefix both the `check` and `server`
+commands with `CHECKPOINT_STEP=20000`. The simulator and client commands do not
+load checkpoint weights themselves.
+
 ## Terminal 1: simulator and embedded TeleImager
+
+The wrapper runs Isaac on `cuda:0`. Do not substitute `--device cpu`: camera
+rendering and simulation on CPU can starve the 100 Hz simulated state stream and
+trigger the client's fail-closed freshness checks.
 
 ```bash
 cd /home/alex/Development/Isaac-GR00T

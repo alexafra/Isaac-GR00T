@@ -6,7 +6,12 @@ SIM_ROOT="/home/alex/Development/unitree_sim_isaaclab"
 CLIENT_ROOT="/home/alex/Development/unitree_lerobot"
 DATASET_ROOT="/home/alex/Development/Datasets/lerobot2/inspire_e2_ftp_colour_only_test_20260912/train"
 MODEL_ROOT="/home/alex/Development/Models/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z"
-CHECKPOINT="${MODEL_ROOT}/checkpoint-20000"
+CHECKPOINT_STEP="${CHECKPOINT_STEP:-15000}"
+if [[ "${CHECKPOINT_STEP}" != "15000" && "${CHECKPOINT_STEP}" != "20000" ]]; then
+    echo "NOT READY: CHECKPOINT_STEP must be 15000 or 20000." >&2
+    exit 2
+fi
+CHECKPOINT="${MODEL_ROOT}/checkpoint-${CHECKPOINT_STEP}"
 
 usage() {
     cat <<'EOF'
@@ -19,6 +24,8 @@ Usage:
 
 Run sim, server, and client in three separate terminals. Before either client
 mode, disconnect/isolate every physical Unitree robot network from this host.
+Checkpoint 15000 is the default because it had the lower validation MSE. Set
+CHECKPOINT_STEP=20000 for an explicit comparison run.
 EOF
 }
 
@@ -50,13 +57,14 @@ check_ready() {
     require_file "${CHECKPOINT}/scheduler.pt"
     require_file "${CHECKPOINT}/rng_state.pth"
 
-    "${GROOT_ROOT}/.venv/bin/python" - "${DATASET_ROOT}" "${CHECKPOINT}" <<'PY'
+    "${GROOT_ROOT}/.venv/bin/python" - "${DATASET_ROOT}" "${CHECKPOINT}" "${CHECKPOINT_STEP}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 dataset = Path(sys.argv[1])
 checkpoint = Path(sys.argv[2])
+expected_step = int(sys.argv[3])
 info = json.loads((dataset / "meta/info.json").read_text())
 modality = json.loads((dataset / "meta/modality.json").read_text())
 tasks = {
@@ -67,7 +75,7 @@ tasks = {
 trainer_state = json.loads((checkpoint / "trainer_state.json").read_text())
 index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
 
-assert trainer_state["global_step"] == 20_000
+assert trainer_state["global_step"] == expected_step
 assert info["robot_type"] == "Unitree_G1_Inspire_HeadOnly"
 assert info["features"]["observation.state"]["shape"] == [26]
 assert info["features"]["action"]["shape"] == [26]
@@ -87,7 +95,10 @@ for shard in set(index["weight_map"].values()):
     path = checkpoint / shard
     assert path.is_file() and path.stat().st_size > 0, path
 
-print("READY: FTP-labelled 26D RGB-only dataset and checkpoint-20000 are complete.")
+print(
+    "READY: FTP-labelled 26D RGB-only dataset and "
+    f"checkpoint-{expected_step} are complete."
+)
 PY
 }
 
@@ -102,7 +113,7 @@ case "${mode}" in
         source /home/alex/miniconda3/etc/profile.d/conda.sh
         conda activate unitree_sim_env
         exec python sim_main.py \
-            --device cpu \
+            --device cuda:0 \
             --enable_cameras \
             --task Isaac-PickPlace-Cylinder-G129-Inspire-Joint \
             --enable_inspire_dds \
