@@ -306,9 +306,7 @@ def find_evaluation_targets(
         EvaluationTarget(step=checkpoint_step(path), model_path=path) for path in checkpoints
     ]
 
-    include_run_root = run_root_step is not None and (
-        selected is None or run_root_step in selected
-    )
+    include_run_root = run_root_step is not None and (selected is None or run_root_step in selected)
     if include_run_root:
         if any(target.step == run_root_step for target in targets):
             raise ValueError(
@@ -317,9 +315,9 @@ def find_evaluation_targets(
             )
         required_root_files = [run_dir / "config.json", run_dir / "processor"]
         missing_root_files = [path for path in required_root_files if not path.exists()]
-        has_root_weights = any(run_dir.glob("model*.safetensors")) or (
-            run_dir / "pytorch_model.bin"
-        ).is_file()
+        has_root_weights = (
+            any(run_dir.glob("model*.safetensors")) or (run_dir / "pytorch_model.bin").is_file()
+        )
         if missing_root_files or not has_root_weights:
             missing = [str(path) for path in missing_root_files]
             if not has_root_weights:
@@ -1322,7 +1320,7 @@ def raw_predictions_csv_path(checkpoint_dir: Path, split: str) -> Path:
 
 
 def latest_checkpoint_steps(checkpoint_steps: list[int], plot_count: int = 2) -> list[int]:
-    """Return the numerically latest checkpoint steps to receive plots."""
+    """Return the numerically latest checkpoint steps to receive trajectory plots."""
 
     if plot_count < 0:
         raise ValueError(f"Plot count must be non-negative, got {plot_count}")
@@ -1455,9 +1453,8 @@ def write_extended_evaluation_metrics(
     missing_summary_columns = required_summary_columns - set(summary.columns)
     if missing_summary_columns:
         raise ValueError(
-            "Checkpoint summary is missing columns: "
-            + ", ".join(sorted(missing_summary_columns))
-    )
+            "Checkpoint summary is missing columns: " + ", ".join(sorted(missing_summary_columns))
+        )
     goal_frames = []
     horizon_frames = []
     task_cache: dict[tuple[str, int], dict[int, list[str]]] = {}
@@ -1475,7 +1472,9 @@ def write_extended_evaluation_metrics(
             continue
         raw_predictions = pd.read_csv(raw_path, compression="gzip")
         _validate_error_rows(raw_predictions)
-        raw_steps = set(pd.to_numeric(raw_predictions["checkpoint_step"], errors="raise").astype(int))
+        raw_steps = set(
+            pd.to_numeric(raw_predictions["checkpoint_step"], errors="raise").astype(int)
+        )
         if raw_steps != {step}:
             raise ValueError(
                 f"{raw_path} contains checkpoint steps {sorted(raw_steps)}, expected only {step}"
@@ -1485,7 +1484,10 @@ def write_extended_evaluation_metrics(
         if dataset_path is None:
             episode_tasks: dict[int, list[str]] = {}
         else:
-            dataset_key = (str(dataset_path.resolve()), int(raw_predictions["trajectory"].max()) + 1)
+            dataset_key = (
+                str(dataset_path.resolve()),
+                int(raw_predictions["trajectory"].max()) + 1,
+            )
             episode_tasks = task_cache.get(dataset_key, {})
             if dataset_key not in task_cache:
                 episode_tasks = _load_episode_tasks(dataset_path, dataset_key[1])
@@ -1507,9 +1509,7 @@ def write_extended_evaluation_metrics(
         )
 
     goals = (
-        pd.concat(goal_frames, ignore_index=True).sort_values(
-            ["split", "checkpoint_step", "goal"]
-        )
+        pd.concat(goal_frames, ignore_index=True).sort_values(["split", "checkpoint_step", "goal"])
         if goal_frames
         else pd.DataFrame(columns=GOAL_METRICS_COLUMNS)
     )
@@ -1535,9 +1535,7 @@ def plot_horizon_position_metrics(
     checkpoint_steps: list[int],
     path: Path,
 ) -> None:
-    selected = horizon_metrics[
-        horizon_metrics["checkpoint_step"].isin(checkpoint_steps)
-    ].copy()
+    selected = horizon_metrics[horizon_metrics["checkpoint_step"].isin(checkpoint_steps)].copy()
     if selected.empty:
         logging.warning(
             "Skipping execution-horizon error plot because no selected metrics are available"
@@ -2394,7 +2392,6 @@ def plot_right_evaluation_summaries(
     joints: pd.DataFrame,
     *,
     save_metrics: bool,
-    plot_checkpoint_steps: set[int] | None = None,
 ) -> int | None:
     right_summary = right_summary_from_raw_predictions(output_dir, summary)
     scoped_joints = right_joint_rows(joints)
@@ -2421,16 +2418,6 @@ def plot_right_evaluation_summaries(
         if not validation_right_summary.empty
         else None
     )
-    if plot_checkpoint_steps is not None:
-        right_summary = right_summary[
-            right_summary["checkpoint_step"].isin(plot_checkpoint_steps)
-        ]
-        scoped_joints = scoped_joints[
-            scoped_joints["checkpoint_step"].isin(plot_checkpoint_steps)
-        ]
-    if right_summary.empty or scoped_joints.empty:
-        logging.warning("Skipping right-arm/hand plots because no selected checkpoints remain")
-        return best_step
     plot_evaluation_summaries(
         right_output_dir,
         right_summary,
@@ -2706,38 +2693,33 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
         if missing_steps:
             raise ValueError(f"Saved metrics do not contain checkpoints: {sorted(missing_steps)}")
     checkpoint_steps = sorted(int(step) for step in summary["checkpoint_step"].unique())
-    plot_checkpoint_steps = latest_checkpoint_steps(checkpoint_steps)
-    plot_step_set = set(plot_checkpoint_steps)
-    plot_summary = summary[summary["checkpoint_step"].isin(plot_step_set)]
-    plot_joints = joints[joints["checkpoint_step"].isin(plot_step_set)]
+    trajectory_plot_checkpoint_steps = latest_checkpoint_steps(checkpoint_steps)
     validation_summary = summary[summary["split"] == "validation"]
-    best_step = int(
-        validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
-    )
-    validation_joints = plot_joints[plot_joints["split"] == "validation"]
+    best_step = int(validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"])
+    validation_joints = joints[joints["split"] == "validation"]
     labels = validation_joints["joint"].drop_duplicates().astype(str).tolist()
-    plot_evaluation_summaries(output_dir, plot_summary, plot_joints, labels)
+    plot_evaluation_summaries(output_dir, summary, joints, labels)
     right_best_step = plot_right_evaluation_summaries(
         output_dir,
         summary,
         joints,
         save_metrics=not bool(args.checkpoint_steps),
-        plot_checkpoint_steps=plot_step_set,
     )
     plot_horizon_position_metrics(
         horizon_metrics,
-        plot_checkpoint_steps,
+        checkpoint_steps,
         output_dir / "error_by_horizon_position.png",
     )
     regenerate_trajectory_plots(
         args=args,
         output_dir=output_dir,
-        checkpoint_steps=plot_checkpoint_steps,
+        checkpoint_steps=trajectory_plot_checkpoint_steps,
         state_cache=state_cache,
     )
 
     print(f"Regenerated plots from saved CSVs in {output_dir}")
-    print(f"Plots limited to latest checkpoint(s): {plot_checkpoint_steps}")
+    print(f"Aggregate plots include all checkpoint(s): {checkpoint_steps}")
+    print(f"Trajectory plots limited to latest checkpoint(s): {trajectory_plot_checkpoint_steps}")
     print(f"Lowest validation MAE: checkpoint {best_step}")
     if right_best_step is not None:
         print(f"Lowest right-side validation MAE: checkpoint {right_best_step}")
@@ -2767,13 +2749,14 @@ def main() -> None:
     canonical_labels = None
     evaluation_started_at = time.perf_counter()
     target_count = len(targets)
-    plot_checkpoint_steps = latest_checkpoint_steps([target.step for target in targets])
-    plot_step_set = set(plot_checkpoint_steps)
+    checkpoint_steps = sorted({target.step for target in targets})
+    trajectory_plot_checkpoint_steps = latest_checkpoint_steps(checkpoint_steps)
+    trajectory_plot_step_set = set(trajectory_plot_checkpoint_steps)
     logging.info(
-        "Evaluation plan: %d model target(s), checkpoint steps=%s, plots=%s, output=%s",
+        "Evaluation plan: %d model target(s), checkpoint steps=%s, trajectory plots=%s, output=%s",
         target_count,
-        [target.step for target in targets],
-        plot_checkpoint_steps,
+        checkpoint_steps,
+        trajectory_plot_checkpoint_steps,
         output_dir,
     )
 
@@ -2837,7 +2820,7 @@ def main() -> None:
                 for episode_id, tasks in episode_tasks.items()
             }
             if (
-                step not in plot_step_set
+                step not in trajectory_plot_step_set
                 or args.skip_trajectory_plots
                 or args.trajectory_plot_episodes == 0
             ):
@@ -2951,16 +2934,12 @@ def main() -> None:
 
     checkpoint_summary_csv = output_dir / "checkpoint_metric_summary.csv"
     summary.to_csv(checkpoint_summary_csv, index=False)
-    plot_summary = summary[summary["checkpoint_step"].isin(plot_step_set)]
-    plot_joints = joints[joints["checkpoint_step"].isin(plot_step_set)]
     validation_summary = summary[summary["split"] == "validation"]
-    best_step = int(
-        validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"]
-    )
+    best_step = int(validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"])
     plot_evaluation_summaries(
         output_dir,
-        plot_summary,
-        plot_joints,
+        summary,
+        joints,
         canonical_labels or [],
     )
     right_best_step = plot_right_evaluation_summaries(
@@ -2968,11 +2947,10 @@ def main() -> None:
         summary,
         joints,
         save_metrics=True,
-        plot_checkpoint_steps=plot_step_set,
     )
     plot_horizon_position_metrics(
         horizon_metrics,
-        plot_checkpoint_steps,
+        checkpoint_steps,
         output_dir / "error_by_horizon_position.png",
     )
 
@@ -2980,7 +2958,8 @@ def main() -> None:
     print(f"\nLowest validation MAE: checkpoint {best_step}")
     if right_best_step is not None:
         print(f"Lowest right-side validation MAE: checkpoint {right_best_step}")
-    print(f"Plots limited to latest checkpoint(s): {plot_checkpoint_steps}")
+    print(f"Aggregate plots include all checkpoint(s): {checkpoint_steps}")
+    print(f"Trajectory plots limited to latest checkpoint(s): {trajectory_plot_checkpoint_steps}")
     print(f"Checkpoint summary CSV: {checkpoint_summary_csv}")
     print(f"Goal metrics CSV: {output_dir / GOAL_METRICS_FILENAME}")
     print(f"Horizon-position metrics CSV: {output_dir / HORIZON_POSITION_METRICS_FILENAME}")

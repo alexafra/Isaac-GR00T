@@ -1187,7 +1187,9 @@ def test_horizon_position_plot_excludes_older_checkpoints(tmp_path, monkeypatch)
     assert line_labels == {"checkpoint 20", "checkpoint 30"}
 
 
-def test_plots_only_scopes_every_checkpoint_plot_to_latest_two(tmp_path, monkeypatch):
+def test_plots_only_uses_all_checkpoints_for_summaries_and_latest_two_for_trajectories(
+    tmp_path, monkeypatch
+):
     output_dir = tmp_path / "evaluation"
     output_dir.mkdir()
     summary = pd.DataFrame(
@@ -1225,8 +1227,8 @@ def test_plots_only_scopes_every_checkpoint_plot_to_latest_two(tmp_path, monkeyp
     monkeypatch.setattr(
         evaluate_checkpoints,
         "plot_right_evaluation_summaries",
-        lambda *_args, **kwargs: plot_calls.update(
-            right=sorted(kwargs["plot_checkpoint_steps"])
+        lambda _output, scoped_summary, _joints, **_kwargs: plot_calls.update(
+            right=sorted(scoped_summary["checkpoint_step"].unique())
         ),
     )
     monkeypatch.setattr(
@@ -1250,8 +1252,8 @@ def test_plots_only_scopes_every_checkpoint_plot_to_latest_two(tmp_path, monkeyp
     regenerate_plots(args, output_dir)
 
     assert plot_calls == {
-        "aggregate": [20, 30],
-        "right": [20, 30],
-        "horizon": [20, 30],
+        "aggregate": [10, 20, 30],
+        "right": [10, 20, 30],
+        "horizon": [10, 20, 30],
         "trajectories": [20, 30],
     }
