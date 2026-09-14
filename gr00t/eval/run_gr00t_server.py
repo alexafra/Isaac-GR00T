@@ -37,6 +37,7 @@ SURFACE_NORMALS_VIEW = "surface_normals_view"
 SURFACE_NORMALS_ENCODING = "camera_xyz_uint8"
 SURFACE_NORMALS_ENCODING_VERSION = 1
 TASK_CONTRACT_SCHEMA_VERSION = 1
+REALSENSE_RGBD_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
 
 
 def _task_contract_sha256(instructions: list[str]) -> str:
@@ -517,7 +518,7 @@ def _load_surface_normals_encoding(info: dict, video_shapes: dict[str, list[int]
     if raw_encoding.get("valid_component_range") != [1, 255]:
         raise ValueError("Dataset surface_normals_encoding.valid_component_range must be [1, 255]")
 
-    return {
+    normalized_encoding = {
         **expected_strings,
         "encoding_version": encoding_version,
         "default_scale_m_per_unit": float(default_scale),
@@ -528,6 +529,64 @@ def _load_surface_normals_encoding(info: dict, video_shapes: dict[str, list[int]
         "invalid_value": [0, 0, 0],
         "valid_component_range": [1, 255],
     }
+    camera_calibration = raw_encoding.get("camera_calibration")
+    if camera_calibration is not None:
+        if not isinstance(camera_calibration, dict) or set(camera_calibration) != {
+            "source",
+            "schema",
+            "camera",
+            "fingerprint",
+        }:
+            raise ValueError(
+                "Dataset surface_normals_encoding.camera_calibration must contain exactly "
+                "source, schema, camera, and fingerprint"
+            )
+        source = camera_calibration["source"]
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError(
+                "Dataset surface_normals_encoding.camera_calibration.source must be a "
+                "non-empty string"
+            )
+        if camera_calibration["schema"] != REALSENSE_RGBD_CALIBRATION_SCHEMA:
+            raise ValueError(
+                "Dataset surface_normals_encoding.camera_calibration.schema must be "
+                f"{REALSENSE_RGBD_CALIBRATION_SCHEMA!r}"
+            )
+        camera = camera_calibration["camera"]
+        camera_fields = ("model", "serial", "product_id", "firmware")
+        if not isinstance(camera, dict) or set(camera) != set(camera_fields):
+            raise ValueError(
+                "Dataset surface_normals_encoding.camera_calibration.camera must contain "
+                "exactly model, serial, product_id, and firmware"
+            )
+        normalized_camera = {}
+        for field in camera_fields:
+            value = camera[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "Dataset surface_normals_encoding.camera_calibration.camera."
+                    f"{field} must be a non-empty string"
+                )
+            normalized_camera[field] = value
+        fingerprint = camera_calibration["fingerprint"]
+        digest = fingerprint.removeprefix("sha256:") if isinstance(fingerprint, str) else ""
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint.startswith("sha256:")
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                "Dataset surface_normals_encoding.camera_calibration.fingerprint must be "
+                "sha256:<64 lowercase hex digits>"
+            )
+        normalized_encoding["camera_calibration"] = {
+            "source": source,
+            "schema": REALSENSE_RGBD_CALIBRATION_SCHEMA,
+            "camera": normalized_camera,
+            "fingerprint": fingerprint,
+        }
+    return normalized_encoding
 
 
 def _load_deployment_dataset_contract(dataset_path: Path) -> dict:

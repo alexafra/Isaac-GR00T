@@ -333,6 +333,20 @@ def _surface_normals_encoding():
     }
 
 
+def _camera_calibration_identity():
+    return {
+        "source": "converter.profile.d435i-254322071415",
+        "schema": "realsense_rgbd_calibration.v1",
+        "camera": {
+            "model": "Intel RealSense D435I",
+            "serial": "254322071415",
+            "product_id": "0B3A",
+            "firmware": "5.15.1.55",
+        },
+        "fingerprint": f"sha256:{'a' * 64}",
+    }
+
+
 def _write_surface_normals_dataset(tmp_path, *, encoding=None, include_metadata=True):
     dataset = tmp_path / "dataset"
     meta = dataset / "meta"
@@ -371,6 +385,38 @@ def test_load_deployment_dataset_contract_includes_surface_normals(tmp_path):
     assert contract["video_shapes"]["surface_normals_view"] == [480, 640, 3]
     assert contract["surface_normals_encoding"] == _surface_normals_encoding()
     assert len(contract["sha256"]) == 64
+
+
+def test_surface_normals_contract_preserves_camera_calibration_identity(tmp_path):
+    encoding = _surface_normals_encoding()
+    encoding["camera_calibration"] = _camera_calibration_identity()
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
+
+    contract = _load_deployment_dataset_contract(dataset)
+
+    assert contract["surface_normals_encoding"]["camera_calibration"] == (
+        _camera_calibration_identity()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(source=""), "source"),
+        (lambda value: value.update(schema="wrong"), "schema"),
+        (lambda value: value["camera"].pop("firmware"), "camera"),
+        (lambda value: value.update(fingerprint="sha256:ABC"), "fingerprint"),
+    ],
+)
+def test_surface_normals_contract_rejects_bad_camera_calibration(tmp_path, mutate, message):
+    encoding = _surface_normals_encoding()
+    calibration = _camera_calibration_identity()
+    mutate(calibration)
+    encoding["camera_calibration"] = calibration
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
+
+    with pytest.raises(ValueError, match=message):
+        _load_deployment_dataset_contract(dataset)
 
 
 def test_surface_normals_view_requires_versioned_encoding_metadata(tmp_path):
