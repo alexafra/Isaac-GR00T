@@ -84,6 +84,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_llm=self.config.model.tune_llm,
                 tune_visual=self.config.model.tune_visual,
                 tune_vision_patch_embed=self.config.model.tune_vision_patch_embed,  # earlyfusion
+                tune_vision_fusion_adapters=self.config.model.tune_vision_fusion_adapters,
                 tune_projector=self.config.model.tune_projector,
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
@@ -137,6 +138,99 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 model.collator.vision_channel_layout = target_layout  # earlyfusion
             elif source_channels > 3 and (source_layout != target_layout or source_init != target_init):  # fmt: skip  # earlyfusion
                 raise RuntimeError(f"Checkpoint vision contract {(source_layout, source_init)} does not match requested {(target_layout, target_init)}")  # fmt: skip  # earlyfusion
+
+            source_fusion = (
+                model.config.vision_fusion_mode,
+                model.config.vision_fusion_version,
+                model.config.vision_fusion_stage,
+                model.config.vision_fusion_adapter_type,
+                model.config.vision_fusion_adapter_bias,
+                model.config.vision_fusion_adapter_bias_init,
+                model.config.vision_fusion_adapter_count,
+                list(model.config.vision_fusion_deepstack_layers),
+                model.config.vision_fusion_adapter_input_dim,
+                model.config.vision_fusion_adapter_output_dim,
+                list(model.config.vision_fusion_source_keys),
+                model.config.vision_fusion_adapter_init,
+                model.config.vision_fusion_rgb_init_scale,
+                model.config.vision_fusion_geometry_init_scale,
+            )
+            target_fusion = (
+                self.model_config.vision_fusion_mode,
+                self.model_config.vision_fusion_version,
+                self.model_config.vision_fusion_stage,
+                self.model_config.vision_fusion_adapter_type,
+                self.model_config.vision_fusion_adapter_bias,
+                self.model_config.vision_fusion_adapter_bias_init,
+                self.model_config.vision_fusion_adapter_count,
+                list(self.model_config.vision_fusion_deepstack_layers),
+                self.model_config.vision_fusion_adapter_input_dim,
+                self.model_config.vision_fusion_adapter_output_dim,
+                list(self.model_config.vision_fusion_source_keys),
+                self.model_config.vision_fusion_adapter_init,
+                self.model_config.vision_fusion_rgb_init_scale,
+                self.model_config.vision_fusion_geometry_init_scale,
+            )
+            if source_fusion != target_fusion:
+                if source_fusion[0] == "none" and target_fusion[0] == "post_vision_late_fusion":
+                    model.backbone.enable_post_vision_late_fusion(
+                        mode=target_fusion[0],
+                        version=target_fusion[1],
+                        stage=target_fusion[2],
+                        adapter_type=target_fusion[3],
+                        adapter_bias=target_fusion[4],
+                        adapter_bias_init=target_fusion[5],
+                        adapter_count=target_fusion[6],
+                        deepstack_layers=target_fusion[7],
+                        adapter_input_dim=target_fusion[8],
+                        adapter_output_dim=target_fusion[9],
+                        source_keys=target_fusion[10],
+                        adapter_init=target_fusion[11],
+                        rgb_init_scale=target_fusion[12],
+                        geometry_init_scale=target_fusion[13],
+                        tune_adapters=self.model_config.tune_vision_fusion_adapters,
+                    )
+                    model.config.vision_fusion_mode = target_fusion[0]
+                    model.config.vision_fusion_version = target_fusion[1]
+                    model.config.vision_fusion_stage = target_fusion[2]
+                    model.config.vision_fusion_adapter_type = target_fusion[3]
+                    model.config.vision_fusion_adapter_bias = target_fusion[4]
+                    model.config.vision_fusion_adapter_bias_init = target_fusion[5]
+                    model.config.vision_fusion_adapter_count = target_fusion[6]
+                    model.config.vision_fusion_deepstack_layers = target_fusion[7]
+                    model.config.vision_fusion_adapter_input_dim = target_fusion[8]
+                    model.config.vision_fusion_adapter_output_dim = target_fusion[9]
+                    model.config.vision_fusion_source_keys = target_fusion[10]
+                    model.config.vision_fusion_adapter_init = target_fusion[11]
+                    model.config.vision_fusion_rgb_init_scale = target_fusion[12]
+                    model.config.vision_fusion_geometry_init_scale = target_fusion[13]
+                    model.config.tune_vision_fusion_adapters = (
+                        self.model_config.tune_vision_fusion_adapters
+                    )
+                    model.collator.post_vision_fusion = True
+                else:
+                    raise RuntimeError(
+                        "Checkpoint vision-fusion contract does not match the requested "
+                        f"configuration: checkpoint={source_fusion!r}, requested={target_fusion!r}"
+                    )
+            elif source_fusion[0] == "post_vision_late_fusion":
+                model.backbone.validate_post_vision_fusion_contract(
+                    mode=source_fusion[0],
+                    version=source_fusion[1],
+                    stage=source_fusion[2],
+                    adapter_type=source_fusion[3],
+                    adapter_bias=source_fusion[4],
+                    adapter_bias_init=source_fusion[5],
+                    adapter_count=source_fusion[6],
+                    deepstack_layers=source_fusion[7],
+                    adapter_input_dim=source_fusion[8],
+                    adapter_output_dim=source_fusion[9],
+                    source_keys=source_fusion[10],
+                    adapter_init=source_fusion[11],
+                    rgb_init_scale=source_fusion[12],
+                    geometry_init_scale=source_fusion[13],
+                    vision_input_channels=source_channels,
+                )
 
         else:
             model = self.model_class(

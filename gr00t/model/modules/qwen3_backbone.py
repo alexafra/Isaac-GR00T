@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import logging
+import math
 
 from huggingface_hub.errors import GatedRepoError
 import torch
+import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 
 
@@ -42,6 +44,13 @@ _GATED_BACKBONE_HINT = (
 
 
 _GATED_MARKERS = ("gated repo", "is restricted", "access to model", "401 client error")
+
+_PRE_VISION_LANGUAGE_ADAPTER = "pre_vision_language_adapter"
+_POST_VISION_LANGUAGE_ADAPTER = "post_vision_language_adapter"
+_VISION_FUSION_STAGES = {
+    _PRE_VISION_LANGUAGE_ADAPTER,
+    _POST_VISION_LANGUAGE_ADAPTER,
+}
 
 
 def _is_gated_repo_error(exc: BaseException) -> bool:
@@ -141,6 +150,21 @@ class Qwen3Backbone(torch.nn.Module):
         tune_vision_patch_embed: bool = False,  # earlyfusion
         vision_input_channels: int = 3,  # earlyfusion
         vision_patch_embed_init: str = "original_rgb",  # earlyfusion
+        vision_fusion_mode: str = "none",
+        vision_fusion_version: int = 1,
+        vision_fusion_stage: str = _PRE_VISION_LANGUAGE_ADAPTER,
+        vision_fusion_adapter_type: str = "concat_linear",
+        vision_fusion_adapter_bias: bool = True,
+        vision_fusion_adapter_bias_init: str = "zeros",
+        vision_fusion_adapter_count: int = 4,
+        vision_fusion_deepstack_layers: list[int] | None = None,
+        vision_fusion_adapter_input_dim: int = 2048,
+        vision_fusion_adapter_output_dim: int = 1024,
+        vision_fusion_source_keys: list[str] | None = None,
+        vision_fusion_adapter_init: str = "rgb50_geo50",
+        vision_fusion_rgb_init_scale: float = 0.5,
+        vision_fusion_geometry_init_scale: float = 0.5,
+        tune_vision_fusion_adapters: bool = True,
         select_layer: int = -1,
         reproject_vision: bool = True,
         use_flash_attention: bool = False,
@@ -165,6 +189,23 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
         super().__init__()
+        self.trainable_params_fp32 = trainable_params_fp32
+        if vision_fusion_mode != "none":
+            incompatible_trainability = {
+                "tune_llm": tune_llm,
+                "tune_visual": tune_visual,
+                "tune_vision_patch_embed": tune_vision_patch_embed,
+                "tune_top_llm_layers": tune_top_llm_layers,
+                "tune_vision_fusion_adapters": tune_vision_fusion_adapters,
+            }
+            if tune_llm or tune_visual or tune_vision_patch_embed or tune_top_llm_layers != 0:
+                raise ValueError(
+                    "Late fusion requires the shared Qwen patch stem, ViT, pretrained "
+                    "vision-language projection, and LLM to remain frozen; got "
+                    f"{incompatible_trainability!r}"
+                )
+            if not tune_vision_fusion_adapters:
+                raise ValueError("Late-fusion training requires tune_vision_fusion_adapters=True")
 
         # Add attention kwargs
         extra_kwargs = {}
@@ -198,8 +239,47 @@ class Qwen3Backbone(torch.nn.Module):
             self.model.language_model.layers.pop(-1)
 
         self.expand_vision_input_channels(vision_input_channels, vision_patch_embed_init)  # fmt: skip  # earlyfusion
+        self.vision_fusion_mode = "none"
+        self.vision_fusion_version = 1
+        self.vision_fusion_stage = _PRE_VISION_LANGUAGE_ADAPTER
+        self.vision_fusion_adapter_type = "concat_linear"
+        self.vision_fusion_adapter_bias = True
+        self.vision_fusion_adapter_bias_init = "zeros"
+        self.vision_fusion_adapter_count = 4
+        self.vision_fusion_deepstack_layers = [5, 11, 17]
+        self.vision_fusion_adapter_input_dim = 2048
+        self.vision_fusion_adapter_output_dim = 1024
+        self.vision_fusion_source_keys: list[str] = []
+        self.vision_fusion_adapter_init = "rgb50_geo50"
+        self.vision_fusion_rgb_init_scale = 0.5
+        self.vision_fusion_geometry_init_scale = 0.5
+        self.vision_fusion_adapters: torch.nn.ModuleDict | None = None
+        if vision_fusion_mode != "none":
+            self.enable_post_vision_late_fusion(
+                mode=vision_fusion_mode,
+                version=vision_fusion_version,
+                stage=vision_fusion_stage,
+                adapter_type=vision_fusion_adapter_type,
+                adapter_bias=vision_fusion_adapter_bias,
+                adapter_bias_init=vision_fusion_adapter_bias_init,
+                adapter_count=vision_fusion_adapter_count,
+                deepstack_layers=vision_fusion_deepstack_layers or [],
+                adapter_input_dim=vision_fusion_adapter_input_dim,
+                adapter_output_dim=vision_fusion_adapter_output_dim,
+                source_keys=vision_fusion_source_keys or [],
+                adapter_init=vision_fusion_adapter_init,
+                rgb_init_scale=vision_fusion_rgb_init_scale,
+                geometry_init_scale=vision_fusion_geometry_init_scale,
+                tune_adapters=tune_vision_fusion_adapters,
+            )
         self.select_layer = select_layer
-        self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers, tune_vision_patch_embed)  # fmt: skip  # earlyfusion
+        self.set_trainable_parameters(
+            tune_llm,
+            tune_visual,
+            tune_top_llm_layers,
+            tune_vision_patch_embed,
+            tune_vision_fusion_adapters,
+        )
         if load_bf16 and trainable_params_fp32:
             # cast trainable parameters to fp32
             for n, p in self.named_parameters():
@@ -213,6 +293,322 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
         self._apply_vision_patch_embed_channels_last()
+
+    @staticmethod
+    def validate_post_vision_fusion_contract(
+        *,
+        mode: str,
+        version: int,
+        stage: str,
+        adapter_type: str,
+        adapter_bias: bool,
+        adapter_bias_init: str,
+        adapter_count: int,
+        deepstack_layers: list[int],
+        adapter_input_dim: int,
+        adapter_output_dim: int,
+        source_keys: list[str],
+        adapter_init: str,
+        rgb_init_scale: float,
+        geometry_init_scale: float,
+        vision_input_channels: int,
+    ) -> None:
+        """Fail closed on a late-fusion checkpoint/input contract mismatch."""
+        if mode != "post_vision_late_fusion":
+            raise ValueError(
+                "vision_fusion_mode must be 'post_vision_late_fusion' when late fusion "
+                f"is enabled; got {mode!r}"
+            )
+        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+            raise ValueError(f"Unsupported vision_fusion_version {version}; expected 1")
+        if stage not in _VISION_FUSION_STAGES:
+            raise ValueError(
+                "vision_fusion_stage must be 'pre_vision_language_adapter' or "
+                f"'post_vision_language_adapter'; got {stage!r}"
+            )
+        if adapter_type != "concat_linear":
+            raise ValueError(
+                f"vision_fusion_adapter_type must be 'concat_linear'; got {adapter_type!r}"
+            )
+        if adapter_bias is not True:
+            raise ValueError(
+                "vision_fusion_adapter_bias must be True for the version-1 contract; "
+                f"got {adapter_bias!r}"
+            )
+        if adapter_bias_init != "zeros":
+            raise ValueError(
+                f"vision_fusion_adapter_bias_init must be 'zeros'; got {adapter_bias_init!r}"
+            )
+        if (
+            isinstance(adapter_count, bool)
+            or not isinstance(adapter_count, int)
+            or adapter_count != 4
+        ):
+            raise ValueError(
+                "Late fusion requires four independent adapters "
+                f"(final + three DeepStack); got {adapter_count}"
+            )
+        if deepstack_layers != [5, 11, 17]:
+            raise ValueError(
+                "vision_fusion_deepstack_layers must be exactly [5, 11, 17]; "
+                f"got {deepstack_layers!r}"
+            )
+        expected_dimensions = {
+            _PRE_VISION_LANGUAGE_ADAPTER: (2048, 1024),
+            _POST_VISION_LANGUAGE_ADAPTER: (4096, 2048),
+        }[stage]
+        dimensions = (adapter_input_dim, adapter_output_dim)
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in dimensions)
+            or dimensions != expected_dimensions
+        ):
+            raise ValueError(
+                f"vision fusion stage {stage!r} requires serialized adapter dimensions "
+                f"Linear{expected_dimensions}; got Linear{dimensions}"
+            )
+        if (
+            not isinstance(source_keys, list)
+            or len(source_keys) != 2
+            or not all(isinstance(key, str) and key for key in source_keys)
+        ):
+            raise ValueError(
+                "vision_fusion_source_keys must contain exactly two non-empty ordered keys "
+                "(primary RGB, auxiliary geometry)"
+            )
+        if source_keys[0] == source_keys[1]:
+            raise ValueError("vision_fusion_source_keys must identify two distinct sources")
+        if adapter_init != "rgb50_geo50":
+            raise ValueError(
+                f"vision_fusion_adapter_init must be 'rgb50_geo50'; got {adapter_init!r}"
+            )
+        scales = (rgb_init_scale, geometry_init_scale)
+        if any(
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(float(scale))
+            for scale in scales
+        ) or (float(rgb_init_scale), float(geometry_init_scale)) != (0.5, 0.5):
+            raise ValueError(
+                "The rgb50_geo50 adapter initialization requires exact serialized scales "
+                "vision_fusion_rgb_init_scale=0.5 and "
+                "vision_fusion_geometry_init_scale=0.5; "
+                f"got {scales!r}"
+            )
+        if vision_input_channels != 3:
+            raise ValueError(
+                "Late fusion requires the unchanged three-channel Qwen vision "
+                f"stem; got vision_input_channels={vision_input_channels}"
+            )
+
+    def _validate_qwen_deepstack_contract(
+        self,
+        *,
+        stage: str,
+        deepstack_layers: list[int],
+        adapter_input_dim: int,
+        adapter_output_dim: int,
+    ) -> None:
+        visual = self.model.visual
+        indexes = list(getattr(visual, "deepstack_visual_indexes", []))
+        mergers = getattr(visual, "deepstack_merger_list", None)
+        merger_count = len(mergers) if mergers is not None else 0
+        if indexes != deepstack_layers or merger_count != 3:
+            raise RuntimeError(
+                "Version-1 late fusion requires Qwen3-VL DeepStack layers "
+                f"{deepstack_layers!r} and three outputs; found indexes={indexes!r}, "
+                f"mergers={merger_count}"
+            )
+        vision_config = getattr(self.model.config, "vision_config", None)
+        text_config = getattr(self.model.config, "text_config", None)
+        vision_hidden = getattr(vision_config, "hidden_size", None)
+        vision_output = getattr(vision_config, "out_hidden_size", None)
+        text_hidden = getattr(text_config, "hidden_size", None)
+        if (vision_hidden, vision_output, text_hidden) != (1024, 2048, 2048):
+            raise RuntimeError(
+                "Version-1 late fusion requires Qwen dimensions "
+                "vision_hidden=1024, vision_output=2048, text_hidden=2048; got "
+                f"{(vision_hidden, vision_output, text_hidden)!r}"
+            )
+        expected_dimensions = (
+            (2 * vision_hidden, vision_hidden)
+            if stage == _PRE_VISION_LANGUAGE_ADAPTER
+            else (2 * vision_output, vision_output)
+        )
+        if (adapter_input_dim, adapter_output_dim) != expected_dimensions:
+            raise RuntimeError(
+                "Serialized late-fusion dimensions do not match the loaded Qwen layout: "
+                f"serialized=Linear({adapter_input_dim}, {adapter_output_dim}), "
+                f"loaded=Linear{expected_dimensions}"
+            )
+
+    def enable_post_vision_late_fusion(
+        self,
+        *,
+        mode: str,
+        version: int,
+        stage: str,
+        adapter_type: str,
+        adapter_bias: bool,
+        adapter_bias_init: str,
+        adapter_count: int,
+        deepstack_layers: list[int],
+        adapter_input_dim: int,
+        adapter_output_dim: int,
+        source_keys: list[str],
+        adapter_init: str,
+        rgb_init_scale: float,
+        geometry_init_scale: float,
+        tune_adapters: bool,
+    ) -> None:
+        """Add deterministic late-fusion adapters to a loaded RGB base backbone.
+
+        This method is also the explicit base-checkpoint migration path. Saved
+        late-fusion checkpoints instantiate the same modules in ``__init__`` and
+        then restore their learned weights normally.
+        """
+        vision_input_channels = self.model.visual.patch_embed.proj.in_channels
+        self.validate_post_vision_fusion_contract(
+            mode=mode,
+            version=version,
+            stage=stage,
+            adapter_type=adapter_type,
+            adapter_bias=adapter_bias,
+            adapter_bias_init=adapter_bias_init,
+            adapter_count=adapter_count,
+            deepstack_layers=deepstack_layers,
+            adapter_input_dim=adapter_input_dim,
+            adapter_output_dim=adapter_output_dim,
+            source_keys=source_keys,
+            adapter_init=adapter_init,
+            rgb_init_scale=rgb_init_scale,
+            geometry_init_scale=geometry_init_scale,
+            vision_input_channels=vision_input_channels,
+        )
+        self._validate_qwen_deepstack_contract(
+            stage=stage,
+            deepstack_layers=deepstack_layers,
+            adapter_input_dim=adapter_input_dim,
+            adapter_output_dim=adapter_output_dim,
+        )
+
+        if self.vision_fusion_adapters is not None:
+            existing = (
+                self.vision_fusion_mode,
+                self.vision_fusion_version,
+                self.vision_fusion_stage,
+                self.vision_fusion_adapter_type,
+                self.vision_fusion_adapter_bias,
+                self.vision_fusion_adapter_bias_init,
+                self.vision_fusion_adapter_count,
+                self.vision_fusion_deepstack_layers,
+                self.vision_fusion_adapter_input_dim,
+                self.vision_fusion_adapter_output_dim,
+                self.vision_fusion_source_keys,
+                self.vision_fusion_adapter_init,
+                self.vision_fusion_rgb_init_scale,
+                self.vision_fusion_geometry_init_scale,
+            )
+            requested = (
+                mode,
+                version,
+                stage,
+                adapter_type,
+                adapter_bias,
+                adapter_bias_init,
+                adapter_count,
+                deepstack_layers,
+                adapter_input_dim,
+                adapter_output_dim,
+                source_keys,
+                adapter_init,
+                rgb_init_scale,
+                geometry_init_scale,
+            )
+            if existing != requested:
+                raise RuntimeError(
+                    f"Late-fusion backbone is already configured as {existing!r}, not {requested!r}"
+                )
+            if hasattr(self, "tune_llm"):
+                self.set_trainable_parameters(
+                    self.tune_llm,
+                    self.tune_visual,
+                    self.tune_top_llm_layers,
+                    self.tune_vision_patch_embed,
+                    tune_adapters,
+                )
+            else:
+                self.vision_fusion_adapters.requires_grad_(tune_adapters)
+            return
+
+        vision_config = self.model.config.vision_config
+        if stage == _PRE_VISION_LANGUAGE_ADAPTER:
+            adapter_hidden_size = int(vision_config.hidden_size)
+        else:
+            adapter_hidden_size = int(vision_config.out_hidden_size)
+        if (2 * adapter_hidden_size, adapter_hidden_size) != (
+            adapter_input_dim,
+            adapter_output_dim,
+        ):
+            raise RuntimeError(
+                "Serialized late-fusion adapter dimensions do not match the loaded Qwen "
+                f"stage: serialized=Linear({adapter_input_dim}, {adapter_output_dim}), "
+                f"loaded=Linear({2 * adapter_hidden_size}, {adapter_hidden_size})"
+            )
+        device = _real_inference_device(self.model)
+        model_dtype = next(
+            (
+                parameter.dtype
+                for parameter in self.model.parameters()
+                if parameter.device.type != "meta"
+            ),
+            torch.float32,
+        )
+        adapter_dtype = torch.float32 if self.trainable_params_fp32 else model_dtype
+        names = ("final", "deepstack_0", "deepstack_1", "deepstack_2")
+        adapters = torch.nn.ModuleDict(
+            {
+                name: torch.nn.Linear(
+                    2 * adapter_hidden_size,
+                    adapter_hidden_size,
+                    bias=adapter_bias,
+                    device=device,
+                    dtype=adapter_dtype,
+                )
+                for name in names
+            }
+        )
+        with torch.no_grad():
+            for adapter in adapters.values():
+                adapter.weight.zero_()
+                adapter.weight[:, :adapter_hidden_size].diagonal().fill_(float(rgb_init_scale))
+                adapter.weight[:, adapter_hidden_size:].diagonal().fill_(float(geometry_init_scale))
+                if adapter.bias is not None:
+                    adapter.bias.zero_()
+        adapters.requires_grad_(tune_adapters)
+
+        self.vision_fusion_adapters = adapters
+        self.vision_fusion_mode = mode
+        self.vision_fusion_version = version
+        self.vision_fusion_stage = stage
+        self.vision_fusion_adapter_type = adapter_type
+        self.vision_fusion_adapter_bias = adapter_bias
+        self.vision_fusion_adapter_bias_init = adapter_bias_init
+        self.vision_fusion_adapter_count = adapter_count
+        self.vision_fusion_deepstack_layers = list(deepstack_layers)
+        self.vision_fusion_adapter_input_dim = adapter_input_dim
+        self.vision_fusion_adapter_output_dim = adapter_output_dim
+        self.vision_fusion_source_keys = list(source_keys)
+        self.vision_fusion_adapter_init = adapter_init
+        self.vision_fusion_rgb_init_scale = float(rgb_init_scale)
+        self.vision_fusion_geometry_init_scale = float(geometry_init_scale)
+        if hasattr(self, "tune_llm"):
+            self.set_trainable_parameters(
+                self.tune_llm,
+                self.tune_visual,
+                self.tune_top_llm_layers,
+                self.tune_vision_patch_embed,
+                tune_adapters,
+            )
 
     def expand_vision_input_channels(self, input_channels: int, initialization: str) -> None:  # fmt: skip  # earlyfusion
         if input_channels not in (3, 4, 6):  # earlyfusion
@@ -279,23 +675,43 @@ class Qwen3Backbone(torch.nn.Module):
                 patched,
             )
 
-    def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int, tune_vision_patch_embed: bool = False):  # fmt: skip  # earlyfusion
+    def set_trainable_parameters(
+        self,
+        tune_llm: bool,
+        tune_visual: bool,
+        tune_top_llm_layers: int,
+        tune_vision_patch_embed: bool = False,
+        tune_vision_fusion_adapters: bool = True,
+    ):
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
         self.tune_vision_patch_embed = tune_vision_patch_embed  # earlyfusion
-        for p in self.parameters():
-            p.requires_grad = True
-        if not tune_llm:
-            self.model.language_model.requires_grad_(False)
-        if not tune_visual:
-            self.model.visual.requires_grad_(False)
-        if tune_vision_patch_embed:  # earlyfusion
-            self.model.visual.patch_embed.proj.requires_grad_(True)  # earlyfusion
-
-        if tune_top_llm_layers > 0:
-            for layer in self.model.language_model.layers[-tune_top_llm_layers:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
+        self.tune_top_llm_layers = tune_top_llm_layers
+        if getattr(self, "vision_fusion_mode", "none") == "post_vision_late_fusion":
+            if tune_llm or tune_visual or tune_vision_patch_embed or tune_top_llm_layers != 0:
+                raise ValueError(
+                    "Late fusion requires the shared Qwen patch stem, ViT, pretrained "
+                    "vision-language projection, and LLM to remain frozen"
+                )
+            if not tune_vision_fusion_adapters:
+                raise ValueError("Late-fusion training requires tune_vision_fusion_adapters=True")
+            self.model.requires_grad_(False)
+            if self.vision_fusion_adapters is None:
+                raise RuntimeError("Late-fusion adapters are not initialized")
+            self.vision_fusion_adapters.requires_grad_(True)
+            if any(parameter.requires_grad for parameter in self.model.parameters()):
+                raise RuntimeError("Late-fusion Qwen freeze contract was not applied")
+            if not all(
+                parameter.requires_grad for parameter in self.vision_fusion_adapters.parameters()
+            ):
+                raise RuntimeError("Late-fusion adapters must remain trainable")
+        else:
+            self._set_legacy_trainable_parameters(
+                tune_llm=tune_llm,
+                tune_visual=tune_visual,
+                tune_top_llm_layers=tune_top_llm_layers,
+                tune_vision_patch_embed=tune_vision_patch_embed,
+            )
 
         logger.debug(f"Tune backbone llm: {self.tune_llm}")
         logger.debug(f"Tune backbone visual: {self.tune_visual}")
@@ -305,6 +721,28 @@ class Qwen3Backbone(torch.nn.Module):
                 logger.debug(f"Backbone trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             logger.warning("No backbone trainable parameters found.")
+
+    def _set_legacy_trainable_parameters(
+        self,
+        *,
+        tune_llm: bool,
+        tune_visual: bool,
+        tune_top_llm_layers: int,
+        tune_vision_patch_embed: bool,
+    ) -> None:
+        """Preserve the original trainability behavior for every non-late mode."""
+        for p in self.parameters():
+            p.requires_grad = True
+        if not tune_llm:
+            self.model.language_model.requires_grad_(False)
+        if not tune_visual:
+            self.model.visual.requires_grad_(False)
+        if tune_vision_patch_embed:  # earlyfusion
+            self.model.visual.patch_embed.proj.requires_grad_(True)  # earlyfusion
+        if tune_top_llm_layers > 0:
+            for layer in self.model.language_model.layers[-tune_top_llm_layers:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -390,15 +828,394 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _fuse_vision_streams(
+        self,
+        adapter_name: str,
+        primary: torch.Tensor,
+        auxiliary: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.vision_fusion_adapters is None:
+            raise RuntimeError("Late-fusion adapters are not enabled")
+        if primary.ndim != 2 or auxiliary.ndim != 2 or primary.shape != auxiliary.shape:
+            raise ValueError(
+                f"Late-fusion {adapter_name} streams must have identical rank-2 shapes; "
+                f"got primary={tuple(primary.shape)}, auxiliary={tuple(auxiliary.shape)}"
+            )
+        adapter = self.vision_fusion_adapters[adapter_name]
+        expected_width = adapter.out_features
+        if primary.shape[-1] != expected_width:
+            raise ValueError(
+                f"Late-fusion {adapter_name} stream width must be {expected_width} for "
+                f"stage {self.vision_fusion_stage!r}; "
+                f"got {primary.shape[-1]}"
+            )
+        if (
+            adapter.in_features != self.vision_fusion_adapter_input_dim
+            or adapter.out_features != self.vision_fusion_adapter_output_dim
+            or (adapter.bias is not None) != self.vision_fusion_adapter_bias
+        ):
+            raise RuntimeError(
+                f"Late-fusion {adapter_name} does not match its serialized adapter contract: "
+                f"Linear({adapter.in_features}, {adapter.out_features}, "
+                f"bias={adapter.bias is not None})"
+            )
+        adapter_input = torch.cat((primary, auxiliary), dim=-1).to(
+            device=adapter.weight.device, dtype=adapter.weight.dtype
+        )
+        fused = adapter(adapter_input)
+        return fused.to(device=primary.device, dtype=primary.dtype)
+
+    @staticmethod
+    def _attention_mask_for_rope(
+        attention_mask: torch.Tensor | dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if isinstance(attention_mask, dict):
+            attention_mask = attention_mask["full_attention"]
+        if attention_mask.ndim != 4:
+            return attention_mask
+        attention_mask = torch.diagonal(attention_mask[:, 0], dim1=1, dim2=2)
+        if attention_mask.dtype.is_floating_point:
+            attention_mask = attention_mask / torch.finfo(attention_mask.dtype).min
+            attention_mask = (1.0 - attention_mask).int()
+        return attention_mask
+
+    def _encode_pre_merger_late_fusion(
+        self,
+        combined_pixels: torch.Tensor,
+        combined_grid: torch.Tensor,
+        primary_raw_token_count: int,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run the pinned Qwen vision path and fuse raw ViT features before mergers.
+
+        RGB images occupy the first half of ``combined_grid`` and auxiliary
+        images the second. Qwen's ``cu_seqlens`` keeps every image independent
+        through the shared ViT. At layers 5/11/17 and the final output, aligned
+        raw 1024-wide source tokens are fused before invoking Qwen's existing
+        pretrained DeepStack/final mergers. The returned tensors therefore keep
+        the normal 2048-wide language interface and one destination image span.
+        """
+        visual = self.model.model.visual
+        hidden_states = visual.patch_embed(combined_pixels.type(visual.dtype))
+        expected_raw_tokens = 2 * primary_raw_token_count
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != expected_raw_tokens:
+            raise RuntimeError(
+                "Qwen patch embedding did not preserve the paired raw-token layout: "
+                f"expected ({expected_raw_tokens}, 1024), got {tuple(hidden_states.shape)}"
+            )
+
+        pos_embeds = visual.fast_pos_embed_interpolate(combined_grid)
+        if pos_embeds.shape != hidden_states.shape:
+            raise RuntimeError(
+                "Qwen position embeddings do not match paired patch embeddings: "
+                f"patches={tuple(hidden_states.shape)}, positions={tuple(pos_embeds.shape)}"
+            )
+        hidden_states = hidden_states + pos_embeds
+
+        rotary_pos_emb = visual.rot_pos_emb(combined_grid)
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        rotary_pair = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (rotary_pair.cos(), rotary_pair.sin())
+
+        cu_seqlens = torch.repeat_interleave(
+            combined_grid[:, 1] * combined_grid[:, 2], combined_grid[:, 0]
+        ).cumsum(
+            dim=0,
+            dtype=combined_grid.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+        deepstack_indexes = list(visual.deepstack_visual_indexes)
+        if deepstack_indexes != self.vision_fusion_deepstack_layers:
+            raise RuntimeError(
+                "Loaded Qwen DeepStack layers no longer match the serialized late-fusion "
+                f"contract: loaded={deepstack_indexes!r}, "
+                f"serialized={self.vision_fusion_deepstack_layers!r}"
+            )
+        deepstack_lookup = {layer: index for index, layer in enumerate(deepstack_indexes)}
+        fused_deepstack = []
+        for layer_num, block in enumerate(visual.blocks):
+            hidden_states = block(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+            )
+            if layer_num in deepstack_lookup:
+                stream_index = deepstack_lookup[layer_num]
+                fused_raw = self._fuse_vision_streams(
+                    f"deepstack_{stream_index}",
+                    hidden_states[:primary_raw_token_count],
+                    hidden_states[primary_raw_token_count:],
+                )
+                fused_deepstack.append(visual.deepstack_merger_list[stream_index](fused_raw))
+
+        fused_final_raw = self._fuse_vision_streams(
+            "final",
+            hidden_states[:primary_raw_token_count],
+            hidden_states[primary_raw_token_count:],
+        )
+        fused_final = visual.merger(fused_final_raw)
+        if len(fused_deepstack) != 3:
+            raise RuntimeError(
+                "Pre-merger late fusion requires outputs from exactly three DeepStack sites; "
+                f"got {len(fused_deepstack)}"
+            )
+        expected_shape = fused_final.shape
+        if fused_final.ndim != 2 or any(
+            stream.shape != expected_shape for stream in fused_deepstack
+        ):
+            raise RuntimeError(
+                "Qwen final and DeepStack mergers must return matching rank-2 token streams; "
+                f"final={tuple(expected_shape)}, "
+                f"deepstack={[tuple(stream.shape) for stream in fused_deepstack]}"
+            )
+        expected_width = int(self.model.config.text_config.hidden_size)
+        if fused_final.shape[-1] != expected_width:
+            raise RuntimeError(
+                "Qwen vision-to-language projection returned an unexpected width: "
+                f"expected {expected_width}, got {fused_final.shape[-1]}"
+            )
+        return fused_final, fused_deepstack
+
+    @staticmethod
+    def _validate_late_fusion_inputs(
+        vl_input: dict[str, torch.Tensor],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        required = {
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "late_fusion_pixel_values",
+            "late_fusion_image_grid_thw",
+        }
+        missing = sorted(required - vl_input.keys())
+        if missing:
+            raise KeyError(f"Late-fusion input is missing required keys: {missing}")
+
+        input_ids = vl_input["input_ids"]
+        attention_mask = vl_input["attention_mask"]
+        primary_pixels = vl_input["pixel_values"]
+        auxiliary_pixels = vl_input["late_fusion_pixel_values"]
+        primary_grid = vl_input["image_grid_thw"]
+        auxiliary_grid = vl_input["late_fusion_image_grid_thw"]
+
+        if primary_grid.ndim != 2 or primary_grid.shape[-1] != 3 or primary_grid.numel() == 0:
+            raise ValueError(
+                "image_grid_thw must be a non-empty [num_images, 3] tensor for late fusion; "
+                f"got {tuple(primary_grid.shape)}"
+            )
+        if primary_grid.shape != auxiliary_grid.shape or not torch.equal(
+            primary_grid, auxiliary_grid
+        ):
+            raise ValueError(
+                "Late-fusion primary and auxiliary image_grid_thw tensors must be exactly "
+                "equal so tokens can be paired spatially"
+            )
+        if primary_pixels.shape != auxiliary_pixels.shape:
+            raise ValueError(
+                "Late-fusion primary and auxiliary pixel tensors must have identical shapes; "
+                f"got primary={tuple(primary_pixels.shape)}, "
+                f"auxiliary={tuple(auxiliary_pixels.shape)}"
+            )
+        return (
+            input_ids,
+            attention_mask,
+            primary_pixels,
+            auxiliary_pixels,
+            primary_grid,
+            auxiliary_grid,
+        )
+
+    def _forward_fused_vision_language(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        primary_grid: torch.Tensor,
+        fused_final: torch.Tensor,
+        fused_deepstack: list[torch.Tensor],
+    ) -> torch.Tensor:
+        if len(fused_deepstack) != 3:
+            raise RuntimeError(
+                "Late fusion requires exactly three DeepStack visual streams; "
+                f"got {len(fused_deepstack)}"
+            )
+        qwen = self.model.model
+        inputs_embeds = qwen.get_input_embeddings()(input_ids)
+        fused_final = fused_final.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        image_mask, _ = qwen.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=fused_final,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, fused_final)
+        visual_pos_masks = image_mask[..., 0]
+        fused_deepstack = [
+            stream.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            for stream in fused_deepstack
+        ]
+
+        position_ids, rope_deltas = qwen.get_rope_index(
+            input_ids,
+            primary_grid,
+            None,
+            attention_mask=self._attention_mask_for_rope(attention_mask),
+        )
+        qwen.rope_deltas = rope_deltas
+        outputs = qwen.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=fused_deepstack,
+        )
+        return outputs.last_hidden_state
+
+    def _forward_pre_adapter_late_fusion(self, vl_input: dict[str, torch.Tensor]) -> torch.Tensor:
+        (
+            input_ids,
+            attention_mask,
+            primary_pixels,
+            auxiliary_pixels,
+            primary_grid,
+            auxiliary_grid,
+        ) = self._validate_late_fusion_inputs(vl_input)
+
+        primary_raw_token_count = int(primary_grid.prod(dim=-1).sum().item())
+        if primary_pixels.ndim != 2 or primary_pixels.shape[0] != primary_raw_token_count:
+            raise ValueError(
+                "Late-fusion primary pixel_values must contain exactly one flattened patch "
+                f"per raw grid token; pixels={tuple(primary_pixels.shape)}, "
+                f"grid_tokens={primary_raw_token_count}"
+            )
+        combined_pixels = torch.cat((primary_pixels, auxiliary_pixels), dim=0)
+        combined_grid = torch.cat((primary_grid, auxiliary_grid), dim=0)
+        fused_final, fused_deepstack = self._encode_pre_merger_late_fusion(
+            combined_pixels,
+            combined_grid,
+            primary_raw_token_count,
+        )
+        return self._forward_fused_vision_language(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            primary_grid=primary_grid,
+            fused_final=fused_final,
+            fused_deepstack=fused_deepstack,
+        )
+
+    def _forward_post_adapter_late_fusion(self, vl_input: dict[str, torch.Tensor]) -> torch.Tensor:
+        (
+            input_ids,
+            attention_mask,
+            primary_pixels,
+            auxiliary_pixels,
+            primary_grid,
+            auxiliary_grid,
+        ) = self._validate_late_fusion_inputs(vl_input)
+
+        qwen = self.model.model
+        combined_pixels = torch.cat((primary_pixels, auxiliary_pixels), dim=0)
+        combined_grid = torch.cat((primary_grid, auxiliary_grid), dim=0)
+        image_chunks, deepstack_streams = qwen.get_image_features(
+            combined_pixels,
+            combined_grid,
+        )
+
+        primary_image_count = primary_grid.shape[0]
+        if not isinstance(image_chunks, (tuple, list)) or len(image_chunks) != (
+            2 * primary_image_count
+        ):
+            raise RuntimeError(
+                "Qwen vision output did not preserve the paired image layout: "
+                f"expected {2 * primary_image_count} chunks, got "
+                f"{len(image_chunks) if isinstance(image_chunks, (tuple, list)) else type(image_chunks)!r}"
+            )
+        primary_chunks = image_chunks[:primary_image_count]
+        auxiliary_chunks = image_chunks[primary_image_count:]
+        mismatched_chunks = [
+            index
+            for index, (primary, auxiliary) in enumerate(
+                zip(primary_chunks, auxiliary_chunks, strict=True)
+            )
+            if primary.shape != auxiliary.shape
+        ]
+        if mismatched_chunks:
+            raise RuntimeError(
+                "Qwen produced different token shapes for aligned late-fusion image pairs "
+                f"at indexes {mismatched_chunks}"
+            )
+        primary_final = torch.cat(tuple(primary_chunks), dim=0)
+        auxiliary_final = torch.cat(tuple(auxiliary_chunks), dim=0)
+        fused_final = self._fuse_vision_streams("final", primary_final, auxiliary_final)
+
+        if not isinstance(deepstack_streams, (tuple, list)) or len(deepstack_streams) != 3:
+            raise RuntimeError(
+                "Qwen vision output must contain exactly three DeepStack streams; got "
+                f"{len(deepstack_streams) if isinstance(deepstack_streams, (tuple, list)) else type(deepstack_streams)!r}"
+            )
+        primary_token_count = primary_final.shape[0]
+        fused_deepstack = []
+        for index, stream in enumerate(deepstack_streams):
+            if stream.ndim != 2 or stream.shape[0] != 2 * primary_token_count:
+                raise RuntimeError(
+                    f"Qwen DeepStack stream {index} did not preserve paired token order: "
+                    f"expected {2 * primary_token_count} rows, got {tuple(stream.shape)}"
+                )
+            fused_deepstack.append(
+                self._fuse_vision_streams(
+                    f"deepstack_{index}",
+                    stream[:primary_token_count],
+                    stream[primary_token_count:],
+                )
+            )
+
+        return self._forward_fused_vision_language(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            primary_grid=primary_grid,
+            fused_final=fused_final,
+            fused_deepstack=fused_deepstack,
+        )
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
-        vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
-        outputs = outputs.hidden_states[-1]
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
-        attention_mask = vl_input["attention_mask"] == 1
+        if self.vision_fusion_mode == "post_vision_late_fusion":
+            keys_to_use.extend(["late_fusion_pixel_values", "late_fusion_image_grid_thw"])
+            selected_input = {k: vl_input[k] for k in keys_to_use if k in vl_input}
+            if self.vision_fusion_stage == _PRE_VISION_LANGUAGE_ADAPTER:
+                outputs = self._forward_pre_adapter_late_fusion(selected_input)
+            elif self.vision_fusion_stage == _POST_VISION_LANGUAGE_ADAPTER:
+                outputs = self._forward_post_adapter_late_fusion(selected_input)
+            else:
+                raise RuntimeError(
+                    "Late-fusion backbone has unsupported serialized stage "
+                    f"{self.vision_fusion_stage!r}"
+                )
+        else:
+            late_keys = {"late_fusion_pixel_values", "late_fusion_image_grid_thw"}
+            unexpected_late_keys = sorted(late_keys.intersection(vl_input.keys()))
+            if unexpected_late_keys:
+                raise ValueError(
+                    "Received late-fusion inputs for a non-late-fusion checkpoint: "
+                    f"{unexpected_late_keys}"
+                )
+            selected_input = {k: vl_input[k] for k in keys_to_use}
+            model_outputs = self.model(**selected_input, output_hidden_states=True)
+            outputs = model_outputs.hidden_states[-1]
+        image_mask = selected_input["input_ids"] == self.model.config.image_token_id
+        attention_mask = selected_input["attention_mask"] == 1
         return BatchFeature(
             data={
                 "backbone_features": outputs,

@@ -52,6 +52,11 @@ DEFAULT_DEPTH_NEAR_M = 0.25
 DEFAULT_DEPTH_FAR_M = 1.0
 TASK_CONTRACT_SCHEMA_VERSION = 1
 REALSENSE_RGBD_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
+POST_VISION_LATE_FUSION_MODE = "post_vision_late_fusion"
+POST_VISION_LATE_FUSION_STAGE_SPECS = {
+    "pre_vision_language_adapter": {"input_dim": 2048, "output_dim": 1024},
+    "post_vision_language_adapter": {"input_dim": 4096, "output_dim": 2048},
+}
 
 
 def _task_contract_sha256(instructions: list[str]) -> str:
@@ -762,6 +767,107 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
     return contract
 
 
+def _validate_checkpoint_dataset_vision_contract(
+    vision_contract: dict, dataset_contract: dict
+) -> None:
+    """Bind a post-vision checkpoint's ordered sources to deployment data.
+
+    Existing RGB, separate-view, and early-channel-fusion deployments retain
+    their current validation behavior.  A late-fusion checkpoint is stricter:
+    it has two semantically ordered, spatially aligned three-channel sources,
+    and deployment must provide the encoding metadata for the auxiliary view.
+    """
+
+    if vision_contract.get("mode") != POST_VISION_LATE_FUSION_MODE:
+        return
+
+    if vision_contract.get("version") != 2:
+        raise ValueError("Post-vision late-fusion vision contract must use schema version 2")
+    if vision_contract.get("patch_embed_trainable") is not False:
+        raise ValueError(
+            "Post-vision late-fusion contract must declare patch_embed_trainable=false"
+        )
+    fusion = vision_contract.get("post_vision_fusion")
+    if not isinstance(fusion, dict):
+        raise ValueError("Post-vision late-fusion contract is missing fusion metadata")
+    stage = fusion.get("stage")
+    if stage not in POST_VISION_LATE_FUSION_STAGE_SPECS:
+        raise ValueError(
+            "Post-vision late-fusion contract must declare stage "
+            "'pre_vision_language_adapter' or 'post_vision_language_adapter'"
+        )
+    stage_spec = POST_VISION_LATE_FUSION_STAGE_SPECS[stage]
+    parameters_per_adapter = (
+        stage_spec["input_dim"] * stage_spec["output_dim"]
+        + stage_spec["output_dim"]
+    )
+    expected_architecture = {
+        "version": 1,
+        "adapter_type": "concat_linear",
+        "adapter_bias": True,
+        "adapter_bias_init": "zeros",
+        "adapter_count": 4,
+        "deepstack_layers": [5, 11, 17],
+        "adapter_input_dim": stage_spec["input_dim"],
+        "adapter_output_dim": stage_spec["output_dim"],
+        "parameters_per_adapter": parameters_per_adapter,
+        "total_adapter_parameters": 4 * parameters_per_adapter,
+    }
+    for field, expected in expected_architecture.items():
+        if fusion.get(field) != expected:
+            raise ValueError(
+                "Post-vision late-fusion contract architecture mismatch for "
+                f"{field}: got {fusion.get(field)!r}, expected {expected!r}"
+            )
+    if fusion.get("adapter_init") != "rgb50_geo50":
+        raise ValueError(
+            "Post-vision late-fusion contract must declare adapter_init 'rgb50_geo50'"
+        )
+    if fusion.get("rgb_init_scale") != 0.5 or fusion.get("geometry_init_scale") != 0.5:
+        raise ValueError(
+            "Post-vision late-fusion contract must declare exact initialization scales "
+            "RGB=0.5 and geometry=0.5"
+        )
+    source_keys = fusion.get("source_keys")
+    if source_keys != vision_contract.get("wire_video_keys"):
+        raise ValueError("Post-vision late-fusion source keys do not match the wire video keys")
+    if (
+        not isinstance(source_keys, list)
+        or len(source_keys) != 2
+        or source_keys[0] != "ego_view"
+        or source_keys[1] not in {"depth_gray_view", SURFACE_NORMALS_VIEW}
+    ):
+        raise ValueError("Post-vision late fusion requires ordered sources ['ego_view', auxiliary]")
+
+    video_shapes = dataset_contract.get("video_shapes")
+    if not isinstance(video_shapes, dict):
+        raise ValueError("Deployment dataset contract is missing video_shapes")
+    try:
+        primary_shape = video_shapes[source_keys[0]]
+        auxiliary_shape = video_shapes[source_keys[1]]
+    except KeyError as exc:
+        raise ValueError(
+            f"Deployment dataset is missing late-fusion video source {exc.args[0]!r}"
+        ) from exc
+    if primary_shape != auxiliary_shape:
+        raise ValueError(
+            "Post-vision late-fusion RGB and auxiliary views must have identical HWC shapes: "
+            f"RGB={primary_shape!r}, auxiliary={auxiliary_shape!r}"
+        )
+    if not isinstance(primary_shape, list) or len(primary_shape) != 3 or primary_shape[-1] != 3:
+        raise ValueError("Post-vision late-fusion sources must be aligned three-channel HWC videos")
+
+    auxiliary_key = source_keys[1]
+    if auxiliary_key == "depth_gray_view" and "depth_encoding" not in dataset_contract:
+        raise ValueError(
+            "Post-vision depth late fusion requires deployment depth_encoding metadata"
+        )
+    if auxiliary_key == SURFACE_NORMALS_VIEW and "surface_normals_encoding" not in dataset_contract:
+        raise ValueError(
+            "Post-vision normals late fusion requires deployment surface_normals_encoding metadata"
+        )
+
+
 def _verify_checkpoint_dataset_path(
     model_path: Path, embodiment_tag: str, deployment_dataset_path: Path
 ) -> None:
@@ -989,9 +1095,12 @@ def main(config: ServerConfig):
             )
         elif Path(config.dataset_path).resolve() != deployment_dataset_path.resolve():
             raise ValueError("Replay policy --deployment-dataset-path must equal --dataset-path")
-        policy_metadata["dataset_contract"] = _load_deployment_dataset_contract(
-            deployment_dataset_path
-        )
+        dataset_contract = _load_deployment_dataset_contract(deployment_dataset_path)
+        if "vision_input_contract" in policy_metadata:
+            _validate_checkpoint_dataset_vision_contract(
+                policy_metadata["vision_input_contract"], dataset_contract
+            )
+        policy_metadata["dataset_contract"] = dataset_contract
         policy_metadata["task_contract"] = _load_deployment_task_contract(deployment_dataset_path)
 
     with PolicyServer(

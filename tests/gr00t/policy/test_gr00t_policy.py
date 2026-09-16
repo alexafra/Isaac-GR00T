@@ -24,7 +24,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from gr00t.data.types import ModalityConfig, VideoChannelSource  # earlyfusion
-from gr00t.policy.gr00t_policy import _vision_input_contract  # earlyfusion
+from gr00t.policy.gr00t_policy import (  # earlyfusion
+    _validate_post_vision_fusion_runtime,
+    _vision_input_contract,
+)
 import numpy as np
 import pytest
 import torch
@@ -57,6 +60,257 @@ def test_six_channel_contract_accepts_both_supported_initializations():  # early
         assert contract["patch_embed_init"] == initialization  # earlyfusion
     with pytest.raises(ValueError, match="patch initialization mismatch"):  # earlyfusion
         _vision_input_contract(SimpleNamespace(vision_input_channels=6, vision_channel_layout=layout, vision_patch_embed_init="original_rgb"), video)  # fmt: skip  # earlyfusion
+
+
+def _late_fusion_model(auxiliary_key: str, **overrides):
+    stage = overrides.get(
+        "vision_fusion_stage", "pre_vision_language_adapter"
+    )
+    input_dim, output_dim = {
+        "pre_vision_language_adapter": (2048, 1024),
+        "post_vision_language_adapter": (4096, 2048),
+    }.get(stage, (2048, 1024))
+    values = {
+        "vision_input_channels": 3,
+        "vision_channel_layout": ["ego_view:0", "ego_view:1", "ego_view:2"],
+        "vision_patch_embed_init": "original_rgb",
+        "vision_fusion_mode": "post_vision_late_fusion",
+        "vision_fusion_version": 1,
+        "vision_fusion_adapter_type": "concat_linear",
+        "vision_fusion_adapter_bias": True,
+        "vision_fusion_adapter_bias_init": "zeros",
+        "vision_fusion_adapter_count": 4,
+        "vision_fusion_deepstack_layers": [5, 11, 17],
+        "vision_fusion_adapter_input_dim": input_dim,
+        "vision_fusion_adapter_output_dim": output_dim,
+        "vision_fusion_source_keys": ["ego_view", auxiliary_key],
+        "vision_fusion_adapter_init": "rgb50_geo50",
+        "vision_fusion_rgb_init_scale": 0.5,
+        "vision_fusion_geometry_init_scale": 0.5,
+        "vision_fusion_stage": "pre_vision_language_adapter",
+        "tune_vision_patch_embed": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize("auxiliary_key", ["depth_gray_view", "surface_normals_view"])
+@pytest.mark.parametrize(
+    ("stage", "input_dim", "output_dim"),
+    [
+        ("pre_vision_language_adapter", 2048, 1024),
+        ("post_vision_language_adapter", 4096, 2048),
+    ],
+)
+def test_post_vision_late_fusion_contract_is_checkpoint_bound(
+    auxiliary_key, stage, input_dim, output_dim
+):
+    video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", auxiliary_key],
+        post_vision_fusion=True,
+        post_vision_fusion_stage=stage,
+    )
+
+    contract = _vision_input_contract(
+        _late_fusion_model(auxiliary_key, vision_fusion_stage=stage), video
+    )
+    parameters_per_adapter = input_dim * output_dim + output_dim
+
+    assert contract == {
+        "version": 2,
+        "mode": "post_vision_late_fusion",
+        "input_channels": 3,
+        "channel_layout": ["ego_view:0", "ego_view:1", "ego_view:2"],
+        "patch_embed_init": "original_rgb",
+        "patch_embed_trainable": False,
+        "wire_video_keys": ["ego_view", auxiliary_key],
+        "post_vision_fusion": {
+            "version": 1,
+            "adapter_type": "concat_linear",
+            "adapter_bias": True,
+            "adapter_bias_init": "zeros",
+            "adapter_count": 4,
+            "deepstack_layers": [5, 11, 17],
+            "adapter_init": "rgb50_geo50",
+            "rgb_init_scale": 0.5,
+            "geometry_init_scale": 0.5,
+            "stage": stage,
+            "adapter_input_dim": input_dim,
+            "adapter_output_dim": output_dim,
+            "parameters_per_adapter": parameters_per_adapter,
+            "total_adapter_parameters": 4 * parameters_per_adapter,
+            "source_keys": ["ego_view", auxiliary_key],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_overrides", "message"),
+    [
+        (
+            {"vision_fusion_source_keys": ["ego_view", "surface_normals_view"]},
+            "source-key mismatch",
+        ),
+        ({"vision_fusion_version": 2}, "fusion version mismatch"),
+        ({"vision_fusion_adapter_count": 3}, "adapter count mismatch"),
+        ({"vision_fusion_adapter_type": "shared_concat_linear"}, "adapter type mismatch"),
+        ({"vision_fusion_adapter_bias": False}, "adapter bias mismatch"),
+        ({"vision_fusion_adapter_bias_init": "ones"}, "bias initialization mismatch"),
+        ({"vision_fusion_deepstack_layers": [4, 10, 16]}, "DeepStack layers mismatch"),
+        ({"vision_fusion_adapter_input_dim": 4096}, "adapter dimensions mismatch"),
+        ({"vision_fusion_adapter_init": "rgb90_geo10"}, "adapter initialization mismatch"),
+        ({"vision_fusion_rgb_init_scale": 0.9}, "RGB initialization scale mismatch"),
+        (
+            {"vision_fusion_geometry_init_scale": 0.1},
+            "geometry initialization scale mismatch",
+        ),
+        ({"tune_vision_patch_embed": True}, "patch_embed_trainable=False"),
+        ({"vision_fusion_stage": "pre_merger"}, "fusion-stage mismatch"),
+    ],
+)
+def test_post_vision_late_fusion_contract_rejects_checkpoint_mismatch(model_overrides, message):
+    video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _vision_input_contract(_late_fusion_model("depth_gray_view", **model_overrides), video)
+
+
+def test_processor_cannot_reinterpret_checkpoint_fusion_mode():
+    late_video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+    )
+    separate_video = ModalityConfig(
+        delta_indices=[0], modality_keys=["ego_view", "depth_gray_view"]
+    )
+
+    with pytest.raises(ValueError, match="Checkpoint/processor post-vision fusion mismatch"):
+        _vision_input_contract(
+            SimpleNamespace(
+                vision_input_channels=3,
+                vision_channel_layout=["ego_view:0", "ego_view:1", "ego_view:2"],
+                vision_patch_embed_init="original_rgb",
+                vision_fusion_mode="none",
+            ),
+            late_video,
+        )
+    with pytest.raises(ValueError, match="Checkpoint/processor post-vision fusion mismatch"):
+        _vision_input_contract(_late_fusion_model("depth_gray_view"), separate_video)
+
+
+def _late_fusion_runtime_model(
+    adapter_names=None,
+    *,
+    stage,
+    in_features,
+    out_features,
+    bias=True,
+    metadata_input_dim=None,
+    metadata_output_dim=None,
+):
+    adapter_names = adapter_names or ("final", "deepstack_0", "deepstack_1", "deepstack_2")
+    adapters = torch.nn.ModuleDict(
+        {
+            name: torch.nn.Linear(in_features, out_features, bias=bias, device="meta")
+            for name in adapter_names
+        }
+    )
+    return SimpleNamespace(
+        backbone=SimpleNamespace(
+            vision_fusion_adapters=adapters,
+            vision_fusion_stage=stage,
+            vision_fusion_adapter_bias=True,
+            vision_fusion_adapter_bias_init="zeros",
+            vision_fusion_deepstack_layers=[5, 11, 17],
+            vision_fusion_adapter_input_dim=(
+                in_features if metadata_input_dim is None else metadata_input_dim
+            ),
+            vision_fusion_adapter_output_dim=(
+                out_features if metadata_output_dim is None else metadata_output_dim
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "in_features", "out_features"),
+    [
+        ("pre_vision_language_adapter", 2048, 1024),
+        ("post_vision_language_adapter", 4096, 2048),
+    ],
+)
+def test_post_vision_runtime_requires_four_stage_specific_linear_adapters(
+    stage, in_features, out_features
+):
+    contract = {
+        "mode": "post_vision_late_fusion",
+        "post_vision_fusion": {"stage": stage},
+    }
+
+    _validate_post_vision_fusion_runtime(
+        _late_fusion_runtime_model(
+            stage=stage, in_features=in_features, out_features=out_features
+        ),
+        contract,
+    )
+
+    with pytest.raises(ValueError, match="adapter sites mismatch"):
+        _validate_post_vision_fusion_runtime(
+            _late_fusion_runtime_model(
+                ("final", "deepstack_0"),
+                stage=stage,
+                in_features=in_features,
+                out_features=out_features,
+            ),
+            contract,
+        )
+    with pytest.raises(ValueError, match="must include bias"):
+        _validate_post_vision_fusion_runtime(
+            _late_fusion_runtime_model(
+                stage=stage,
+                in_features=in_features,
+                out_features=out_features,
+                bias=False,
+            ),
+            contract,
+        )
+    with pytest.raises(
+        ValueError, match=rf"Linear\({in_features}, {out_features}\)"
+    ):
+        _validate_post_vision_fusion_runtime(
+            _late_fusion_runtime_model(
+                stage=stage,
+                in_features=in_features,
+                out_features=out_features * 2,
+                metadata_output_dim=out_features,
+            ),
+            contract,
+        )
+
+
+def test_post_vision_runtime_rejects_stage_reinterpretation():
+    contract = {
+        "mode": "post_vision_late_fusion",
+        "post_vision_fusion": {"stage": "pre_vision_language_adapter"},
+    }
+
+    with pytest.raises(ValueError, match="runtime/config stage mismatch"):
+        _validate_post_vision_fusion_runtime(
+            _late_fusion_runtime_model(
+                stage="post_vision_language_adapter",
+                in_features=2048,
+                out_features=1024,
+            ),
+            contract,
+        )
 
 
 def _build_modality_configs():

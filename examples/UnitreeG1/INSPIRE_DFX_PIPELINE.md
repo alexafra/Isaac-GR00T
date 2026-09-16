@@ -129,7 +129,7 @@ uv run --no-sync python -m gr00t.data.stats \
   --modality-config-path examples/UnitreeG1/g1_inspire_headonly_config.py
 ```
 
-All seven visual recipes share the same state/action statistics.
+All visual recipes share the same state/action statistics.
 
 ## 5. Train
 
@@ -141,9 +141,65 @@ Choose one of these modality configurations:
 | RGB + gray depth, separate views | `g1_inspire_head_3_channel_gray_depth_config.py` |
 | Gray depth only | `g1_inspire_head_depth_gray_only_config.py` |
 | RGB + depth early fusion | `g1_inspire_head_4_channel_gray_depth_fusion_config.py` |
+| RGB-D late fusion, pre-adapter | `g1_inspire_head_rgbd_late_fusion_pre_adapter_config.py` |
+| RGB-D late fusion, post-adapter | `g1_inspire_head_rgbd_late_fusion_post_adapter_config.py` |
 | RGB + normals, separate views | `g1_inspire_head_3_channel_surface_normals_config.py` |
 | Normals only | `g1_inspire_head_surface_normals_only_config.py` |
 | RGB + normals early fusion | `g1_inspire_head_6_channel_surface_normals_fusion_config.py` |
+| RGB + normals late fusion, pre-adapter | `g1_inspire_head_rgb_surface_normals_late_fusion_pre_adapter_config.py` |
+| RGB + normals late fusion, post-adapter | `g1_inspire_head_rgb_surface_normals_late_fusion_post_adapter_config.py` |
+
+Both late-fusion stages encode the two three-channel sources separately with
+the shared vision tower and use four independent `concat_linear` adapters: one
+for the final visual stream and one for each of Qwen3-VL's three DeepStack
+streams. The stage is part of the saved model contract:
+
+The processor keeps RGB and geometry as two ordered, spatially synchronized
+3-channel branches. Only RGB creates the Qwen image placeholder and destination
+grid; geometry is carried in `late_fusion_pixel_values` and
+`late_fusion_image_grid_thw`, whose grid must match RGB exactly.
+
+- `pre_vision_language_adapter`: `Linear(2048, 1024, bias=True)` on concatenated
+  aligned 1024-wide RGB/geometry ViT tokens, before each pretrained Qwen
+  vision-language adapter (8,392,704 trainable parameters across four adapters).
+- `post_vision_language_adapter`: `Linear(4096, 2048, bias=True)` on concatenated
+  aligned 2048-wide RGB/geometry outputs from the Qwen vision-language adapters,
+  before language-model input or DeepStack injection (33,562,624 trainable
+  parameters across four adapters).
+
+The four adapters serve the final stream plus the exact Qwen3-VL DeepStack
+layers `[5, 11, 17]`. Both stages use the fixed `rgb50_geo50` initialization,
+`W = [0.5I | 0.5I]`, with a trainable bias initialized exactly to zero. There is
+no calibration or initialization sweep. Checkpoints serialize
+`vision_fusion_adapter_bias=true` and `vision_fusion_adapter_bias_init=zeros`
+alongside the stage, dimensions, layers, and initialization scales. Use model
+labels containing `late_fusion_pre_adapter` or `late_fusion_post_adapter` and
+also state `rgbd` or `surface_normals`; do not use an ambiguous `late_fusion`
+label alone.
+
+Recommended unambiguous model-label fragments are:
+
+| Variant | Model-label fragment |
+| --- | --- |
+| RGB-D pre-adapter | `rgbd_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen` |
+| RGB-D post-adapter | `rgbd_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen` |
+| Surface normals pre-adapter | `surface_normals_late_fusion_pre_adapter_4x_linear_rgb50_geo50_patch_frozen` |
+| Surface normals post-adapter | `surface_normals_late_fusion_post_adapter_4x_linear_rgb50_geo50_patch_frozen` |
+
+For the first late-fusion comparison, keep the complete pretrained Qwen
+backbone frozen and train only the four fusion adapters plus the GR00T action
+side:
+
+```text
+--no-tune-llm --no-tune-visual --no-tune-vision-patch-embed \
+--tune-projector --tune-diffusion-model
+```
+
+This freezes Qwen's language layers, pretrained vision-language adapters,
+vision tower, and shared original 3-channel patch embedding while tuning all
+four late-fusion adapters and the action head. The launcher fails closed if a
+late-fusion recipe is combined with `--tune-llm`, `--tune-visual`,
+`--tune-vision-patch-embed`, or nonzero top-LLM-layer tuning.
 
 For a dataset converted with `--color-only`, select the first row only. The
 statistics command above remains unchanged because statistics are calculated

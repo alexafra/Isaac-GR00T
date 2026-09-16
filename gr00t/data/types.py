@@ -112,6 +112,17 @@ class ModalityConfig:
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     action_configs: list[ActionConfig] | None = None
     channel_fusion: list[VideoChannelSource] | None = None  # earlyfusion
+    post_vision_fusion: bool = False
+    """Fuse two separately encoded 3-channel views after the vision encoder.
+
+    The first ``modality_keys`` entry is the primary RGB view and supplies the
+    single image placeholder/grid consumed by the language model. The second
+    entry is its spatially aligned auxiliary view (for example gray depth or
+    surface normals). The model encodes both views with the shared vision tower
+    and fuses their corresponding visual features before language processing.
+    """
+    post_vision_fusion_stage: str | None = None
+    """Whether fusion is before or after Qwen's vision-language adapter."""
 
     @property  # earlyfusion
     def vision_input_channels(self) -> int:  # earlyfusion
@@ -157,3 +168,34 @@ class ModalityConfig:
                 raise ValueError("channel_fusion must cover modality_keys in order and start with RGB channels 0,1,2")  # fmt: skip  # earlyfusion
             if self.vision_input_channels not in (4, 6):  # earlyfusion
                 raise ValueError("channel_fusion must produce exactly 4 or 6 input channels")  # fmt: skip  # earlyfusion
+        if not isinstance(self.post_vision_fusion, bool):
+            raise ValueError(f"post_vision_fusion must be a bool, got {self.post_vision_fusion!r}")
+        if self.post_vision_fusion:
+            if self.channel_fusion is not None:
+                raise ValueError("post_vision_fusion and channel_fusion are mutually exclusive")
+            if len(self.modality_keys) != 2:
+                raise ValueError(
+                    "post_vision_fusion requires exactly two ordered modality_keys: "
+                    "primary RGB first and aligned auxiliary view second"
+                )
+            if self.modality_keys[0] != "ego_view" or self.modality_keys[1] not in {
+                "depth_gray_view",
+                "surface_normals_view",
+            }:
+                raise ValueError(
+                    "post_vision_fusion requires ordered modality_keys "
+                    "['ego_view', 'depth_gray_view'] or "
+                    "['ego_view', 'surface_normals_view']"
+                )
+            if self.post_vision_fusion_stage not in {
+                "pre_vision_language_adapter",
+                "post_vision_language_adapter",
+            }:
+                raise ValueError(
+                    "post_vision_fusion_stage must be 'pre_vision_language_adapter' or "
+                    "'post_vision_language_adapter' when post_vision_fusion is enabled"
+                )
+        elif self.post_vision_fusion_stage is not None:
+            raise ValueError(
+                "post_vision_fusion_stage must be None when post_vision_fusion is disabled"
+            )

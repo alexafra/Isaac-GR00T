@@ -23,11 +23,48 @@ from gr00t.eval.run_gr00t_server import (
     _load_deployment_dataset_contract,
     _load_deployment_task_contract,
     _load_json_modality_configs,
+    _validate_checkpoint_dataset_vision_contract,
     _verify_checkpoint_dataset_path,
     main,
 )
 import gr00t.policy.gr00t_policy as policy_module
 import pytest
+
+
+def _late_fusion_vision_contract(
+    auxiliary_key, stage="pre_vision_language_adapter"
+):
+    input_dim, output_dim = {
+        "pre_vision_language_adapter": (2048, 1024),
+        "post_vision_language_adapter": (4096, 2048),
+    }[stage]
+    parameters_per_adapter = input_dim * output_dim + output_dim
+    return {
+        "version": 2,
+        "mode": "post_vision_late_fusion",
+        "input_channels": 3,
+        "channel_layout": ["ego_view:0", "ego_view:1", "ego_view:2"],
+        "patch_embed_init": "original_rgb",
+        "patch_embed_trainable": False,
+        "wire_video_keys": ["ego_view", auxiliary_key],
+        "post_vision_fusion": {
+            "version": 1,
+            "adapter_type": "concat_linear",
+            "adapter_bias": True,
+            "adapter_bias_init": "zeros",
+            "adapter_count": 4,
+            "deepstack_layers": [5, 11, 17],
+            "adapter_init": "rgb50_geo50",
+            "rgb_init_scale": 0.5,
+            "geometry_init_scale": 0.5,
+            "stage": stage,
+            "adapter_input_dim": input_dim,
+            "adapter_output_dim": output_dim,
+            "parameters_per_adapter": parameters_per_adapter,
+            "total_adapter_parameters": 4 * parameters_per_adapter,
+            "source_keys": ["ego_view", auxiliary_key],
+        },
+    }
 
 
 def _write_tasks(dataset, instructions):
@@ -408,6 +445,129 @@ def test_load_deployment_dataset_contract_accepts_masked_surface_normals_v2(tmp_
     contract = _load_deployment_dataset_contract(dataset)
 
     assert contract["surface_normals_encoding"] == _surface_normals_encoding_v2()
+
+
+@pytest.mark.parametrize(
+    ("auxiliary_key", "encoding_key"),
+    [
+        ("depth_gray_view", "depth_encoding"),
+        ("surface_normals_view", "surface_normals_encoding"),
+    ],
+)
+@pytest.mark.parametrize(
+    "stage", ["pre_vision_language_adapter", "post_vision_language_adapter"]
+)
+def test_late_fusion_checkpoint_contract_binds_aligned_deployment_views(
+    auxiliary_key, encoding_key, stage
+):
+    vision_contract = _late_fusion_vision_contract(auxiliary_key, stage)
+    dataset_contract = {
+        "video_shapes": {
+            "ego_view": [480, 640, 3],
+            auxiliary_key: [480, 640, 3],
+        },
+        encoding_key: {"encoding": "test"},
+    }
+
+    _validate_checkpoint_dataset_vision_contract(vision_contract, dataset_contract)
+
+
+def test_late_fusion_checkpoint_contract_rejects_unaligned_deployment_views():
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    dataset_contract = {
+        "video_shapes": {
+            "ego_view": [480, 640, 3],
+            "depth_gray_view": [240, 320, 3],
+        },
+        "depth_encoding": {"encoding": "test"},
+    }
+
+    with pytest.raises(ValueError, match="identical HWC shapes"):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, dataset_contract)
+
+
+def test_late_fusion_checkpoint_contract_requires_auxiliary_encoding_metadata():
+    vision_contract = _late_fusion_vision_contract("surface_normals_view")
+    dataset_contract = {
+        "video_shapes": {
+            "ego_view": [480, 640, 3],
+            "surface_normals_view": [480, 640, 3],
+        }
+    }
+
+    with pytest.raises(ValueError, match="surface_normals_encoding metadata"):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, dataset_contract)
+
+
+def test_late_fusion_checkpoint_contract_rejects_legacy_fusion_stage_name():
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    vision_contract["post_vision_fusion"]["stage"] = "pre_merger"
+
+    with pytest.raises(ValueError, match="must declare stage"):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, {})
+
+
+def test_late_fusion_checkpoint_contract_rejects_stage_dimension_mismatch():
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    vision_contract["post_vision_fusion"]["stage"] = (
+        "post_vision_language_adapter"
+    )
+
+    with pytest.raises(ValueError, match="architecture mismatch for adapter_input_dim"):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, {})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adapter_bias", False),
+        ("adapter_bias_init", "ones"),
+        ("deepstack_layers", [4, 10, 16]),
+        ("parameters_per_adapter", 0),
+        ("total_adapter_parameters", 0),
+    ],
+)
+def test_late_fusion_checkpoint_contract_rejects_architecture_metadata_mismatch(
+    field, value
+):
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    vision_contract["post_vision_fusion"][field] = value
+
+    with pytest.raises(ValueError, match=f"architecture mismatch for {field}"):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, {})
+
+
+def test_late_fusion_checkpoint_contract_requires_frozen_patch_embedding():
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    vision_contract["patch_embed_trainable"] = True
+
+    with pytest.raises(ValueError, match="patch_embed_trainable=false"):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, {})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("adapter_init", "rgb90_geo10", "adapter_init 'rgb50_geo50'"),
+        ("rgb_init_scale", 0.9, "RGB=0.5 and geometry=0.5"),
+        ("geometry_init_scale", 0.1, "RGB=0.5 and geometry=0.5"),
+    ],
+)
+def test_late_fusion_checkpoint_contract_rejects_another_initialization(
+    field, value, message
+):
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    vision_contract["post_vision_fusion"][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        _validate_checkpoint_dataset_vision_contract(vision_contract, {})
+
+
+def test_existing_vision_modes_keep_existing_dataset_validation_behavior():
+    _validate_checkpoint_dataset_vision_contract(
+        {"version": 1, "mode": "early_channel_fusion"},
+        {},
+    )
 
 
 def test_surface_normals_contract_preserves_camera_calibration_identity(tmp_path):

@@ -570,6 +570,21 @@ class Gr00tN1d7(PreTrainedModel):
             tune_vision_patch_embed=config.tune_vision_patch_embed,  # earlyfusion
             vision_input_channels=config.vision_input_channels,  # earlyfusion
             vision_patch_embed_init=config.vision_patch_embed_init,  # earlyfusion
+            vision_fusion_mode=config.vision_fusion_mode,
+            vision_fusion_version=config.vision_fusion_version,
+            vision_fusion_stage=config.vision_fusion_stage,
+            vision_fusion_adapter_type=config.vision_fusion_adapter_type,
+            vision_fusion_adapter_bias=config.vision_fusion_adapter_bias,
+            vision_fusion_adapter_bias_init=config.vision_fusion_adapter_bias_init,
+            vision_fusion_adapter_count=config.vision_fusion_adapter_count,
+            vision_fusion_deepstack_layers=config.vision_fusion_deepstack_layers,
+            vision_fusion_adapter_input_dim=config.vision_fusion_adapter_input_dim,
+            vision_fusion_adapter_output_dim=config.vision_fusion_adapter_output_dim,
+            vision_fusion_source_keys=config.vision_fusion_source_keys,
+            vision_fusion_adapter_init=config.vision_fusion_adapter_init,
+            vision_fusion_rgb_init_scale=config.vision_fusion_rgb_init_scale,
+            vision_fusion_geometry_init_scale=config.vision_fusion_geometry_init_scale,
+            tune_vision_fusion_adapters=config.tune_vision_fusion_adapters,
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,
@@ -589,6 +604,7 @@ class Gr00tN1d7(PreTrainedModel):
             transformers_loading_kwargs=transformers_loading_kwargs,
             vision_input_channels=config.vision_input_channels,  # earlyfusion
             vision_channel_layout=config.vision_channel_layout,  # earlyfusion
+            post_vision_fusion=config.vision_fusion_mode == "post_vision_late_fusion",
         )
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:

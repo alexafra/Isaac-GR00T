@@ -97,6 +97,46 @@ def _early_fusion_contract(modality_configs) -> tuple[int, list[str] | None]:  #
     return channels, list(layout) if layout else None  # earlyfusion
 
 
+def _post_vision_fusion_contract(modality_configs) -> bool:
+    """Return the common post-vision fusion mode for all configured embodiments."""
+
+    contracts = {
+        (bool(video.post_vision_fusion), video.post_vision_fusion_stage)
+        for config in modality_configs.values()
+        if (video := config.get("video")) is not None
+    }
+    if len(contracts) > 1:
+        raise ValueError(
+            f"All modalities must share one post-vision fusion contract; got {sorted(contracts)}"
+        )
+    enabled, _ = next(iter(contracts), (False, None))
+    return enabled
+
+
+def _process_late_fusion_auxiliary_images(
+    image_processor,
+    images: list[Image.Image],
+    primary_grid_thw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Process the aligned auxiliary branch without creating language placeholders."""
+
+    auxiliary = image_processor(images=images, return_tensors="pt")
+    try:
+        auxiliary_pixels = auxiliary["pixel_values"]
+        auxiliary_grid_thw = auxiliary["image_grid_thw"]
+    except KeyError as error:
+        raise ValueError(
+            "The Qwen image processor did not return pixel_values and image_grid_thw "
+            "for the post-vision fusion auxiliary branch"
+        ) from error
+    if not torch.equal(primary_grid_thw, auxiliary_grid_thw):
+        raise ValueError(
+            "Post-vision fusion requires paired primary and auxiliary images with "
+            "identical processed image_grid_thw values"
+        )
+    return auxiliary_pixels, auxiliary_grid_thw
+
+
 def _surface_normals_views(
     modality_configs: dict[str, dict[str, ModalityConfig]],
 ) -> list[str]:
@@ -233,6 +273,7 @@ class Gr00tN1d7DataCollator:
         transformers_loading_kwargs: dict = {},
         vision_input_channels: int = 3,  # earlyfusion
         vision_channel_layout: list[str] | None = None,  # earlyfusion
+        post_vision_fusion: bool = False,
     ):
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
@@ -242,6 +283,7 @@ class Gr00tN1d7DataCollator:
         self.model_name = model_name
         self.vision_input_channels = vision_input_channels  # earlyfusion
         self.vision_channel_layout = vision_channel_layout  # earlyfusion
+        self.post_vision_fusion = post_vision_fusion
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
@@ -253,6 +295,7 @@ class Gr00tN1d7DataCollator:
                 # Handle vlm_content specially - extract text and images
                 text_list = []
                 image_inputs = []
+                late_fusion_image_inputs = []
                 for v in values:
                     if v.get("vision_input_channels", 3) != self.vision_input_channels:  # fmt: skip  # earlyfusion
                         raise ValueError("VLM images do not match the model vision-input channels")  # fmt: skip  # earlyfusion
@@ -261,6 +304,23 @@ class Gr00tN1d7DataCollator:
                     text_list += curr_text_list
                     curr_image_inputs = v["images"]
                     image_inputs += curr_image_inputs
+                    auxiliary_images = v.get("late_fusion_images")
+                    if self.post_vision_fusion:
+                        if auxiliary_images is None:
+                            raise ValueError(
+                                "Post-vision fusion VLM content is missing late_fusion_images"
+                            )
+                        if len(curr_image_inputs) != len(auxiliary_images):
+                            raise ValueError(
+                                "Post-vision fusion requires one aligned auxiliary image for "
+                                "every primary image"
+                            )
+                        late_fusion_image_inputs += auxiliary_images
+                    elif auxiliary_images is not None:
+                        raise ValueError(
+                            "Received late_fusion_images for a processor without the "
+                            "post-vision fusion contract"
+                        )
 
                 vlm_inputs = self.processor(
                     text=text_list,
@@ -271,6 +331,14 @@ class Gr00tN1d7DataCollator:
                 )
                 for k, v in vlm_inputs.items():
                     batch[k] = v
+                if self.post_vision_fusion:
+                    auxiliary_pixels, auxiliary_grid_thw = _process_late_fusion_auxiliary_images(
+                        self.processor.image_processor,
+                        late_fusion_image_inputs,
+                        vlm_inputs["image_grid_thw"],
+                    )
+                    batch["late_fusion_pixel_values"] = auxiliary_pixels
+                    batch["late_fusion_image_grid_thw"] = auxiliary_grid_thw
             elif key in (
                 "pixel_values",
                 "image_grid_thw",
@@ -413,6 +481,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             transformers_loading_kwargs=transformers_loading_kwargs,
             vision_input_channels=_early_fusion_contract(self.modality_configs)[0],  # earlyfusion
             vision_channel_layout=_early_fusion_contract(self.modality_configs)[1],  # earlyfusion
+            post_vision_fusion=_post_vision_fusion_contract(self.modality_configs),
         )
         self.train()
 
@@ -593,8 +662,22 @@ class Gr00tN1d7Processor(BaseProcessor):
             # Rearrange (B, T, V, H, W, C) → (B, T*V, C, H, W) for torchvision
             images_perm = images.permute(0, 1, 2, 5, 3, 4).reshape(B, T * V, img_C, img_H, img_W)
             transformed_images = self.eval_image_transform(images_perm).numpy()
-        if video_config.channel_fusion:  # earlyfusion
-            transformed_grid = torch.from_numpy(transformed_images).reshape(B, T, V, -1, transformed_images.shape[-2], transformed_images.shape[-1])  # fmt: skip  # earlyfusion
+        late_fusion_images = None
+        if video_config.post_vision_fusion or video_config.channel_fusion:
+            transformed_grid = torch.from_numpy(transformed_images).reshape(
+                B,
+                T,
+                V,
+                -1,
+                transformed_images.shape[-2],
+                transformed_images.shape[-1],
+            )
+        if video_config.post_vision_fusion:
+            if V != 2:
+                raise ValueError(f"Post-vision fusion requires exactly two views; received {V}")
+            transformed_images = transformed_grid[:, :, 0].numpy()
+            late_fusion_images = transformed_grid[:, :, 1].numpy()
+        elif video_config.channel_fusion:  # earlyfusion
             transformed_images = torch.cat(  # fmt: skip  # earlyfusion
                 [  # earlyfusion
                     transformed_grid[:, :, index, list(source.channels)]  # earlyfusion
@@ -609,15 +692,33 @@ class Gr00tN1d7Processor(BaseProcessor):
             for lang in observation[language_key]
         ]
 
-        texts, all_images = [], []
+        texts, all_images, all_late_fusion_images = [], [], []
         for i in range(B):
-            vlm_inputs = self._apply_vlm_processing(transformed_images[i], language[i])
+            sample_auxiliary = None if late_fusion_images is None else late_fusion_images[i]
+            if sample_auxiliary is None:
+                # Preserve the legacy two-argument call for existing wrappers/tests.
+                vlm_inputs = self._apply_vlm_processing(transformed_images[i], language[i])
+            else:
+                vlm_inputs = self._apply_vlm_processing(
+                    transformed_images[i],
+                    language[i],
+                    late_fusion_images=sample_auxiliary,
+                )
             vc = vlm_inputs["vlm_content"]
             texts.append(vc["text"])
             all_images.extend(vc["images"])
+            all_late_fusion_images.extend(vc.get("late_fusion_images", []))
         tokenized = self.processor(text=texts, images=all_images, return_tensors="pt", padding=True, **_vision_processor_kwargs(video_config.vision_input_channels))  # fmt: skip  # earlyfusion
         for k, v in tokenized.items():
             transformed_observation[k] = v
+        if video_config.post_vision_fusion:
+            auxiliary_pixels, auxiliary_grid_thw = _process_late_fusion_auxiliary_images(
+                self.processor.image_processor,
+                all_late_fusion_images,
+                tokenized["image_grid_thw"],
+            )
+            transformed_observation["late_fusion_pixel_values"] = auxiliary_pixels
+            transformed_observation["late_fusion_image_grid_thw"] = auxiliary_grid_thw
 
         embodiment_id = (
             torch.ones(B, dtype=torch.int32) * self.embodiment_id_mapping[embodiment_tag.value]
@@ -639,7 +740,12 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         return BatchFeature(transformed_observation)
 
-    def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
+    def _apply_vlm_processing(
+        self,
+        images: np.ndarray,
+        language: str,
+        late_fusion_images: np.ndarray | None = None,
+    ) -> BatchFeature:
         """
         Args:
             batch:
@@ -647,6 +753,16 @@ class Gr00tN1d7Processor(BaseProcessor):
         Returns: vlm_content format for collation
         """
         vlm_images = list(images) if images.shape[1] != 3 else [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images]  # fmt: skip  # earlyfusion
+        auxiliary_vlm_images = None
+        if late_fusion_images is not None:
+            if images.shape != late_fusion_images.shape or images.shape[1] != 3:
+                raise ValueError(
+                    "Post-vision fusion requires aligned primary and auxiliary image arrays "
+                    "with identical (T, 3, H, W) shapes"
+                )
+            auxiliary_vlm_images = [
+                Image.fromarray(np.transpose(image, (1, 2, 0))) for image in late_fusion_images
+            ]
 
         # Create conversation with images and text
         conversation = [
@@ -665,14 +781,15 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
 
         # Return vlm_content format for collation
-        return {  # fmt: skip  # earlyfusion
-            "vlm_content": {
-                "text": text,
-                "images": vlm_images,  # earlyfusion
-                "vision_input_channels": images.shape[1],  # earlyfusion
-                "conversation": conversation,
-            }
+        vlm_content = {
+            "text": text,
+            "images": vlm_images,  # earlyfusion
+            "vision_input_channels": images.shape[1],  # earlyfusion
+            "conversation": conversation,
         }
+        if auxiliary_vlm_images is not None:
+            vlm_content["late_fusion_images"] = auxiliary_vlm_images
+        return {"vlm_content": vlm_content}
 
     def __call__(
         self,
@@ -785,6 +902,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             image_transform=image_transform,
             language=language,
             channel_fusion=video_config.channel_fusion,  # earlyfusion
+            post_vision_fusion=video_config.post_vision_fusion,
         )
 
         transformed_inputs = {
@@ -807,6 +925,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         image_transform: transforms.Compose | A.Compose,
         language: str,
         channel_fusion: list[Any] | None = None,  # earlyfusion
+        post_vision_fusion: bool = False,
     ):
         temporal_stacked_images = {}
 
@@ -830,8 +949,11 @@ class Gr00tN1d7Processor(BaseProcessor):
                 )
                 temporal_stacked_images[view] = torch.stack(transformed_images)  # (T, C, H, W)
         else:
-            if channel_fusion and self.training:  # earlyfusion
-                raise ValueError("Early fusion training requires synchronized albumentations transforms")  # fmt: skip  # earlyfusion
+            if (channel_fusion or post_vision_fusion) and self.training:  # earlyfusion
+                raise ValueError(
+                    "Early and post-vision fusion training require synchronized "
+                    "albumentations transforms"
+                )
             if masks is not None:
                 raise ValueError(
                     "Mask transforms require albumentations. Set use_albumentations_transforms=True."
@@ -854,21 +976,35 @@ class Gr00tN1d7Processor(BaseProcessor):
             assert v.dtype == torch.uint8, f"{v} is not a uint8 tensor"
             assert v.shape[1] == 3, f"{v} is not a 3 channel tensor"
 
-        stacked_images = (
-            torch.stack([temporal_stacked_images[view] for view in image_keys], dim=1)
-            .flatten(0, 1)
-            .numpy()
-        )  # (T*V, C, H, W), processor expects numpy array
-        if channel_fusion:  # earlyfusion
-            stacked_images = torch.cat(  # earlyfusion
-                [  # earlyfusion
-                    temporal_stacked_images[source.key][:, list(source.channels)]  # earlyfusion
-                    for source in channel_fusion  # earlyfusion
-                ],  # earlyfusion
-                dim=1,  # fmt: skip  # earlyfusion
-            ).numpy()  # earlyfusion
+        late_fusion_images = None
+        if post_vision_fusion:
+            primary_key, auxiliary_key = image_keys
+            stacked_images = temporal_stacked_images[primary_key].numpy()
+            late_fusion_images = temporal_stacked_images[auxiliary_key].numpy()
+        else:
+            stacked_images = (
+                torch.stack([temporal_stacked_images[view] for view in image_keys], dim=1)
+                .flatten(0, 1)
+                .numpy()
+            )  # (T*V, C, H, W), processor expects numpy array
+            if channel_fusion:  # earlyfusion
+                stacked_images = torch.cat(  # earlyfusion
+                    [  # earlyfusion
+                        temporal_stacked_images[source.key][:, list(source.channels)]  # earlyfusion
+                        for source in channel_fusion  # earlyfusion
+                    ],  # earlyfusion
+                    dim=1,  # fmt: skip  # earlyfusion
+                ).numpy()  # earlyfusion
 
-        vlm_inputs = self._apply_vlm_processing(stacked_images, language)
+        if late_fusion_images is None:
+            # Preserve the legacy two-argument call for existing wrappers/tests.
+            vlm_inputs = self._apply_vlm_processing(stacked_images, language)
+        else:
+            vlm_inputs = self._apply_vlm_processing(
+                stacked_images,
+                language,
+                late_fusion_images=late_fusion_images,
+            )
         return vlm_inputs
 
     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
@@ -981,12 +1117,15 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         # Directly override other processor kwargs
         if kwargs:
-            # Replace inactive pretrained modalities only for a fused shared vision stem.  # earlyfusion
+            # A fused model has one model-wide vision contract, so discard inactive
+            # pretrained modalities instead of mixing incompatible processor modes.
             modality_configs = kwargs.pop("modality_configs", {})
             fusion_override = any(  # earlyfusion
                 getattr(video, "channel_fusion", None)  # earlyfusion
+                or getattr(video, "post_vision_fusion", False)
                 or (  # earlyfusion
-                    isinstance(video, dict) and video.get("channel_fusion")  # earlyfusion
+                    isinstance(video, dict)
+                    and (video.get("channel_fusion") or video.get("post_vision_fusion"))
                 )  # fmt: skip  # earlyfusion
                 for config_override in modality_configs.values()  # earlyfusion
                 if (video := config_override.get("video")) is not None  # earlyfusion
@@ -995,7 +1134,9 @@ class Gr00tN1d7Processor(BaseProcessor):
                 processor_kwargs["modality_configs"] = modality_configs  # earlyfusion
                 processor_kwargs["statistics"] = {  # earlyfusion
                     embodiment_tag: statistics  # earlyfusion
-                    for embodiment_tag, statistics in processor_kwargs["statistics"].items()  # earlyfusion
+                    for embodiment_tag, statistics in processor_kwargs[
+                        "statistics"
+                    ].items()  # earlyfusion
                     if embodiment_tag in modality_configs  # earlyfusion
                 }  # earlyfusion
             else:  # earlyfusion

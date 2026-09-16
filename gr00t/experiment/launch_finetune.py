@@ -27,6 +27,16 @@ from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.experiment.experiment import run
 
 
+_POST_VISION_LATE_FUSION = "post_vision_late_fusion"
+_PRE_VISION_LANGUAGE_ADAPTER = "pre_vision_language_adapter"
+_POST_VISION_LANGUAGE_ADAPTER = "post_vision_language_adapter"
+_VISION_FUSION_DEEPSTACK_LAYERS = [5, 11, 17]
+_VISION_FUSION_STAGE_DIMS = {
+    _PRE_VISION_LANGUAGE_ADAPTER: (2048, 1024),
+    _POST_VISION_LANGUAGE_ADAPTER: (4096, 2048),
+}
+
+
 # Make sure the user provided modality config is registered.
 def load_modality_config(modality_config_path: str):
     import importlib
@@ -39,6 +49,78 @@ def load_modality_config(modality_config_path: str):
         print(f"Loaded modality config: {path}")
     else:
         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
+
+
+def configure_vision_input_contract(
+    config,
+    embodiment_tag: str,
+    video_config,
+    vision_patch_embed_init: str | None,
+) -> None:
+    """Map the selected video recipe onto the serialized model vision contract."""
+
+    if vision_patch_embed_init is not None and not video_config.channel_fusion:  # fmt: skip  # earlyfusion
+        raise ValueError(
+            "--vision-patch-embed-init is only valid for early-fusion modality configs"
+        )
+    if video_config.channel_fusion:  # earlyfusion
+        config.data.modality_configs = {
+            embodiment_tag: config.data.modality_configs[embodiment_tag]
+        }
+        config.model.vision_channel_layout = video_config.vision_channel_layout  # earlyfusion
+        config.model.vision_input_channels = video_config.vision_input_channels  # earlyfusion
+        default_patch_init = "rgb_mean" if config.model.vision_input_channels == 4 else "zeros"
+        config.model.vision_patch_embed_init = vision_patch_embed_init or default_patch_init
+    elif video_config.post_vision_fusion:
+        # Post-vision fusion is one model-wide graph contract. Remove inactive
+        # pretrained embodiment recipes so the processor cannot mix fused and
+        # non-fused batches, while retaining two separate 3-channel sources.
+        config.data.modality_configs = {
+            embodiment_tag: config.data.modality_configs[embodiment_tag]
+        }
+        config.model.vision_input_channels = 3
+        config.model.vision_channel_layout = [
+            f"{video_config.modality_keys[0]}:{channel}" for channel in range(3)
+        ]
+        config.model.vision_patch_embed_init = "original_rgb"
+        config.model.vision_fusion_mode = _POST_VISION_LATE_FUSION
+        config.model.vision_fusion_version = 1
+        config.model.vision_fusion_stage = video_config.post_vision_fusion_stage
+        config.model.vision_fusion_adapter_type = "concat_linear"
+        config.model.vision_fusion_adapter_count = 4
+        config.model.vision_fusion_deepstack_layers = list(_VISION_FUSION_DEEPSTACK_LAYERS)
+        (
+            config.model.vision_fusion_adapter_input_dim,
+            config.model.vision_fusion_adapter_output_dim,
+        ) = _VISION_FUSION_STAGE_DIMS[video_config.post_vision_fusion_stage]
+        config.model.vision_fusion_source_keys = list(video_config.modality_keys)
+        config.model.vision_fusion_adapter_init = "rgb50_geo50"
+        config.model.vision_fusion_rgb_init_scale = 0.5
+        config.model.vision_fusion_geometry_init_scale = 0.5
+        config.model.vision_fusion_adapter_bias = True
+        config.model.vision_fusion_adapter_bias_init = "zeros"
+        config.model.tune_vision_fusion_adapters = True
+
+
+def validate_vision_trainability_contract(config, video_config) -> None:
+    """Reject trainability flags that would make a late-fusion comparison ambiguous."""
+
+    if not video_config.post_vision_fusion:
+        return
+    incompatible = {
+        "tune_llm": config.model.tune_llm,
+        "tune_visual": config.model.tune_visual,
+        "tune_vision_patch_embed": config.model.tune_vision_patch_embed,
+        "tune_top_llm_layers": config.model.tune_top_llm_layers != 0,
+    }
+    enabled = [name for name, is_enabled in incompatible.items() if is_enabled]
+    if enabled:
+        raise ValueError(
+            "Late fusion requires the pretrained Qwen backbone and shared 3-channel "
+            "patch embedding to remain frozen; disable " + ", ".join(enabled)
+        )
+    if not config.model.tune_vision_fusion_adapters:
+        raise ValueError("Late fusion requires tune_vision_fusion_adapters=True")
 
 
 if __name__ == "__main__":
@@ -75,18 +157,17 @@ if __name__ == "__main__":
     config.load_config_path = None
 
     video_config = config.data.modality_configs[embodiment_tag]["video"]  # earlyfusion
-    if ft_config.vision_patch_embed_init is not None and not video_config.channel_fusion:  # fmt: skip  # earlyfusion
-        raise ValueError("--vision-patch-embed-init is only valid for early-fusion modality configs")  # earlyfusion
-    if video_config.channel_fusion:  # earlyfusion
-        config.data.modality_configs = {embodiment_tag: config.data.modality_configs[embodiment_tag]}  # fmt: skip  # earlyfusion
-        config.model.vision_channel_layout = video_config.vision_channel_layout  # earlyfusion
-        config.model.vision_input_channels = video_config.vision_input_channels  # earlyfusion
-        default_patch_init = "rgb_mean" if config.model.vision_input_channels == 4 else "zeros"  # fmt: skip  # earlyfusion
-        config.model.vision_patch_embed_init = ft_config.vision_patch_embed_init or default_patch_init  # fmt: skip  # earlyfusion
+    configure_vision_input_contract(
+        config,
+        embodiment_tag,
+        video_config,
+        ft_config.vision_patch_embed_init,
+    )
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
     config.model.tune_vision_patch_embed = ft_config.tune_vision_patch_embed  # earlyfusion
+    validate_vision_trainability_contract(config, video_config)
     if config.model.vision_input_channels == 6 and config.model.vision_patch_embed_init == "zeros" and not config.model.tune_vision_patch_embed:  # fmt: skip  # earlyfusion
         raise ValueError("6-channel zero-initialized normals require --tune-vision-patch-embed")  # fmt: skip  # earlyfusion
     config.model.tune_projector = ft_config.tune_projector

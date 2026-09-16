@@ -50,6 +50,25 @@ class Gr00tN1d7Config(PretrainedConfig):
         default_factory=lambda: ["ego_view:0", "ego_view:1", "ego_view:2"]  # earlyfusion
     )  # earlyfusion
     vision_patch_embed_init: str = "original_rgb"  # earlyfusion
+    # Optional late fusion. ``none`` preserves the original N1.7 graph exactly.
+    # The opt-in mode encodes two aligned three-channel images with the shared
+    # Qwen3-VL vision tower. The serialized stage selects adapters immediately
+    # before or after Qwen's pretrained vision-to-language projection.
+    vision_fusion_mode: str = "none"
+    vision_fusion_version: int = 1
+    vision_fusion_stage: str = "pre_vision_language_adapter"
+    vision_fusion_adapter_type: str = "concat_linear"
+    vision_fusion_adapter_bias: bool = True
+    vision_fusion_adapter_bias_init: str = "zeros"
+    vision_fusion_adapter_count: int = 4
+    vision_fusion_deepstack_layers: list[int] = field(default_factory=lambda: [5, 11, 17])
+    vision_fusion_adapter_input_dim: int = 2048
+    vision_fusion_adapter_output_dim: int = 1024
+    vision_fusion_source_keys: list[str] = field(default_factory=list)
+    vision_fusion_adapter_init: str = "rgb50_geo50"
+    vision_fusion_rgb_init_scale: float = 0.5
+    vision_fusion_geometry_init_scale: float = 0.5
+    tune_vision_fusion_adapters: bool = True
     select_layer: int = 12
     reproject_vision: bool = False
     use_flash_attention: bool = True

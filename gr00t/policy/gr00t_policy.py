@@ -62,9 +62,40 @@ _VISION_PATCH_INITS = {  # earlyfusion
     6: frozenset({"zeros", "rgb_mean"}),  # earlyfusion
 }  # earlyfusion
 
+_VISION_FUSION_NONE = "none"
+_POST_VISION_LATE_FUSION = "post_vision_late_fusion"
+_POST_VISION_FUSION_VERSION = 1
+_POST_VISION_ADAPTER_TYPE = "concat_linear"
+_POST_VISION_ADAPTER_COUNT = 4
+_POST_VISION_ADAPTER_INIT = "rgb50_geo50"
+_POST_VISION_RGB_INIT_SCALE = 0.5
+_POST_VISION_GEOMETRY_INIT_SCALE = 0.5
+_POST_VISION_ADAPTER_BIAS = True
+_POST_VISION_ADAPTER_BIAS_INIT = "zeros"
+_POST_VISION_DEEPSTACK_LAYERS = [5, 11, 17]
+_POST_VISION_AUXILIARY_KEYS = frozenset({"depth_gray_view", "surface_normals_view"})
+_POST_VISION_ADAPTER_NAMES = ("final", "deepstack_0", "deepstack_1", "deepstack_2")
+_POST_VISION_STAGE_SPECS = {
+    "pre_vision_language_adapter": {"input_dim": 2048, "output_dim": 1024},
+    "post_vision_language_adapter": {"input_dim": 4096, "output_dim": 2048},
+}
+
 
 def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> dict[str, Any]:  # fmt: skip  # earlyfusion
     fusion = getattr(video_config, "channel_fusion", None)  # earlyfusion
+    post_vision_fusion = getattr(video_config, "post_vision_fusion", False)
+    if not isinstance(post_vision_fusion, bool):
+        raise ValueError(
+            f"Processor post_vision_fusion must be a boolean, got {post_vision_fusion!r}"
+        )
+    fusion_mode = getattr(model_config, "vision_fusion_mode", _VISION_FUSION_NONE)
+    if fusion_mode not in {_VISION_FUSION_NONE, _POST_VISION_LATE_FUSION}:
+        raise ValueError(f"Unsupported checkpoint vision_fusion_mode: {fusion_mode!r}")
+    if post_vision_fusion != (fusion_mode == _POST_VISION_LATE_FUSION):
+        raise ValueError(
+            "Checkpoint/processor post-vision fusion mismatch: "
+            f"checkpoint={fusion_mode!r}, processor={post_vision_fusion!r}"
+        )
     layout = _RGB_VISION_LAYOUT.copy()  # earlyfusion
     if fusion:  # earlyfusion
         layout = [  # fmt: skip  # earlyfusion
@@ -83,7 +114,246 @@ def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> d
         raise ValueError(f"Early-fusion model/processor layout mismatch: model={model_layout!r}, processor={layout!r}")  # fmt: skip  # earlyfusion
     if patch_init not in allowed_inits:  # earlyfusion
         raise ValueError(f"Early-fusion patch initialization mismatch: got {patch_init!r}, allowed {sorted(allowed_inits)!r}")  # fmt: skip  # earlyfusion
+    if fusion_mode == _POST_VISION_LATE_FUSION:
+        wire_keys = list(video_config.modality_keys)
+        if fusion:
+            raise ValueError("Post-vision late fusion cannot also use channel_fusion")
+        if (
+            len(wire_keys) != 2
+            or wire_keys[0] != "ego_view"
+            or wire_keys[1] not in _POST_VISION_AUXILIARY_KEYS
+        ):
+            raise ValueError(
+                "Post-vision late fusion requires ordered wire keys "
+                "['ego_view', 'depth_gray_view'] or "
+                "['ego_view', 'surface_normals_view']; "
+                f"got {wire_keys!r}"
+            )
+        source_keys = getattr(model_config, "vision_fusion_source_keys", None)
+        normalized_source_keys = (
+            list(source_keys) if isinstance(source_keys, (list, tuple)) else source_keys
+        )
+        if normalized_source_keys != wire_keys:
+            raise ValueError(
+                "Post-vision checkpoint/processor source-key mismatch: "
+                f"checkpoint={source_keys!r}, processor={wire_keys!r}"
+            )
+        version = getattr(model_config, "vision_fusion_version", None)
+        adapter_type = getattr(model_config, "vision_fusion_adapter_type", None)
+        adapter_bias = getattr(model_config, "vision_fusion_adapter_bias", None)
+        adapter_bias_init = getattr(
+            model_config, "vision_fusion_adapter_bias_init", None
+        )
+        adapter_count = getattr(model_config, "vision_fusion_adapter_count", None)
+        deepstack_layers = getattr(
+            model_config, "vision_fusion_deepstack_layers", None
+        )
+        adapter_input_dim = getattr(
+            model_config, "vision_fusion_adapter_input_dim", None
+        )
+        adapter_output_dim = getattr(
+            model_config, "vision_fusion_adapter_output_dim", None
+        )
+        adapter_init = getattr(model_config, "vision_fusion_adapter_init", None)
+        rgb_init_scale = getattr(model_config, "vision_fusion_rgb_init_scale", None)
+        geometry_init_scale = getattr(
+            model_config, "vision_fusion_geometry_init_scale", None
+        )
+        fusion_stage = getattr(model_config, "vision_fusion_stage", None)
+        processor_fusion_stage = getattr(
+            video_config, "post_vision_fusion_stage", None
+        )
+        if processor_fusion_stage != fusion_stage:
+            raise ValueError(
+                "Post-vision checkpoint/processor fusion-stage mismatch: "
+                f"checkpoint={fusion_stage!r}, processor={processor_fusion_stage!r}"
+            )
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != _POST_VISION_FUSION_VERSION
+        ):
+            raise ValueError(
+                "Post-vision checkpoint fusion version mismatch: "
+                f"got {version!r}, expected {_POST_VISION_FUSION_VERSION}"
+            )
+        if adapter_type != _POST_VISION_ADAPTER_TYPE:
+            raise ValueError(
+                "Post-vision checkpoint adapter type mismatch: "
+                f"got {adapter_type!r}, expected {_POST_VISION_ADAPTER_TYPE!r}"
+            )
+        if adapter_bias is not _POST_VISION_ADAPTER_BIAS:
+            raise ValueError(
+                "Post-vision checkpoint adapter bias mismatch: "
+                f"got {adapter_bias!r}, expected {_POST_VISION_ADAPTER_BIAS!r}"
+            )
+        if adapter_bias_init != _POST_VISION_ADAPTER_BIAS_INIT:
+            raise ValueError(
+                "Post-vision checkpoint adapter bias initialization mismatch: "
+                f"got {adapter_bias_init!r}, expected {_POST_VISION_ADAPTER_BIAS_INIT!r}"
+            )
+        if (
+            isinstance(adapter_count, bool)
+            or not isinstance(adapter_count, int)
+            or adapter_count != _POST_VISION_ADAPTER_COUNT
+        ):
+            raise ValueError(
+                "Post-vision checkpoint adapter count mismatch: "
+                f"got {adapter_count!r}, expected {_POST_VISION_ADAPTER_COUNT}"
+            )
+        if deepstack_layers != _POST_VISION_DEEPSTACK_LAYERS:
+            raise ValueError(
+                "Post-vision checkpoint DeepStack layers mismatch: "
+                f"got {deepstack_layers!r}, expected {_POST_VISION_DEEPSTACK_LAYERS!r}"
+            )
+        if adapter_init != _POST_VISION_ADAPTER_INIT:
+            raise ValueError(
+                "Post-vision checkpoint adapter initialization mismatch: "
+                f"got {adapter_init!r}, expected {_POST_VISION_ADAPTER_INIT!r}"
+            )
+        if (
+            isinstance(rgb_init_scale, bool)
+            or not isinstance(rgb_init_scale, Real)
+            or float(rgb_init_scale) != _POST_VISION_RGB_INIT_SCALE
+        ):
+            raise ValueError(
+                "Post-vision checkpoint RGB initialization scale mismatch: "
+                f"got {rgb_init_scale!r}, expected {_POST_VISION_RGB_INIT_SCALE}"
+            )
+        if (
+            isinstance(geometry_init_scale, bool)
+            or not isinstance(geometry_init_scale, Real)
+            or float(geometry_init_scale) != _POST_VISION_GEOMETRY_INIT_SCALE
+        ):
+            raise ValueError(
+                "Post-vision checkpoint geometry initialization scale mismatch: "
+                f"got {geometry_init_scale!r}, expected {_POST_VISION_GEOMETRY_INIT_SCALE}"
+            )
+        if fusion_stage not in _POST_VISION_STAGE_SPECS:
+            raise ValueError(
+                "Post-vision checkpoint fusion stage mismatch: "
+                f"got {fusion_stage!r}, expected one of "
+                f"{sorted(_POST_VISION_STAGE_SPECS)!r}"
+            )
+        stage_spec = _POST_VISION_STAGE_SPECS[fusion_stage]
+        serialized_dimensions = (adapter_input_dim, adapter_output_dim)
+        expected_dimensions = (stage_spec["input_dim"], stage_spec["output_dim"])
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in serialized_dimensions
+            )
+            or serialized_dimensions != expected_dimensions
+        ):
+            raise ValueError(
+                "Post-vision checkpoint adapter dimensions mismatch for "
+                f"{fusion_stage!r}: got {serialized_dimensions!r}, "
+                f"expected {expected_dimensions!r}"
+            )
+        patch_embed_trainable = getattr(
+            model_config, "tune_vision_patch_embed", False
+        )
+        if patch_embed_trainable is not False:
+            raise ValueError(
+                "Post-vision late fusion requires patch_embed_trainable=False; "
+                f"got {patch_embed_trainable!r}"
+            )
+        parameters_per_adapter = adapter_input_dim * adapter_output_dim + adapter_output_dim
+        return {
+            "version": 2,
+            "mode": _POST_VISION_LATE_FUSION,
+            "input_channels": channels,
+            "channel_layout": layout,
+            "patch_embed_init": patch_init,
+            "patch_embed_trainable": False,
+            "wire_video_keys": wire_keys,
+            "post_vision_fusion": {
+                "version": version,
+                "adapter_type": adapter_type,
+                "adapter_bias": adapter_bias,
+                "adapter_bias_init": adapter_bias_init,
+                "adapter_count": adapter_count,
+                "deepstack_layers": list(deepstack_layers),
+                "adapter_init": adapter_init,
+                "rgb_init_scale": float(rgb_init_scale),
+                "geometry_init_scale": float(geometry_init_scale),
+                "stage": fusion_stage,
+                "adapter_input_dim": adapter_input_dim,
+                "adapter_output_dim": adapter_output_dim,
+                "parameters_per_adapter": parameters_per_adapter,
+                "total_adapter_parameters": (
+                    _POST_VISION_ADAPTER_COUNT * parameters_per_adapter
+                ),
+                "source_keys": normalized_source_keys,
+            },
+        }
     return {"version": 1, "mode": "early_channel_fusion" if fusion else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": patch_init, "wire_video_keys": list(video_config.modality_keys)}  # fmt: skip  # earlyfusion
+
+
+def _validate_post_vision_fusion_runtime(model: Any, contract: dict[str, Any]) -> None:
+    """Prove that a late-fusion checkpoint instantiated all four fixed adapters."""
+
+    if contract.get("mode") != _POST_VISION_LATE_FUSION:
+        return
+    backbone = getattr(model, "backbone", None)
+    adapters = getattr(backbone, "vision_fusion_adapters", None)
+    if not isinstance(adapters, torch.nn.ModuleDict):
+        raise ValueError("Late-fusion checkpoint did not instantiate its adapter ModuleDict")
+    if tuple(adapters.keys()) != _POST_VISION_ADAPTER_NAMES:
+        raise ValueError(
+            "Late-fusion checkpoint adapter sites mismatch: "
+            f"got {tuple(adapters.keys())!r}, expected {_POST_VISION_ADAPTER_NAMES!r}"
+        )
+    fusion = contract.get("post_vision_fusion", {})
+    stage = fusion.get("stage")
+    if stage not in _POST_VISION_STAGE_SPECS:
+        raise ValueError(f"Late-fusion runtime received unsupported stage {stage!r}")
+    runtime_stage = getattr(backbone, "vision_fusion_stage", None)
+    if runtime_stage != stage:
+        raise ValueError(
+            "Late-fusion checkpoint runtime/config stage mismatch: "
+            f"runtime={runtime_stage!r}, contract={stage!r}"
+        )
+    stage_spec = _POST_VISION_STAGE_SPECS[stage]
+    runtime_metadata = {
+        "adapter_bias": getattr(backbone, "vision_fusion_adapter_bias", None),
+        "adapter_bias_init": getattr(
+            backbone, "vision_fusion_adapter_bias_init", None
+        ),
+        "deepstack_layers": getattr(
+            backbone, "vision_fusion_deepstack_layers", None
+        ),
+        "adapter_input_dim": getattr(
+            backbone, "vision_fusion_adapter_input_dim", None
+        ),
+        "adapter_output_dim": getattr(
+            backbone, "vision_fusion_adapter_output_dim", None
+        ),
+    }
+    expected_runtime_metadata = {
+        "adapter_bias": True,
+        "adapter_bias_init": _POST_VISION_ADAPTER_BIAS_INIT,
+        "deepstack_layers": _POST_VISION_DEEPSTACK_LAYERS,
+        "adapter_input_dim": stage_spec["input_dim"],
+        "adapter_output_dim": stage_spec["output_dim"],
+    }
+    if runtime_metadata != expected_runtime_metadata:
+        raise ValueError(
+            "Late-fusion checkpoint runtime architecture metadata mismatch: "
+            f"got {runtime_metadata!r}, expected {expected_runtime_metadata!r}"
+        )
+    for name, adapter in adapters.items():
+        if (
+            not isinstance(adapter, torch.nn.Linear)
+            or adapter.in_features != stage_spec["input_dim"]
+            or adapter.out_features != stage_spec["output_dim"]
+            or adapter.bias is None
+        ):
+            raise ValueError(
+                f"Late-fusion checkpoint adapter {name!r} must include bias and be "
+                f"Linear({stage_spec['input_dim']}, {stage_spec['output_dim']}) "
+                f"for stage {stage!r}"
+            )
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -222,6 +492,7 @@ class Gr00tPolicy(BasePolicy):
             if k != "rl_info"
         }
         self.vision_input_contract = _vision_input_contract(self.model.config, self.modality_configs["video"])  # fmt: skip  # earlyfusion
+        _validate_post_vision_fusion_runtime(self.model, self.vision_input_contract)
         self.collate_fn = self.processor.collator
 
         # Extract and validate language configuration
