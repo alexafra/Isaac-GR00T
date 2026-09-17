@@ -477,6 +477,29 @@ def test_joint_trajectory_plot_labels_visible_frame_axes(tmp_path, monkeypatch):
     )
 
 
+def test_processor_error_heatmap_label_distinguishes_operand_and_error_ranges(
+    tmp_path, monkeypatch
+):
+    saved_figures = []
+    monkeypatch.setattr(
+        "matplotlib.figure.Figure.savefig",
+        lambda figure, *_args, **_kwargs: saved_figures.append(figure),
+    )
+
+    plot_error_heatmap(
+        np.array([[2.0], [-2.0]]),
+        ["right_arm[0]"],
+        "processor-coordinate error",
+        tmp_path / "processor_error_heatmap.png",
+        error_units=evaluate_checkpoints.PROCESSOR_ERROR_UNITS,
+    )
+
+    assert len(saved_figures) == 1
+    colorbar_label = saved_figures[0].axes[-1].get_ylabel()
+    assert "GT/pred each clipped to [-1, +1]" in colorbar_label
+    assert "difference range [-2, +2]" in colorbar_label
+
+
 def test_target_velocity_plot_marks_cross_chunk_transition_and_joint_maxima(tmp_path, monkeypatch):
     saved_figures = []
     monkeypatch.setattr(
@@ -610,6 +633,51 @@ def test_checkpoint_summary_splits_magnitude_metrics_with_matching_colours(tmp_p
         legend = axes_by_title[title].get_legend()
         assert legend._ncols == 1
         assert [text.get_text() for text in legend.get_texts()] == list(expected_metric_colours)
+    assert axes_by_title["Validation error magnitude"].get_ylim() == pytest.approx(
+        axes_by_title["Train Probe error magnitude"].get_ylim()
+    )
+
+
+def test_checkpoint_magnitude_limits_are_recomputed_without_base_checkpoint(tmp_path, monkeypatch):
+    saved_figures = []
+    monkeypatch.setattr(
+        "matplotlib.figure.Figure.savefig",
+        lambda figure, *_args, **_kwargs: saved_figures.append(figure),
+    )
+
+    rows = []
+    for split in ("validation", "train_probe"):
+        for step, scale in ((0, 100.0), (100, 0.2), (200, 0.1)):
+            rows.append(
+                {
+                    "split": split,
+                    "checkpoint_step": step,
+                    "mae": scale,
+                    "mse": scale**2,
+                    "rmse": scale,
+                    "median_absolute_error": scale * 0.8,
+                    "p95_absolute_error": scale * 1.2,
+                    "bias": 0.0,
+                    "max_absolute_error": scale * 2.0,
+                }
+            )
+    summary = pd.DataFrame(rows)
+
+    plot_checkpoint_metric_summary(summary, tmp_path / "with_base.png")
+    plot_checkpoint_metric_summary(
+        summary[summary["checkpoint_step"] > 0], tmp_path / "without_base.png"
+    )
+
+    full_axes = {axis.get_title(): axis for axis in saved_figures[0].axes}
+    finetuned_axes = {axis.get_title(): axis for axis in saved_figures[1].axes}
+    assert full_axes["Validation error magnitude"].get_ylim() == pytest.approx(
+        full_axes["Train Probe error magnitude"].get_ylim()
+    )
+    assert finetuned_axes["Validation error magnitude"].get_ylim() == pytest.approx(
+        finetuned_axes["Train Probe error magnitude"].get_ylim()
+    )
+    assert finetuned_axes["Validation error magnitude"].get_ylim()[1] < 1.0
+    assert full_axes["Validation error magnitude"].get_ylim()[1] > 1_000.0
 
 
 def test_checkpoint_progress_legend_explains_color_and_line_style(tmp_path, monkeypatch):
@@ -1089,16 +1157,22 @@ def test_plots_only_skips_velocity_statistics_without_opt_in(tmp_path, monkeypat
 
 def test_main_plots_only_skips_checkpoint_loading(tmp_path, monkeypatch):
     calls = []
+    statistics_path = tmp_path / "run" / "experiment_cfg" / "dataset_statistics.json"
+    statistics_path.parent.mkdir(parents=True)
+    statistics_path.write_text(json.dumps({"new_embodiment": {}}))
     args = Namespace(
         output_dir=tmp_path / "evaluation",
         plots_only=True,
         run_dir=tmp_path / "run",
+        embodiment_tag="NEW_EMBODIMENT",
+        execution_horizon=8,
+        action_error_range_floor=1e-8,
     )
     monkeypatch.setattr(evaluate_checkpoints, "parse_args", lambda: args)
     monkeypatch.setattr(
         evaluate_checkpoints,
         "regenerate_plots",
-        lambda parsed_args, output_dir: calls.append((parsed_args, output_dir)),
+        lambda parsed_args, output_dir, **_kwargs: calls.append((parsed_args, output_dir)),
     )
     monkeypatch.setattr(
         evaluate_checkpoints,
@@ -1109,6 +1183,34 @@ def test_main_plots_only_skips_checkpoint_loading(tmp_path, monkeypatch):
     evaluate_checkpoints.main()
 
     assert calls == [(args, args.output_dir)]
+
+
+def test_stale_raw_metric_plot_cleanup_is_narrow_and_idempotent(tmp_path):
+    output_dir = tmp_path / "evaluation"
+    stale = [
+        output_dir / "checkpoint_error_progress.png",
+        output_dir / "checkpoint_metric_summary_finetuned_only.png",
+        output_dir / "joint_error_by_checkpoint.png",
+        output_dir / "best_checkpoint_joint_mae.png",
+        output_dir / "error_by_horizon_position.png",
+        output_dir / "right_arm_hand" / "checkpoint-10" / "trajectory_0001_error_heatmap.png",
+    ]
+    preserved = [
+        output_dir / "checkpoint-10" / "trajectory_0001_joints.png",
+        output_dir / "checkpoint-10" / "trajectory_0001_joint_velocities.png",
+        output_dir / "checkpoint-10" / "validation_frame_predictions.csv.gz",
+        output_dir / "unrelated.png",
+    ]
+    for path in [*stale, *preserved]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"evidence")
+
+    removed = evaluate_checkpoints.remove_stale_error_metric_plots(output_dir)
+
+    assert set(removed) == set(stale)
+    assert all(not path.exists() for path in stale)
+    assert all(path.read_bytes() == b"evidence" for path in preserved)
+    assert evaluate_checkpoints.remove_stale_error_metric_plots(output_dir) == []
 
 
 def test_latest_checkpoint_steps_selects_only_two_numerically_latest():
@@ -1158,6 +1260,55 @@ def test_goal_and_horizon_position_metrics_use_every_scalar_error():
     assert positions.loc[1, "mse"] == pytest.approx(5.0)
 
 
+def test_normalized_multi_goal_metrics_normalize_before_membership_expansion():
+    statistics = {
+        "new_embodiment": {
+            "relative_action": {
+                "right_arm": {
+                    "min": [[-4.0], [-4.0]],
+                    "max": [[4.0], [4.0]],
+                    "q01": [[-2.0], [-2.0]],
+                    "q99": [[2.0], [2.0]],
+                }
+            },
+            "action": {},
+        }
+    }
+    episode_zero = raw_action_frame(
+        checkpoint_step_value=10,
+        trajectory_id=0,
+        ground_truth=np.zeros((4, 1)),
+        prediction=np.ones((4, 1)),
+        labels=["right_arm[0]"],
+        measured_state=np.zeros((4, 1)),
+    )
+    episode_one = raw_action_frame(
+        checkpoint_step_value=10,
+        trajectory_id=1,
+        ground_truth=np.zeros((4, 1)),
+        prediction=np.zeros((4, 1)),
+        labels=["right_arm[0]"],
+        measured_state=np.zeros((4, 1)),
+    )
+    raw = pd.concat([episode_zero, episode_one], ignore_index=True)
+    normalizer = evaluate_checkpoints.ActionErrorNormalizer(statistics, execution_horizon=2)
+
+    goals = evaluate_checkpoints.goal_metrics_from_raw_predictions(
+        raw,
+        split="validation",
+        episode_tasks={0: ["pick", "shared"], 1: ["place", "shared"]},
+        error_normalizer=normalizer,
+    ).set_index("goal")
+
+    assert goals.loc["pick", "mae"] == pytest.approx(0.25)
+    assert goals.loc["place", "mae"] == pytest.approx(0.0)
+    assert goals.loc["shared", "mae"] == pytest.approx(0.125)
+    assert goals.loc["pick", "diagnostic_unclipped_q01_q99_mae"] == pytest.approx(0.5)
+    assert goals.loc["shared", "diagnostic_unclipped_q01_q99_mae"] == pytest.approx(0.25)
+    assert goals.loc["pick", "samples"] == 4
+    assert goals.loc["shared", "samples"] == 8
+
+
 def test_horizon_position_plot_excludes_older_checkpoints(tmp_path, monkeypatch):
     saved_figures = []
     monkeypatch.setattr(
@@ -1185,6 +1336,32 @@ def test_horizon_position_plot_excludes_older_checkpoints(tmp_path, monkeypatch)
 
     line_labels = {line.get_label() for line in saved_figures[0].axes[0].lines}
     assert line_labels == {"checkpoint 20", "checkpoint 30"}
+
+
+def test_horizon_position_mae_panels_share_y_limits_across_splits(tmp_path, monkeypatch):
+    saved_figures = []
+    monkeypatch.setattr(
+        "matplotlib.figure.Figure.savefig",
+        lambda figure, *_args, **_kwargs: saved_figures.append(figure),
+    )
+    metrics = pd.DataFrame(
+        [
+            {
+                "split": split,
+                "checkpoint_step": 20,
+                "horizon_position": position,
+                "mae": scale * (position + 1),
+            }
+            for split, scale in (("validation", 0.1), ("train_probe", 1.0))
+            for position in (0, 1)
+        ]
+    )
+
+    evaluate_checkpoints.plot_horizon_position_metrics(metrics, [20], tmp_path / "horizon.png")
+
+    axes = saved_figures[0].axes
+    assert len(axes) == 2
+    assert axes[0].get_ylim() == pytest.approx(axes[1].get_ylim())
 
 
 def test_plots_only_uses_all_checkpoints_for_summaries_and_latest_two_for_trajectories(

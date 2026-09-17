@@ -26,6 +26,15 @@ from gr00t.policy.gr00t_policy import Gr00tPolicy
 from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
+from scripts.analysis_tools.normalized_action_metrics import (
+    DEFAULT_RANGE_FLOOR,
+    DIAGNOSTIC_METRIC_COLUMNS,
+    DIAGNOSTIC_PREFIX,
+    ActionErrorNormalizer,
+    default_statistics_path,
+    error_metrics,
+    write_metric_tables as write_normalized_metric_tables,
+)
 import torch
 
 
@@ -98,6 +107,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--steps", type=int, default=0, help="0 evaluates each complete episode")
     parser.add_argument("--execution-horizon", type=int, default=16)
+    parser.add_argument(
+        "--action-error-range-floor",
+        type=float,
+        default=DEFAULT_RANGE_FLOOR,
+        help=(
+            "Minimum training-statistics denominator for normalized action-error metrics. "
+            "Defaults to the processor's 1e-8 floor."
+        ),
+    )
     parser.add_argument("--denoising-steps", type=int, default=4)
     parser.add_argument(
         "--inference-batch-size",
@@ -138,6 +156,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--train-traj-ids and --train-probe-episodes require --train-dataset-path")
     if args.inference_batch_size <= 0:
         parser.error("--inference-batch-size must be positive")
+    if not np.isfinite(args.action_error_range_floor) or args.action_error_range_floor <= 0:
+        parser.error("--action-error-range-floor must be finite and positive")
     return args
 
 
@@ -891,6 +911,7 @@ def plot_error_heatmap(
     title: str,
     path: Path,
     goal: str | None = None,
+    error_units: str = "Absolute error (joint units)",
 ) -> None:
     figure, axis = plt.subplots(figsize=(13, 8))
     image = axis.imshow(np.abs(error).T, aspect="auto", interpolation="nearest", cmap="magma")
@@ -909,10 +930,16 @@ def plot_error_heatmap(
             fontsize=9,
             color="dimgray",
         )
-    figure.colorbar(image, ax=axis, label="Absolute error (joint units)")
+    figure.colorbar(image, ax=axis, label=error_units)
     figure.tight_layout()
     save_figure_with_parent(figure, path, dpi=160)
     plt.close(figure)
+
+
+PROCESSOR_ERROR_UNITS = (
+    "Normalized error (processor coordinates; GT/pred each clipped to [-1, +1], "
+    "difference range [-2, +2])"
+)
 
 
 def plot_right_trajectory_outputs(
@@ -926,6 +953,7 @@ def plot_right_trajectory_outputs(
     dataset_fps: float | None,
     goal: str | None,
     measured_state: np.ndarray | None = None,
+    normalized_error: np.ndarray | None = None,
 ) -> None:
     indices = right_action_indices(labels)
     if not indices:
@@ -936,6 +964,7 @@ def plot_right_trajectory_outputs(
     right_ground_truth = ground_truth[:, indices]
     right_prediction = prediction[:, indices]
     right_measured_state = measured_state[:, indices] if measured_state is not None else None
+    right_normalized_error = normalized_error[:, indices] if normalized_error is not None else None
     right_labels = [labels[index] for index in indices]
     plot_trajectory(
         right_ground_truth,
@@ -960,11 +989,24 @@ def plot_right_trajectory_outputs(
             measured_state=right_measured_state,
         )
     plot_error_heatmap(
-        right_prediction - right_ground_truth,
+        (
+            right_normalized_error
+            if right_normalized_error is not None
+            else right_prediction - right_ground_truth
+        ),
         right_labels,
-        f"{title} absolute error — right arm + right hand",
+        (
+            f"{title} normalized absolute error — right arm + right hand"
+            if right_normalized_error is not None
+            else f"{title} absolute error — right arm + right hand"
+        ),
         plot_dir / f"trajectory_{trajectory_id:04d}_error_heatmap.png",
         goal,
+        error_units=(
+            PROCESSOR_ERROR_UNITS
+            if right_normalized_error is not None
+            else "Absolute error (joint units)"
+        ),
     )
 
 
@@ -996,6 +1038,26 @@ MAGNITUDE_METRICS = [
     ("median_absolute_error", "Median absolute error", "tab:green"),
     ("p95_absolute_error", "95th-percentile absolute error", "tab:red"),
 ]
+
+
+def set_common_y_limits(axes: list[plt.Axes]) -> None:
+    """Give comparable panels one finite union of their independently autoscaled limits."""
+
+    populated_axes = [axis for axis in axes if axis.has_data()]
+    if len(populated_axes) < 2:
+        return
+    for axis in populated_axes:
+        axis.relim()
+        axis.autoscale_view(scalex=False, scaley=True)
+    limits = np.asarray([axis.get_ylim() for axis in populated_axes], dtype=float)
+    if not np.all(np.isfinite(limits)):
+        raise ValueError("Cannot share non-finite y-axis limits")
+    common_limits = (float(np.min(limits[:, 0])), float(np.max(limits[:, 1])))
+    if common_limits[0] == common_limits[1]:
+        padding = max(abs(common_limits[0]) * 0.05, 1e-9)
+        common_limits = (common_limits[0] - padding, common_limits[1] + padding)
+    for axis in populated_axes:
+        axis.set_ylim(common_limits)
 
 
 def plot_checkpoint_progress(
@@ -1032,7 +1094,7 @@ def plot_checkpoint_progress(
             alpha=SUMMARY_ALPHA,
         )
     axis.set_xlabel("Checkpoint step")
-    axis.set_ylabel("Unnormalized action error")
+    axis.set_ylabel("Normalized action error (processor training coordinates)")
     if scope_label:
         axis.set_title(scope_label)
     axis.grid(alpha=0.25)
@@ -1139,7 +1201,7 @@ def plot_checkpoint_metric_summary(
             alpha=SUMMARY_ALPHA,
         )
     for split, axis in magnitude_axes.items():
-        axis.set_ylabel("Metric value")
+        axis.set_ylabel("Normalized metric value")
         axis.set_title(f"{split_label(split)} error magnitude")
         if split in populated_magnitude_splits:
             axis.legend(fontsize=8, handlelength=2.5, ncol=1)
@@ -1154,12 +1216,20 @@ def plot_checkpoint_metric_summary(
                 color="dimgray",
             )
 
+    # Validation and train-probe panels contain the same normalized metrics,
+    # so their vertical scales must be directly comparable. This union is
+    # calculated independently for each call; the finetuned-only figure does
+    # not inherit limits expanded by checkpoint 0.
+    set_common_y_limits(
+        [magnitude_axes[split] for split in magnitude_axes if split in populated_magnitude_splits]
+    )
+
     bias_axis.axhline(0, color="black", linewidth=0.8, alpha=0.5)
-    bias_axis.set_ylabel("Signed action error")
+    bias_axis.set_ylabel("Normalized signed action error")
     bias_axis.set_title("Aggregate prediction bias")
     bias_axis.legend()
 
-    maximum_axis.set_ylabel("Action error")
+    maximum_axis.set_ylabel("Normalized action error")
     maximum_axis.set_title("Worst observed error")
     maximum_axis.legend()
 
@@ -1198,7 +1268,7 @@ def plot_joint_checkpoint_heatmap(
     if scope_label:
         title += f" — {scope_label}"
     axis.set_title(title)
-    figure.colorbar(image, ax=axis, label="MAE (joint units)")
+    figure.colorbar(image, ax=axis, label="Normalized MAE (processor training coordinates)")
     figure.tight_layout()
     save_figure_with_parent(figure, path, dpi=180)
     plt.close(figure)
@@ -1216,7 +1286,7 @@ def plot_best_checkpoint_joints(
     axis.bar(range(len(labels)), selected["mae"])
     axis.set_xticks(range(len(labels)))
     axis.set_xticklabels(labels, rotation=70, ha="right", fontsize=8)
-    axis.set_ylabel("MAE (joint units)")
+    axis.set_ylabel("Normalized MAE (processor training coordinates)")
     title = f"Per-joint MAE at checkpoint {best_step}"
     if scope_label:
         title += f" — {scope_label}"
@@ -1257,6 +1327,14 @@ ERROR_SUMMARY_COLUMNS = [
     "p95_absolute_error",
     "bias",
     "max_absolute_error",
+    "raw_mae",
+    "raw_mse",
+    "raw_rmse",
+    "raw_median_absolute_error",
+    "raw_p95_absolute_error",
+    "raw_bias",
+    "raw_max_absolute_error",
+    *DIAGNOSTIC_METRIC_COLUMNS,
 ]
 GOAL_METRICS_COLUMNS = [
     "split",
@@ -1354,29 +1432,42 @@ def _validate_error_rows(raw_predictions: pd.DataFrame) -> None:
 def _summarize_error_groups(
     raw_predictions: pd.DataFrame,
     group_columns: list[str],
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> pd.DataFrame:
     _validate_error_rows(raw_predictions)
+    if error_normalizer is not None:
+        metric_predictions = error_normalizer.normalize_predictions(raw_predictions)
+    elif {"normalized_error", "normalized_absolute_error"}.issubset(raw_predictions.columns):
+        # Some callers must normalize before a many-to-many expansion. Preserve
+        # those per-physical-row values instead of replacing them with raw errors.
+        metric_predictions = raw_predictions
+    else:
+        metric_predictions = raw_predictions.assign(
+            normalized_error=raw_predictions["error"],
+            normalized_absolute_error=raw_predictions["absolute_error"],
+        )
     rows = []
     grouper = group_columns[0] if len(group_columns) == 1 else group_columns
-    for group_values, group in raw_predictions.groupby(grouper, sort=True, dropna=False):
+    for group_values, group in metric_predictions.groupby(grouper, sort=True, dropna=False):
         if len(group_columns) == 1:
             group_values = (group_values,)
-        error = group["error"].to_numpy(dtype=float)
-        absolute_error = np.abs(error)
-        mse = float(np.mean(error**2))
+        normalized_error = group["normalized_error"].to_numpy(dtype=float)
+        raw_error = group["error"].to_numpy(dtype=float)
         row = dict(zip(group_columns, group_values, strict=True))
         row.update(
             {
                 "episodes": int(group["trajectory"].nunique()),
                 "frames": int(len(group[["trajectory", "frame"]].drop_duplicates())),
                 "samples": int(len(group)),
-                "mae": float(np.mean(absolute_error)),
-                "mse": mse,
-                "rmse": float(np.sqrt(mse)),
-                "median_absolute_error": float(np.median(absolute_error)),
-                "p95_absolute_error": float(np.percentile(absolute_error, 95)),
-                "bias": float(np.mean(error)),
-                "max_absolute_error": float(np.max(absolute_error)),
+                **error_metrics(
+                    normalized_error,
+                    raw_error,
+                    (
+                        group[f"{DIAGNOSTIC_PREFIX}_error"].to_numpy(dtype=float)
+                        if f"{DIAGNOSTIC_PREFIX}_error" in group
+                        else None
+                    ),
+                ),
             }
         )
         rows.append(row)
@@ -1388,6 +1479,7 @@ def goal_metrics_from_raw_predictions(
     *,
     split: str,
     episode_tasks: dict[int, list[str]],
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> pd.DataFrame:
     """Summarize each recorded goal without combining or reweighting goals."""
 
@@ -1402,7 +1494,15 @@ def goal_metrics_from_raw_predictions(
             goals = ["(missing goal metadata)"]
         memberships.extend({"trajectory": trajectory, "goal": goal} for goal in goals)
 
-    expanded = raw_predictions.merge(
+    # Normalize each physical frame/joint row exactly once. Expanding a
+    # multi-goal episode first would duplicate chunk-start arm anchors and make
+    # processor-coordinate reconstruction ambiguous.
+    metric_predictions = (
+        error_normalizer.normalize_predictions(raw_predictions)
+        if error_normalizer is not None
+        else raw_predictions
+    )
+    expanded = metric_predictions.merge(
         pd.DataFrame(memberships),
         on="trajectory",
         how="left",
@@ -1421,6 +1521,7 @@ def horizon_position_metrics_from_raw_predictions(
     *,
     split: str,
     execution_horizon: int,
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> pd.DataFrame:
     """Summarize errors by zero-based action offset within each predicted chunk."""
 
@@ -1436,6 +1537,7 @@ def horizon_position_metrics_from_raw_predictions(
     result = _summarize_error_groups(
         positioned,
         ["split", "checkpoint_step", "horizon_position"],
+        error_normalizer,
     )
     return result.reindex(columns=HORIZON_POSITION_METRICS_COLUMNS)
 
@@ -1446,6 +1548,7 @@ def write_extended_evaluation_metrics(
     summary: pd.DataFrame,
     dataset_paths: dict[str, Path | None],
     execution_horizon: int,
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Write goal and predicted-horizon-position diagnostic CSVs."""
 
@@ -1498,6 +1601,7 @@ def write_extended_evaluation_metrics(
                 raw_predictions,
                 split=split,
                 episode_tasks=episode_tasks,
+                error_normalizer=error_normalizer,
             )
         )
         horizon_frames.append(
@@ -1505,6 +1609,7 @@ def write_extended_evaluation_metrics(
                 raw_predictions,
                 split=split,
                 execution_horizon=execution_horizon,
+                error_normalizer=error_normalizer,
             )
         )
 
@@ -1563,10 +1668,11 @@ def plot_horizon_position_metrics(
         positions = sorted(int(value) + 1 for value in split_metrics["horizon_position"].unique())
         axis.set_xticks(positions)
         axis.set_xlabel("Predicted action position within execution chunk (1 = first)")
-        axis.set_ylabel("Unnormalized action MAE")
+        axis.set_ylabel("Normalized action MAE (processor training coordinates)")
         axis.set_title(f"{split_label(split)} error by predicted horizon position")
         axis.grid(alpha=0.25)
         axis.legend()
+    set_common_y_limits(list(axes[:, 0]))
     figure.tight_layout()
     save_figure_with_parent(figure, path, dpi=180)
     plt.close(figure)
@@ -1575,6 +1681,7 @@ def plot_horizon_position_metrics(
 def right_summary_from_raw_predictions(
     output_dir: Path,
     summary: pd.DataFrame,
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> pd.DataFrame:
     rows = []
     split_steps = summary[["split", "checkpoint_step"]].drop_duplicates()
@@ -1593,22 +1700,28 @@ def right_summary_from_raw_predictions(
             logging.warning("No right_arm/right_hand actions found in %s", raw_path)
             continue
 
-        error = right_predictions["error"].to_numpy(dtype=float)
-        absolute_error = np.abs(error)
-        mse = float(np.mean(error**2))
+        metric_predictions = (
+            error_normalizer.normalize_predictions(right_predictions)
+            if error_normalizer is not None
+            else right_predictions.assign(normalized_error=right_predictions["error"])
+        )
+        normalized_error = metric_predictions["normalized_error"].to_numpy(dtype=float)
+        raw_error = metric_predictions["error"].to_numpy(dtype=float)
         rows.append(
             {
                 "split": split,
                 "checkpoint_step": step,
                 "episodes": int(right_predictions["trajectory"].nunique()),
                 "frames": len(right_predictions[["trajectory", "frame"]].drop_duplicates()),
-                "mae": float(np.mean(absolute_error)),
-                "mse": mse,
-                "median_absolute_error": float(np.median(absolute_error)),
-                "p95_absolute_error": float(np.percentile(absolute_error, 95)),
-                "rmse": float(np.sqrt(mse)),
-                "bias": float(np.mean(error)),
-                "max_absolute_error": float(np.max(absolute_error)),
+                **error_metrics(
+                    normalized_error,
+                    raw_error,
+                    (
+                        metric_predictions[f"{DIAGNOSTIC_PREFIX}_error"].to_numpy(dtype=float)
+                        if f"{DIAGNOSTIC_PREFIX}_error" in metric_predictions
+                        else None
+                    ),
+                ),
             }
         )
 
@@ -2082,10 +2195,13 @@ def evaluate_probe(
     velocity_analysis: bool = False,
     inference_batch_size: int = 1,
     inference_seed: int | None = None,
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> tuple[list[dict], dict, list[dict], list[str]]:
     episode_rows = []
     joint_rows = []
     checkpoint_errors = []
+    checkpoint_normalized_errors = []
+    checkpoint_diagnostic_errors = []
     labels = None
     if raw_predictions_path is not None:
         initialize_raw_predictions_csv(raw_predictions_path)
@@ -2172,30 +2288,45 @@ def evaluate_probe(
             frame_count=len(gt),
         )
         error = pred - gt
-        checkpoint_errors.append(error)
-        if raw_predictions_path is not None:
-            append_raw_predictions_csv(
-                raw_predictions_path,
-                raw_action_frame(
-                    checkpoint_step_value=checkpoint_step_value,
-                    trajectory_id=traj_id,
-                    ground_truth=gt,
-                    prediction=pred,
-                    labels=labels,
-                    measured_state=measured_state,
-                ),
+        raw_frame = raw_action_frame(
+            checkpoint_step_value=checkpoint_step_value,
+            trajectory_id=traj_id,
+            ground_truth=gt,
+            prediction=pred,
+            labels=labels,
+            measured_state=measured_state,
+        )
+        if error_normalizer is not None:
+            normalized_frame = error_normalizer.normalize_predictions(raw_frame)
+            normalized_error = (
+                normalized_frame["normalized_error"].to_numpy(dtype=float).reshape(error.shape)
             )
+            diagnostic_error = (
+                normalized_frame[f"{DIAGNOSTIC_PREFIX}_error"]
+                .to_numpy(dtype=float)
+                .reshape(error.shape)
+            )
+        else:
+            normalized_error = error
+            diagnostic_error = None
+        checkpoint_errors.append(error)
+        checkpoint_normalized_errors.append(normalized_error)
+        if diagnostic_error is not None:
+            checkpoint_diagnostic_errors.append(diagnostic_error)
+        if raw_predictions_path is not None:
+            append_raw_predictions_csv(raw_predictions_path, raw_frame)
+        episode_metrics = error_metrics(
+            normalized_error.reshape(-1),
+            error.reshape(-1),
+            diagnostic_error.reshape(-1) if diagnostic_error is not None else None,
+        )
         episode_rows.append(
             {
                 "split": split,
                 "checkpoint_step": checkpoint_step_value,
                 "trajectory": traj_id,
                 "frames": len(error),
-                "mae": mae,
-                "mse": mse,
-                "rmse": float(np.sqrt(mse)),
-                "bias": float(np.mean(error)),
-                "max_absolute_error": float(np.max(np.abs(error))),
+                **episode_metrics,
             }
         )
 
@@ -2229,12 +2360,13 @@ def evaluate_probe(
                     measured_state=measured_state,
                 )
             plot_error_heatmap(
-                error,
+                normalized_error,
                 labels,
-                f"{split_label(split)} absolute error: checkpoint "
+                f"{split_label(split)} normalized absolute error: checkpoint "
                 f"{checkpoint_step_value}, trajectory {traj_id}",
                 plot_dir / f"trajectory_{traj_id:04d}_error_heatmap.png",
                 goal,
+                error_units=PROCESSOR_ERROR_UNITS,
             )
             plot_right_trajectory_outputs(
                 gt,
@@ -2247,6 +2379,7 @@ def evaluate_probe(
                 dataset_fps if velocity_analysis else None,
                 goal,
                 measured_state=measured_state,
+                normalized_error=normalized_error,
             )
 
         trajectory_elapsed = time.perf_counter() - trajectory_started_at
@@ -2257,8 +2390,8 @@ def evaluate_probe(
             "[%s] complete in %s: MAE=%.6f, MSE=%.6f; split ETA %s",
             progress_label,
             format_duration(trajectory_elapsed),
-            mae,
-            mse,
+            episode_metrics["mae"],
+            episode_metrics["mse"],
             format_duration(probe_eta),
         )
 
@@ -2266,19 +2399,23 @@ def evaluate_probe(
         raise ValueError(f"The {split} probe contains no episodes")
 
     combined = np.concatenate(checkpoint_errors, axis=0)
-    checkpoint_mse = float(np.mean(combined**2))
+    combined_normalized = np.concatenate(checkpoint_normalized_errors, axis=0)
+    combined_diagnostic = (
+        np.concatenate(checkpoint_diagnostic_errors, axis=0)
+        if checkpoint_diagnostic_errors
+        else None
+    )
+    checkpoint_metrics = error_metrics(
+        combined_normalized.reshape(-1),
+        combined.reshape(-1),
+        combined_diagnostic.reshape(-1) if combined_diagnostic is not None else None,
+    )
     checkpoint_row = {
         "split": split,
         "checkpoint_step": checkpoint_step_value,
         "episodes": len(checkpoint_errors),
         "frames": len(combined),
-        "mae": float(np.mean(np.abs(combined))),
-        "mse": checkpoint_mse,
-        "median_absolute_error": float(np.median(np.abs(combined))),
-        "p95_absolute_error": float(np.percentile(np.abs(combined), 95)),
-        "rmse": float(np.sqrt(checkpoint_mse)),
-        "bias": float(np.mean(combined)),
-        "max_absolute_error": float(np.max(np.abs(combined))),
+        **checkpoint_metrics,
     }
     logging.info(
         "[%s | %s] complete in %s: %d episode(s), %d frame(s), MAE=%.6f, RMSE=%.6f",
@@ -2292,18 +2429,17 @@ def evaluate_probe(
     )
 
     for index, label in enumerate(labels or []):
-        values = combined[:, index]
-        mse = float(np.mean(values**2))
+        raw_values = combined[:, index]
+        normalized_values = combined_normalized[:, index]
+        diagnostic_values = (
+            combined_diagnostic[:, index] if combined_diagnostic is not None else None
+        )
         joint_rows.append(
             {
                 "split": split,
                 "checkpoint_step": checkpoint_step_value,
                 "joint": label,
-                "mae": float(np.mean(np.abs(values))),
-                "mse": mse,
-                "rmse": float(np.sqrt(mse)),
-                "bias": float(np.mean(values)),
-                "max_absolute_error": float(np.max(np.abs(values))),
+                **error_metrics(normalized_values, raw_values, diagnostic_values),
             }
         )
 
@@ -2392,8 +2528,11 @@ def plot_right_evaluation_summaries(
     joints: pd.DataFrame,
     *,
     save_metrics: bool,
+    error_normalizer: ActionErrorNormalizer | None = None,
 ) -> int | None:
-    right_summary = right_summary_from_raw_predictions(output_dir, summary)
+    right_summary = right_summary_from_raw_predictions(
+        output_dir, summary, error_normalizer=error_normalizer
+    )
     scoped_joints = right_joint_rows(joints)
     if right_summary.empty or scoped_joints.empty:
         logging.warning(
@@ -2529,6 +2668,7 @@ def regenerate_trajectory_plots(
     args: argparse.Namespace,
     output_dir: Path,
     checkpoint_steps: list[int],
+    error_normalizer: ActionErrorNormalizer | None = None,
     state_cache: dict[tuple, pd.DataFrame] | None = None,
 ) -> None:
     if args.skip_trajectory_plots or args.trajectory_plot_episodes == 0:
@@ -2609,6 +2749,16 @@ def regenerate_trajectory_plots(
                     else None
                 )
                 error = prediction - ground_truth
+                normalized_error = None
+                if error_normalizer is not None:
+                    trajectory_rows = raw_predictions[
+                        raw_predictions["trajectory"] == trajectory_id
+                    ]
+                    normalized_error = (
+                        error_normalizer.normalize_predictions(trajectory_rows)["normalized_error"]
+                        .to_numpy(dtype=float)
+                        .reshape(error.shape)
+                    )
                 goal = trajectory_goals.get(trajectory_id)
                 plot_trajectory(
                     ground_truth,
@@ -2633,12 +2783,22 @@ def regenerate_trajectory_plots(
                         measured_state=measured_state,
                     )
                 plot_error_heatmap(
-                    error,
+                    normalized_error if normalized_error is not None else error,
                     labels,
-                    f"{split_label(split)} absolute error: checkpoint "
-                    f"{step}, trajectory {trajectory_id}",
+                    (
+                        f"{split_label(split)} normalized absolute error: checkpoint "
+                        f"{step}, trajectory {trajectory_id}"
+                        if normalized_error is not None
+                        else f"{split_label(split)} absolute error: checkpoint "
+                        f"{step}, trajectory {trajectory_id}"
+                    ),
                     plot_dir / f"trajectory_{trajectory_id:04d}_error_heatmap.png",
                     goal,
+                    error_units=(
+                        PROCESSOR_ERROR_UNITS
+                        if normalized_error is not None
+                        else "Absolute error (joint units)"
+                    ),
                 )
                 plot_right_trajectory_outputs(
                     ground_truth,
@@ -2651,10 +2811,49 @@ def regenerate_trajectory_plots(
                     dataset_fps,
                     goal,
                     measured_state=measured_state,
+                    normalized_error=normalized_error,
                 )
 
 
-def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
+def remove_stale_error_metric_plots(output_dir: Path) -> list[Path]:
+    """Remove only plots whose cross-unit raw values would be misleading after backfill."""
+
+    aggregate_patterns = (
+        "checkpoint_error_progress*.png",
+        "checkpoint_metric_summary*.png",
+        "joint_error_by_checkpoint*.png",
+        "best_checkpoint_joint_mae*.png",
+        "error_by_horizon_position.png",
+    )
+    candidates: set[Path] = set()
+    for directory in (output_dir, output_dir / "right_arm_hand"):
+        if not directory.is_dir():
+            continue
+        for pattern in aggregate_patterns:
+            candidates.update(directory.glob(pattern))
+    candidates.update(output_dir.glob("**/trajectory_*_error_heatmap.png"))
+
+    removed = []
+    for path in sorted(candidates):
+        if path.is_file():
+            path.unlink()
+            removed.append(path)
+    return removed
+
+
+def regenerate_plots(
+    args: argparse.Namespace,
+    output_dir: Path,
+    error_normalizer: ActionErrorNormalizer | None = None,
+) -> None:
+    if error_normalizer is not None:
+        write_normalized_metric_tables(
+            evaluation_dir=output_dir,
+            normalizer=error_normalizer,
+            model_dir=getattr(args, "run_dir", output_dir.parent),
+        )
+        removed = remove_stale_error_metric_plots(output_dir)
+        logging.info("Removed %d stale raw error/metric plot(s) before regeneration", len(removed))
     summary_path = output_dir / "metrics_by_checkpoint.csv"
     joints_path = output_dir / "metrics_per_joint.csv"
     if not summary_path.is_file():
@@ -2673,6 +2872,7 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
             "train_probe": args.train_dataset_path,
         },
         execution_horizon=args.execution_horizon,
+        error_normalizer=error_normalizer,
     )
     if args.velocity_analysis:
         write_joint_position_velocity_statistics(
@@ -2704,6 +2904,7 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
         summary,
         joints,
         save_metrics=not bool(args.checkpoint_steps),
+        error_normalizer=error_normalizer,
     )
     plot_horizon_position_metrics(
         horizon_metrics,
@@ -2714,6 +2915,7 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
         args=args,
         output_dir=output_dir,
         checkpoint_steps=trajectory_plot_checkpoint_steps,
+        error_normalizer=error_normalizer,
         state_cache=state_cache,
     )
 
@@ -2728,12 +2930,19 @@ def regenerate_plots(args: argparse.Namespace, output_dir: Path) -> None:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
+    embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
+    error_normalizer = ActionErrorNormalizer.from_file(
+        default_statistics_path(args.run_dir),
+        execution_horizon=args.execution_horizon,
+        embodiment_tag=embodiment_tag.value,
+        range_floor=args.action_error_range_floor,
+    )
     output_dir = args.output_dir or default_evaluation_output_dir(
         args.run_dir, args.execution_horizon
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.plots_only:
-        regenerate_plots(args, output_dir)
+        regenerate_plots(args, output_dir, error_normalizer=error_normalizer)
         return
 
     targets = find_evaluation_targets(
@@ -2742,7 +2951,6 @@ def main() -> None:
         args.base_model_path,
         args.run_root_step,
     )
-    embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     episode_rows = []
     checkpoint_rows = []
     joint_rows = []
@@ -2882,6 +3090,7 @@ def main() -> None:
                 velocity_analysis=args.velocity_analysis,
                 inference_batch_size=args.inference_batch_size,
                 inference_seed=args.inference_seed,
+                error_normalizer=error_normalizer,
             )
             logging.info("Saved frame-level %s data to %s", split, raw_predictions_path)
             episode_rows.extend(probe_episode_rows)
@@ -2920,6 +3129,7 @@ def main() -> None:
             "train_probe": args.train_dataset_path,
         },
         execution_horizon=args.execution_horizon,
+        error_normalizer=error_normalizer,
     )
     if args.velocity_analysis:
         write_joint_position_velocity_statistics(
@@ -2947,11 +3157,17 @@ def main() -> None:
         summary,
         joints,
         save_metrics=True,
+        error_normalizer=error_normalizer,
     )
     plot_horizon_position_metrics(
         horizon_metrics,
         checkpoint_steps,
         output_dir / "error_by_horizon_position.png",
+    )
+    normalized_outputs = write_normalized_metric_tables(
+        evaluation_dir=output_dir,
+        normalizer=error_normalizer,
+        model_dir=args.run_dir,
     )
 
     print(summary.to_string(index=False))
@@ -2963,6 +3179,7 @@ def main() -> None:
     print(f"Checkpoint summary CSV: {checkpoint_summary_csv}")
     print(f"Goal metrics CSV: {output_dir / GOAL_METRICS_FILENAME}")
     print(f"Horizon-position metrics CSV: {output_dir / HORIZON_POSITION_METRICS_FILENAME}")
+    print(f"Normalized metrics by scope CSV: {normalized_outputs['scopes']}")
     print(
         "Frame-level validation CSVs: "
         f"{output_dir}/<checkpoint>/validation_frame_predictions.csv.gz"
