@@ -155,7 +155,7 @@ Example for six-channel RGB + surface-normal fusion:
 cd /home/alex/Development/Isaac-GR00T
 TRAIN_DATASET=/home/alex/Development/Datasets/raw/inspire_stack_three_cups_split_copy/train
 BASE_MODEL=/home/alex/Development/Models/GR00T-N1.7-3B
-OUTPUT_DIR=/home/alex/Development/Models/inspire_dfx_normals_6ch_25k
+OUTPUT_DIR=/home/alex/Development/Models/inspire/inspire_dfx_normals_6ch_25k
 
 CUDA_VISIBLE_DEVICES=0 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -194,7 +194,7 @@ long enough to provide the configured 32-action horizon.
 
 ```bash
 cd /home/alex/Development/Isaac-GR00T
-CHECKPOINT=/home/alex/Development/Models/inspire_dfx_normals_6ch_25k/checkpoint-25000
+CHECKPOINT=/home/alex/Development/Models/inspire/inspire_dfx_normals_6ch_25k/checkpoint-25000
 TRAIN_DATASET=/home/alex/Development/Datasets/raw/inspire_stack_three_cups_split_copy/train
 
 .venv/bin/python -m gr00t.eval.run_gr00t_server \

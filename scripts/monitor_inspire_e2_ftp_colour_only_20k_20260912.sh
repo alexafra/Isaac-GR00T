@@ -2,7 +2,7 @@
 set -euo pipefail
 
 RUNNER="${GROOT_MONITOR_RUNNER:-/home/alex/Development/Isaac-GR00T/scripts/run_inspire_e2_ftp_colour_only_20k_20260912.sh}"
-OUTPUT_DIR="${GROOT_MONITOR_OUTPUT_DIR:-/home/alex/Development/Models/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z}"
+OUTPUT_DIR="${GROOT_MONITOR_OUTPUT_DIR:-/home/alex/Development/Models/inspire/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z}"
 TRAIN_LOG="${GROOT_MONITOR_TRAIN_LOG:-/home/alex/Development/logs/groot/training/inspire_e2_ftp_colour_only_rgb_20k_20260912T150904Z.log}"
 MONITOR_LOG="${GROOT_MONITOR_LOG:-/home/alex/Development/logs/groot/training/inspire_e2_ftp_colour_only_rgb_20k_20260912T150904Z.monitor.log}"
 CURRENT_SERVICE="${GROOT_MONITOR_CURRENT_SERVICE:-groot-inspire-e2-ftp-colour-only-rgb-20k-20260912.service}"

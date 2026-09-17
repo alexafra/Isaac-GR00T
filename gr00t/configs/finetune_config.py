@@ -200,9 +200,12 @@ class FinetuneConfig:
     save_only_model: bool = False
     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""
 
-    skip_final_model_save: bool = False
-    """Skip the final model-weight save. Intended for short compatibility and
-    memory dry runs; experiment configuration and processor files are still saved."""
+    skip_final_model_save: bool = True
+    """Skip the redundant model-weight save in the run root after training.
+
+    Step checkpoints remain authoritative and resumable. Set this to False only
+    when a standalone root-level model artifact is explicitly required.
+    """
 
     resume_from_checkpoint: bool = False
     """If True, resume from the latest ``checkpoint-*`` in ``output_dir``. Default

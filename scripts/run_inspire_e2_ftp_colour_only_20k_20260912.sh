@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="/home/alex/Development/Isaac-GR00T"
 DATASET_ROOT="/home/alex/Development/Datasets/lerobot2/inspire_e2_ftp_colour_only_test_20260912/train"
-OUTPUT_DIR="/home/alex/Development/Models/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z"
+OUTPUT_DIR="/home/alex/Development/Models/inspire/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z"
 LOG_DIR="/home/alex/Development/logs/groot/training"
 LOG_FILE="${LOG_DIR}/inspire_e2_ftp_colour_only_rgb_20k_20260912T150904Z.log"
 LOCK_FILE="/tmp/groot-inspire-e2-ftp-colour-only-20k-20260912.lock"

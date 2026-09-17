@@ -376,7 +376,8 @@ def run(config: Config):
             torch.cuda.max_memory_reserved() / gib,
         )
 
-    # Save final model unless this is an explicitly storage-light dry run.
+    # Step checkpoints are authoritative by default.  A root-level final save
+    # is optional because it duplicates the last checkpoint's model weights.
     if config.training.skip_final_model_save:
         logging.info("Skipping final model save (skip_final_model_save=True)")
     else:

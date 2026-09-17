@@ -149,6 +149,7 @@ LAUNCH_CMD=(
     --output_dir "$OUTPUT_DIR"
     --save_steps "$SAVE_STEPS"
     --save_total_limit 5
+    --skip_final_model_save
     --max_steps "$MAX_STEPS"
     --warmup_ratio 0.05
     --weight_decay 1e-5

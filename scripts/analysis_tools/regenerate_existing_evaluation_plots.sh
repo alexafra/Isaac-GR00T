@@ -9,8 +9,8 @@ if (($#)); then
     MODEL_RUNS=("$@")
 else
     MODEL_RUNS=(
-        "$HOME/Development/Models/c_d1_batch_32_acc_1_10k_chunk_16_0908_2_atomic"
-        "$HOME/Development/Models/c_only_batch_32_acc_1_10k_chunk_16_0908_2_10k_atomic"
+        "$HOME/Development/Models/dex3/c_d1_batch_32_acc_1_10k_chunk_16_0908_2_atomic"
+        "$HOME/Development/Models/dex3/c_only_batch_32_acc_1_10k_chunk_16_0908_2_10k_atomic"
     )
 fi
 

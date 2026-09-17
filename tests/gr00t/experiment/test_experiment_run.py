@@ -26,7 +26,7 @@ exercises almost the entire training stack:
       → Gr00tN1d7 model (from_pretrained with checkpoint)
     → TrainingArguments + Gr00tTrainer
     → trainer.train(max_steps=1)
-    → trainer.save_model()
+    → trainer checkpoint save (root-level duplicate save is skipped by default)
 
 Covers modules at 0% coverage: experiment.py, trainer.py, model_pipeline.py,
 and heavily exercises sharded_*.py, factory.py, processing_gr00t_n1d7.py.

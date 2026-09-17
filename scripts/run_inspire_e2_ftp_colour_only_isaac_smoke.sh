@@ -5,7 +5,7 @@ GROOT_ROOT="/home/alex/Development/Isaac-GR00T"
 SIM_ROOT="/home/alex/Development/unitree_sim_isaaclab"
 CLIENT_ROOT="/home/alex/Development/unitree_lerobot"
 DATASET_ROOT="/home/alex/Development/Datasets/lerobot2/inspire_e2_ftp_colour_only_test_20260912/train"
-MODEL_ROOT="/home/alex/Development/Models/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z"
+MODEL_ROOT="/home/alex/Development/Models/inspire/inspire_e2_ftp_colour_only_rgb_redcup_pick_put_82eps_bf16_b32a1_h32_20k_20260912T150904Z"
 CHECKPOINT_STEP="${CHECKPOINT_STEP:-15000}"
 if [[ "${CHECKPOINT_STEP}" != "15000" && "${CHECKPOINT_STEP}" != "20000" ]]; then
     echo "NOT READY: CHECKPOINT_STEP must be 15000 or 20000." >&2

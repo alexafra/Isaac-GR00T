@@ -176,3 +176,6 @@ __pycache__/
 # Local analysis outputs
 /output/
 /output.png
+
+# Local SQLite session scratch created by ad-hoc analysis tools
+/:memory:.ses
