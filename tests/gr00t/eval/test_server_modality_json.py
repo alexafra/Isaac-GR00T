@@ -333,6 +333,18 @@ def _surface_normals_encoding():
     }
 
 
+def _surface_normals_encoding_v2():
+    encoding = _surface_normals_encoding()
+    encoding["encoding_version"] = 2
+    encoding["depth_valid_range_m"] = {
+        "near_m": 0.25,
+        "far_m": 1.0,
+        "inclusive": True,
+        "required_samples": ["center", "left", "right", "up", "down"],
+    }
+    return encoding
+
+
 def _camera_calibration_identity():
     return {
         "source": "converter.profile.d435i-254322071415",
@@ -387,6 +399,17 @@ def test_load_deployment_dataset_contract_includes_surface_normals(tmp_path):
     assert len(contract["sha256"]) == 64
 
 
+def test_load_deployment_dataset_contract_accepts_masked_surface_normals_v2(tmp_path):
+    dataset = _write_surface_normals_dataset(
+        tmp_path,
+        encoding=_surface_normals_encoding_v2(),
+    )
+
+    contract = _load_deployment_dataset_contract(dataset)
+
+    assert contract["surface_normals_encoding"] == _surface_normals_encoding_v2()
+
+
 def test_surface_normals_contract_preserves_camera_calibration_identity(tmp_path):
     encoding = _surface_normals_encoding()
     encoding["camera_calibration"] = _camera_calibration_identity()
@@ -429,7 +452,7 @@ def test_surface_normals_view_requires_versioned_encoding_metadata(tmp_path):
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda value: value.update(encoding_version=2), "encoding_version"),
+        (lambda value: value.update(encoding_version=3), "encoding_version"),
         (
             lambda value: value["intrinsics"].update(width=848),
             "intrinsics resolution",
@@ -450,6 +473,97 @@ def test_deployment_contract_rejects_malformed_surface_normals_encoding(tmp_path
     dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
 
     with pytest.raises(ValueError, match=message):
+        _load_deployment_dataset_contract(dataset)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.pop("depth_valid_range_m"), "depth_valid_range_m"),
+        (
+            lambda value: value["depth_valid_range_m"].update(inclusive=False),
+            "inclusive",
+        ),
+        (
+            lambda value: value["depth_valid_range_m"].update(near_m=1.0),
+            "near_m < far_m",
+        ),
+        (
+            lambda value: value["depth_valid_range_m"].update(extra=True),
+            "exactly",
+        ),
+        (
+            lambda value: value["depth_valid_range_m"].update(required_samples=["center"]),
+            "required_samples must be exactly",
+        ),
+        (
+            lambda value: value.update(range_semantics="center_only"),
+            "unsupported fields",
+        ),
+    ],
+)
+def test_surface_normals_v2_rejects_malformed_depth_valid_range(tmp_path, mutate, message):
+    encoding = _surface_normals_encoding_v2()
+    mutate(encoding)
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
+
+    with pytest.raises(ValueError, match=message):
+        _load_deployment_dataset_contract(dataset)
+
+
+@pytest.mark.parametrize(
+    "range_value",
+    [
+        None,
+        {
+            "near_m": 0.25,
+            "far_m": 1.0,
+            "inclusive": True,
+            "required_samples": ["center", "left", "right", "up", "down"],
+        },
+    ],
+)
+def test_surface_normals_v1_rejects_v2_range_field(tmp_path, range_value):
+    encoding = _surface_normals_encoding()
+    encoding["depth_valid_range_m"] = range_value
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
+
+    with pytest.raises(ValueError, match="version 1.*depth_valid_range_m"):
+        _load_deployment_dataset_contract(dataset)
+
+
+def test_surface_normals_v2_range_must_match_canonical_depth_contract(tmp_path):
+    encoding = _surface_normals_encoding_v2()
+    encoding["depth_valid_range_m"]["far_m"] = 0.9
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
+
+    with pytest.raises(ValueError, match="must exactly match.*canonical depth encoding"):
+        _load_deployment_dataset_contract(dataset)
+
+
+def test_surface_normals_v2_range_must_match_declared_depth_view(tmp_path):
+    encoding = _surface_normals_encoding_v2()
+    encoding["depth_valid_range_m"]["far_m"] = 0.9
+    dataset = _write_surface_normals_dataset(tmp_path, encoding=encoding)
+    info_path = dataset / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["observation.images.depth_gray_view"] = {
+        "dtype": "video",
+        "shape": [480, 640, 3],
+    }
+    info["depth_encoding"] = {
+        "source_key": "depth_0",
+        "feature_key": "observation.images.depth_gray_view",
+        "encoding": "linear_grayscale_replicated_rgb",
+        "default_scale_m_per_unit": 0.001,
+        "near_m": 0.25,
+        "far_m": 1.0,
+        "invalid_value": 0,
+        "valid_value_range": [1, 255],
+    }
+    info_path.write_text(json.dumps(info))
+
+    with pytest.raises(ValueError, match="must exactly match.*dataset depth_encoding"):
         _load_deployment_dataset_contract(dataset)
 
 

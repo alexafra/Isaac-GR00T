@@ -35,7 +35,21 @@ DEFAULT_MODEL_SERVER_PORT = 5555
 IMAGE_FEATURE_PREFIX = "observation.images."
 SURFACE_NORMALS_VIEW = "surface_normals_view"
 SURFACE_NORMALS_ENCODING = "camera_xyz_uint8"
-SURFACE_NORMALS_ENCODING_VERSION = 1
+LEGACY_SURFACE_NORMALS_ENCODING_VERSION = 1
+SURFACE_NORMALS_ENCODING_VERSION = 2
+SUPPORTED_SURFACE_NORMALS_ENCODING_VERSIONS = (
+    LEGACY_SURFACE_NORMALS_ENCODING_VERSION,
+    SURFACE_NORMALS_ENCODING_VERSION,
+)
+SURFACE_NORMALS_DEPTH_RANGE_REQUIRED_SAMPLES = (
+    "center",
+    "left",
+    "right",
+    "up",
+    "down",
+)
+DEFAULT_DEPTH_NEAR_M = 0.25
+DEFAULT_DEPTH_FAR_M = 1.0
 TASK_CONTRACT_SCHEMA_VERSION = 1
 REALSENSE_RGBD_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
 
@@ -443,11 +457,85 @@ def _load_surface_normals_encoding(info: dict, video_shapes: dict[str, list[int]
     if (
         isinstance(encoding_version, bool)
         or not isinstance(encoding_version, int)
-        or encoding_version != SURFACE_NORMALS_ENCODING_VERSION
+        or encoding_version not in SUPPORTED_SURFACE_NORMALS_ENCODING_VERSIONS
     ):
         raise ValueError(
-            "Dataset surface_normals_encoding.encoding_version must be the supported "
-            f"version {SURFACE_NORMALS_ENCODING_VERSION}"
+            "Dataset surface_normals_encoding.encoding_version must be one of the supported "
+            f"versions {list(SUPPORTED_SURFACE_NORMALS_ENCODING_VERSIONS)!r}"
+        )
+
+    depth_valid_range = raw_encoding.get("depth_valid_range_m")
+    normalized_depth_valid_range = None
+    if encoding_version == LEGACY_SURFACE_NORMALS_ENCODING_VERSION:
+        if "depth_valid_range_m" in raw_encoding:
+            raise ValueError(
+                "Dataset legacy surface_normals_encoding version 1 must not declare "
+                "depth_valid_range_m"
+            )
+    else:
+        if not isinstance(depth_valid_range, dict) or set(depth_valid_range) != {
+            "near_m",
+            "far_m",
+            "inclusive",
+            "required_samples",
+        }:
+            raise ValueError(
+                "Dataset surface_normals_encoding.depth_valid_range_m must contain exactly "
+                "near_m, far_m, inclusive, and required_samples"
+            )
+        if depth_valid_range["inclusive"] is not True:
+            raise ValueError(
+                "Dataset surface_normals_encoding.depth_valid_range_m.inclusive must be true"
+            )
+        if depth_valid_range["required_samples"] != list(
+            SURFACE_NORMALS_DEPTH_RANGE_REQUIRED_SAMPLES
+        ):
+            raise ValueError(
+                "Dataset surface_normals_encoding.depth_valid_range_m.required_samples "
+                "must be exactly "
+                f"{list(SURFACE_NORMALS_DEPTH_RANGE_REQUIRED_SAMPLES)!r}"
+            )
+        near_m = depth_valid_range["near_m"]
+        far_m = depth_valid_range["far_m"]
+        if (
+            isinstance(near_m, bool)
+            or isinstance(far_m, bool)
+            or not isinstance(near_m, (int, float))
+            or not isinstance(far_m, (int, float))
+            or not math.isfinite(near_m)
+            or not math.isfinite(far_m)
+            or near_m < 0.0
+            or far_m <= near_m
+        ):
+            raise ValueError(
+                "Dataset surface_normals_encoding.depth_valid_range_m requires finite "
+                "0 <= near_m < far_m"
+            )
+        normalized_depth_valid_range = {
+            "near_m": float(near_m),
+            "far_m": float(far_m),
+            "inclusive": True,
+            "required_samples": list(SURFACE_NORMALS_DEPTH_RANGE_REQUIRED_SAMPLES),
+        }
+
+    expected_top_level_fields = set(expected_strings) | {
+        "encoding_version",
+        "default_scale_m_per_unit",
+        "intrinsics",
+        "axis_order",
+        "neighbor_offset_pixels",
+        "max_neighbor_depth_delta_m",
+        "invalid_value",
+        "valid_component_range",
+        "camera_calibration",
+    }
+    if encoding_version == SURFACE_NORMALS_ENCODING_VERSION:
+        expected_top_level_fields.add("depth_valid_range_m")
+    unknown_fields = set(raw_encoding) - expected_top_level_fields
+    if unknown_fields:
+        raise ValueError(
+            "Dataset surface_normals_encoding declares unsupported fields: "
+            f"{sorted(unknown_fields)!r}"
         )
 
     default_scale = raw_encoding.get("default_scale_m_per_unit")
@@ -462,9 +550,15 @@ def _load_surface_normals_encoding(info: dict, video_shapes: dict[str, list[int]
         )
 
     intrinsics = raw_encoding.get("intrinsics")
-    if not isinstance(intrinsics, dict) or intrinsics.get("model") != "pinhole":
+    expected_intrinsics_fields = {"model", "width", "height", "fx", "fy", "cx", "cy"}
+    if (
+        not isinstance(intrinsics, dict)
+        or set(intrinsics) != expected_intrinsics_fields
+        or intrinsics.get("model") != "pinhole"
+    ):
         raise ValueError(
-            "Dataset surface_normals_encoding.intrinsics must describe a pinhole camera"
+            "Dataset surface_normals_encoding.intrinsics must contain exactly the pinhole "
+            f"fields {sorted(expected_intrinsics_fields)!r}"
         )
     normalized_intrinsics = {"model": "pinhole"}
     for field in ("width", "height"):
@@ -529,6 +623,8 @@ def _load_surface_normals_encoding(info: dict, video_shapes: dict[str, list[int]
         "invalid_value": [0, 0, 0],
         "valid_component_range": [1, 255],
     }
+    if normalized_depth_valid_range is not None:
+        normalized_encoding["depth_valid_range_m"] = normalized_depth_valid_range
     camera_calibration = raw_encoding.get("camera_calibration")
     if camera_calibration is not None:
         if not isinstance(camera_calibration, dict) or set(camera_calibration) != {
@@ -618,6 +714,28 @@ def _load_deployment_dataset_contract(dataset_path: Path) -> dict:
             )
         depth_encoding = _load_depth_encoding(info, video_shapes)
         surface_normals_encoding = _load_surface_normals_encoding(info, video_shapes)
+        if (
+            surface_normals_encoding is not None
+            and surface_normals_encoding["encoding_version"] == SURFACE_NORMALS_ENCODING_VERSION
+        ):
+            expected_near_m = (
+                depth_encoding["near_m"] if depth_encoding is not None else DEFAULT_DEPTH_NEAR_M
+            )
+            expected_far_m = (
+                depth_encoding["far_m"] if depth_encoding is not None else DEFAULT_DEPTH_FAR_M
+            )
+            normal_range = surface_normals_encoding["depth_valid_range_m"]
+            if normal_range["near_m"] != expected_near_m or normal_range["far_m"] != expected_far_m:
+                source = (
+                    "dataset depth_encoding"
+                    if depth_encoding is not None
+                    else "canonical depth encoding"
+                )
+                raise ValueError(
+                    "Dataset surface-normal v2 depth_valid_range_m must exactly match "
+                    f"the {source} near/far bounds "
+                    f"[{expected_near_m}, {expected_far_m}]"
+                )
         contract = {
             "robot_type": str(info["robot_type"]),
             "fps": float(info["fps"]),
