@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import sys
 
+from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
 from gr00t.policy.gr00t_policy import Gr00tPolicy
@@ -777,6 +778,31 @@ def _validate_checkpoint_dataset_vision_contract(
     it has two semantically ordered, spatially aligned three-channel sources,
     and deployment must provide the encoding metadata for the auxiliary view.
     """
+
+    depth_colormap = vision_contract.get("depth_colormap")
+    if depth_colormap is not None:
+        expected_colormap = fixed_turbo_depth_colormap_contract()
+        if depth_colormap != expected_colormap:
+            raise ValueError(
+                "Checkpoint depth-colormap contract does not match fixed_turbo_v1: "
+                f"got {depth_colormap!r}, expected {expected_colormap!r}"
+            )
+        depth_encoding = dataset_contract.get("depth_encoding")
+        if not isinstance(depth_encoding, dict):
+            raise ValueError(
+                "fixed_turbo_v1 requires deployment depth_encoding metadata"
+            )
+        expected_encoding = {
+            "encoding": "linear_grayscale_replicated_rgb",
+            "invalid_value": 0,
+            "valid_value_range": [1, 255],
+        }
+        for field, expected in expected_encoding.items():
+            if depth_encoding.get(field) != expected:
+                raise ValueError(
+                    "fixed_turbo_v1 deployment depth encoding mismatch for "
+                    f"{field}: got {depth_encoding.get(field)!r}, expected {expected!r}"
+                )
 
     if vision_contract.get("mode") != POST_VISION_LATE_FUSION_MODE:
         return

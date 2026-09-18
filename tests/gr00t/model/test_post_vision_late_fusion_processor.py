@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import albumentations as A
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+from gr00t.data.depth_colormap import FIXED_TURBO_DEPTH_COLORMAP, FIXED_TURBO_DEPTH_LUT
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig, VideoChannelSource
 from gr00t.data.utils import parse_modality_configs, to_json_serializable
@@ -87,6 +88,30 @@ def test_post_vision_fusion_config_roundtrip_and_validation():
         )
 
 
+def test_fixed_turbo_depth_config_roundtrip_and_validation():
+    video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+
+    restored = parse_modality_configs(
+        to_json_serializable({"tag": {"video": video}})
+    )["tag"]["video"]
+
+    assert restored.depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    with pytest.raises(ValueError, match="depth_colormap must be"):
+        ModalityConfig([0], ["depth_gray_view"], depth_colormap="library_turbo")
+    with pytest.raises(ValueError, match="requires post-vision late fusion"):
+        ModalityConfig(
+            [0],
+            ["ego_view", "surface_normals_view"],
+            depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+        )
+
+
 def test_processor_rejects_mixed_late_fusion_stages():
     configs = {
         "pre": {
@@ -125,6 +150,11 @@ def test_processor_rejects_mixed_late_fusion_stages():
             "post_vision_language_adapter",
         ),
         (
+            "g1_inspire_head_rgbd_turbo_late_fusion_pre_adapter_config",
+            "depth_gray_view",
+            "pre_vision_language_adapter",
+        ),
+        (
             "g1_inspire_head_rgb_surface_normals_late_fusion_pre_adapter_config",
             "surface_normals_view",
             "pre_vision_language_adapter",
@@ -158,6 +188,9 @@ def test_inspire_post_vision_late_fusion_configs_are_explicit(config_name, auxil
     assert video.post_vision_fusion_stage == stage
     assert video.channel_fusion is None
     assert video.vision_input_channels == 3
+    assert video.depth_colormap == (
+        FIXED_TURBO_DEPTH_COLORMAP if "turbo" in config_name else None
+    )
 
 
 def test_post_vision_fusion_keeps_two_3_channel_branches_and_one_prompt_stream():
@@ -185,6 +218,96 @@ def test_post_vision_fusion_keeps_two_3_channel_branches_and_one_prompt_stream()
     assert np.asarray(result["late_fusion_images"][0]).shape == (8, 9, 3)
     conversation = processor.processor.apply_chat_template.call_args.args[0]
     assert [item["type"] for item in conversation[0]["content"]] == ["image", "text"]
+
+
+def test_fixed_turbo_depth_runs_before_training_spatial_transforms():
+    processor = Gr00tN1d7Processor.__new__(Gr00tN1d7Processor)
+    processor.use_albumentations = True
+    processor.training = True
+    processor.processor = MagicMock()
+    processor.processor.apply_chat_template.return_value = "one destination image"
+    gray = np.array([[0, 1, 127], [254, 255, 2]], dtype=np.uint8)
+    depth = Image.fromarray(np.repeat(gray[..., None], 3, axis=-1))
+    ego = _solid_image((10, 20, 30)).resize((3, 2))
+
+    result = processor._get_vlm_inputs(
+        image_keys=["ego_view", "depth_gray_view"],
+        images={"ego_view": [ego], "depth_gray_view": [depth]},
+        masks=None,
+        image_transform=A.ReplayCompose([]),
+        language="test",
+        post_vision_fusion=True,
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )["vlm_content"]
+
+    np.testing.assert_array_equal(
+        np.asarray(result["late_fusion_images"][0]),
+        FIXED_TURBO_DEPTH_LUT[gray],
+    )
+    np.testing.assert_array_equal(np.asarray(result["images"][0]), np.asarray(ego))
+
+
+def test_fixed_turbo_depth_runs_in_batched_policy_observation_path():
+    tag = EmbodimentTag.NEW_EMBODIMENT
+    video = ModalityConfig(
+        [0],
+        ["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    processor = Gr00tN1d7Processor.__new__(Gr00tN1d7Processor)
+    processor.modality_configs = {
+        tag.value: {
+            "video": video,
+            "state": ModalityConfig([0], ["joint"]),
+            "action": ModalityConfig([0], ["joint"]),
+            "language": ModalityConfig([0], ["task"]),
+        }
+    }
+    processor.exclude_state = False
+    processor.max_state_dim = 1
+    processor.max_action_horizon = 1
+    processor.use_albumentations = True
+    processor.eval_image_transform = A.ReplayCompose([])
+    processor.formalize_language = False
+    processor.embodiment_id_mapping = {tag.value: 0}
+    processor.state_action_processor = MagicMock()
+    processor.state_action_processor.apply_state.return_value = {
+        "joint": np.zeros((1, 1), dtype=np.float32)
+    }
+
+    grid = torch.tensor([[1, 1, 1]])
+    qwen = MagicMock()
+    qwen.apply_chat_template.return_value = "prompt"
+    qwen.return_value = {
+        "input_ids": torch.ones((1, 1), dtype=torch.long),
+        "attention_mask": torch.ones((1, 1), dtype=torch.long),
+        "image_grid_thw": grid,
+    }
+    qwen.image_processor.return_value = {
+        "pixel_values": torch.zeros((1, 1)),
+        "image_grid_thw": grid.clone(),
+    }
+    processor.processor = qwen
+
+    gray = np.array([[0, 1, 127], [254, 255, 2]], dtype=np.uint8)
+    depth = np.repeat(gray[..., None], 3, axis=-1)[None, None]
+    ego = np.full_like(depth, 17)
+    processor.process_observation(
+        {
+            "video.ego_view": ego,
+            "video.depth_gray_view": depth,
+            "state.joint": np.zeros((1, 1), dtype=np.float32),
+            "task": ["test"],
+        },
+        tag,
+    )
+
+    auxiliary = np.asarray(qwen.image_processor.call_args.kwargs["images"][0])
+    np.testing.assert_array_equal(auxiliary, FIXED_TURBO_DEPTH_LUT[gray])
+    primary = np.asarray(qwen.call_args.kwargs["images"][0])
+    np.testing.assert_array_equal(primary, ego[0, 0])
 
 
 def test_post_vision_fusion_collator_emits_paired_auxiliary_tensors():

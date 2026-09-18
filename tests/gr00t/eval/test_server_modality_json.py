@@ -15,6 +15,7 @@
 
 import json
 
+from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
 from gr00t.data.types import ModalityConfig
 import gr00t.eval.run_gr00t_server as server_module
 from gr00t.eval.run_gr00t_server import (
@@ -497,6 +498,41 @@ def test_late_fusion_checkpoint_contract_requires_auxiliary_encoding_metadata():
 
     with pytest.raises(ValueError, match="surface_normals_encoding metadata"):
         _validate_checkpoint_dataset_vision_contract(vision_contract, dataset_contract)
+
+
+def test_fixed_turbo_checkpoint_requires_exact_gray_depth_dataset_contract():
+    vision_contract = _late_fusion_vision_contract("depth_gray_view")
+    vision_contract["depth_colormap"] = fixed_turbo_depth_colormap_contract()
+    dataset_contract = {
+        "video_shapes": {
+            "ego_view": [480, 640, 3],
+            "depth_gray_view": [480, 640, 3],
+        },
+        "depth_encoding": {
+            "encoding": "linear_grayscale_replicated_rgb",
+            "invalid_value": 0,
+            "valid_value_range": [1, 255],
+        },
+    }
+
+    _validate_checkpoint_dataset_vision_contract(vision_contract, dataset_contract)
+
+    for field, bad_value in (
+        ("encoding", "frame_normalized_gray"),
+        ("invalid_value", 255),
+        ("valid_value_range", [0, 255]),
+    ):
+        malformed = dict(dataset_contract)
+        malformed["depth_encoding"] = dict(dataset_contract["depth_encoding"])
+        malformed["depth_encoding"][field] = bad_value
+        with pytest.raises(ValueError, match=f"mismatch for {field}"):
+            _validate_checkpoint_dataset_vision_contract(vision_contract, malformed)
+
+    with pytest.raises(ValueError, match="requires deployment depth_encoding metadata"):
+        _validate_checkpoint_dataset_vision_contract(
+            vision_contract,
+            {"video_shapes": dataset_contract["video_shapes"]},
+        )
 
 
 def test_late_fusion_checkpoint_contract_rejects_legacy_fusion_stage_name():

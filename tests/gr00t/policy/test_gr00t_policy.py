@@ -23,6 +23,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from gr00t.data.depth_colormap import (
+    FIXED_TURBO_DEPTH_COLORMAP,
+    FIXED_TURBO_DEPTH_LUT_SHA256,
+    fixed_turbo_depth_colormap_contract,
+)
 from gr00t.data.types import ModalityConfig, VideoChannelSource  # earlyfusion
 from gr00t.policy.gr00t_policy import (  # earlyfusion
     _validate_post_vision_fusion_runtime,
@@ -204,6 +209,63 @@ def test_processor_cannot_reinterpret_checkpoint_fusion_mode():
         )
     with pytest.raises(ValueError, match="Checkpoint/processor post-vision fusion mismatch"):
         _vision_input_contract(_late_fusion_model("depth_gray_view"), separate_video)
+
+
+def test_fixed_turbo_depth_contract_is_checkpoint_bound():
+    video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    model = _late_fusion_model(
+        "depth_gray_view",
+        vision_depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+        vision_depth_colormap_lut_sha256=FIXED_TURBO_DEPTH_LUT_SHA256,
+    )
+
+    contract = _vision_input_contract(model, video)
+
+    assert contract["depth_colormap"] == fixed_turbo_depth_colormap_contract()
+
+    for overrides, message in (
+        (
+            {
+                "vision_depth_colormap": None,
+                "vision_depth_colormap_lut_sha256": None,
+            },
+            "depth-colormap mismatch",
+        ),
+        (
+            {
+                "vision_depth_colormap": FIXED_TURBO_DEPTH_COLORMAP,
+                "vision_depth_colormap_lut_sha256": "sha256:" + "0" * 64,
+            },
+            "LUT hash mismatch",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            _vision_input_contract(
+                _late_fusion_model("depth_gray_view", **overrides), video
+            )
+
+
+def test_gray_depth_processor_rejects_fixed_turbo_checkpoint_contract():
+    video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+    )
+    model = _late_fusion_model(
+        "depth_gray_view",
+        vision_depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+        vision_depth_colormap_lut_sha256=FIXED_TURBO_DEPTH_LUT_SHA256,
+    )
+
+    with pytest.raises(ValueError, match="depth-colormap mismatch"):
+        _vision_input_contract(model, video)
 
 
 def _late_fusion_runtime_model(

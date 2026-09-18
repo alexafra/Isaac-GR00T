@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 
+from gr00t.data.depth_colormap import FIXED_TURBO_DEPTH_COLORMAP
 from gr00t.data.embodiment_tags import EmbodimentTag
 
 
@@ -123,6 +124,8 @@ class ModalityConfig:
     """
     post_vision_fusion_stage: str | None = None
     """Whether fusion is before or after Qwen's vision-language adapter."""
+    depth_colormap: str | None = None
+    """Optional model-side colour map applied to ``depth_gray_view`` before image transforms."""
 
     @property  # earlyfusion
     def vision_input_channels(self) -> int:  # earlyfusion
@@ -198,4 +201,17 @@ class ModalityConfig:
         elif self.post_vision_fusion_stage is not None:
             raise ValueError(
                 "post_vision_fusion_stage must be None when post_vision_fusion is disabled"
+            )
+        if self.depth_colormap not in {None, FIXED_TURBO_DEPTH_COLORMAP}:
+            raise ValueError(
+                "depth_colormap must be None or "
+                f"{FIXED_TURBO_DEPTH_COLORMAP!r}, got {self.depth_colormap!r}"
+            )
+        if self.depth_colormap is not None and (
+            not self.post_vision_fusion
+            or self.modality_keys != ["ego_view", "depth_gray_view"]
+        ):
+            raise ValueError(
+                "depth_colormap requires post-vision late fusion with ordered "
+                "modality_keys ['ego_view', 'depth_gray_view']"
             )

@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+from gr00t.data.depth_colormap import FIXED_TURBO_DEPTH_COLORMAP, FIXED_TURBO_DEPTH_LUT_SHA256
 from gr00t.data.types import ModalityConfig, VideoChannelSource
 from gr00t.experiment.launch_finetune import (
     configure_vision_input_contract,
@@ -171,3 +172,37 @@ def test_launch_rejects_patch_embed_override_for_post_vision_fusion():
 
     with pytest.raises(ValueError, match="only valid for early-fusion"):
         configure_vision_input_contract(_config(video), "new_embodiment", video, "zeros")
+
+
+def test_launch_serializes_pinned_fixed_turbo_depth_contract():
+    video = ModalityConfig(
+        [0],
+        ["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    config = _config(video)
+
+    configure_vision_input_contract(config, "new_embodiment", video, None)
+
+    assert config.model.vision_depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    assert (
+        config.model.vision_depth_colormap_lut_sha256
+        == FIXED_TURBO_DEPTH_LUT_SHA256
+    )
+
+
+def test_launch_preserves_no_depth_colormap_for_existing_configs():
+    video = ModalityConfig(
+        [0],
+        ["ego_view", "depth_gray_view"],
+        post_vision_fusion=True,
+        post_vision_fusion_stage="pre_vision_language_adapter",
+    )
+    config = _config(video)
+
+    configure_vision_input_contract(config, "new_embodiment", video, None)
+
+    assert config.model.vision_depth_colormap is None
+    assert config.model.vision_depth_colormap_lut_sha256 is None

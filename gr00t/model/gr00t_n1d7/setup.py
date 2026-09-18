@@ -24,6 +24,7 @@ from transformers import AutoModel, AutoProcessor
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.data.dataset.factory import DatasetFactory
+from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
 from gr00t.model.base.model_pipeline import ModelPipeline
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
@@ -42,6 +43,46 @@ def convert_tensors_to_lists(obj):
         return [convert_tensors_to_lists(item) for item in obj]
     else:
         return obj
+
+
+def _reconcile_depth_colormap_contract(
+    checkpoint_config,
+    requested_config,
+    *,
+    initializing_late_fusion: bool,
+) -> None:
+    """Bind a base checkpoint to the requested depth representation exactly once."""
+
+    source = (
+        getattr(checkpoint_config, "vision_depth_colormap", None),
+        getattr(checkpoint_config, "vision_depth_colormap_lut_sha256", None),
+    )
+    target = (
+        getattr(requested_config, "vision_depth_colormap", None),
+        getattr(requested_config, "vision_depth_colormap_lut_sha256", None),
+    )
+    if target[0] is not None:
+        expected = fixed_turbo_depth_colormap_contract()
+        expected_target = (expected["name"], expected["lut_sha256"])
+        if target != expected_target:
+            raise RuntimeError(
+                "Requested depth-colormap contract is not the pinned fixed-Turbo contract: "
+                f"got {target!r}, expected {expected_target!r}"
+            )
+    elif target[1] is not None:
+        raise RuntimeError(
+            "Requested depth-colormap LUT digest requires a depth-colormap name"
+        )
+    if source == target:
+        return
+    if source == (None, None) and initializing_late_fusion:
+        checkpoint_config.vision_depth_colormap = target[0]
+        checkpoint_config.vision_depth_colormap_lut_sha256 = target[1]
+        return
+    raise RuntimeError(
+        "Checkpoint depth-colormap contract does not match the requested configuration: "
+        f"checkpoint={source!r}, requested={target!r}"
+    )
 
 
 class Gr00tN1d7Pipeline(ModelPipeline):
@@ -171,8 +212,12 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.model_config.vision_fusion_rgb_init_scale,
                 self.model_config.vision_fusion_geometry_init_scale,
             )
+            initializing_late_fusion = (
+                source_fusion[0] == "none"
+                and target_fusion[0] == "post_vision_late_fusion"
+            )
             if source_fusion != target_fusion:
-                if source_fusion[0] == "none" and target_fusion[0] == "post_vision_late_fusion":
+                if initializing_late_fusion:
                     model.backbone.enable_post_vision_late_fusion(
                         mode=target_fusion[0],
                         version=target_fusion[1],
@@ -231,6 +276,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     geometry_init_scale=source_fusion[13],
                     vision_input_channels=source_channels,
                 )
+            _reconcile_depth_colormap_contract(
+                model.config,
+                self.model_config,
+                initializing_late_fusion=initializing_late_fusion,
+            )
 
         else:
             model = self.model_class(

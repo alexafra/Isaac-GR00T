@@ -69,6 +69,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     vision_fusion_rgb_init_scale: float = 0.5
     vision_fusion_geometry_init_scale: float = 0.5
     tune_vision_fusion_adapters: bool = True
+    # Optional model-side preprocessing for the depth auxiliary view. The LUT
+    # digest binds a checkpoint to the exact pixel representation used during
+    # training rather than relying on a library-provided colour map.
+    vision_depth_colormap: str | None = None
+    vision_depth_colormap_lut_sha256: str | None = None
     select_layer: int = 12
     reproject_vision: bool = False
     use_flash_attention: bool = True

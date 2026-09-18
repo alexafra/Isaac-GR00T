@@ -24,6 +24,7 @@ import tyro
 
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
+from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
 from gr00t.experiment.experiment import run
 
 
@@ -58,6 +59,17 @@ def configure_vision_input_contract(
     vision_patch_embed_init: str | None,
 ) -> None:
     """Map the selected video recipe onto the serialized model vision contract."""
+
+    depth_colormap = video_config.depth_colormap
+    depth_colormap_contract = (
+        fixed_turbo_depth_colormap_contract() if depth_colormap is not None else None
+    )
+    config.model.vision_depth_colormap = depth_colormap
+    config.model.vision_depth_colormap_lut_sha256 = (
+        depth_colormap_contract["lut_sha256"]
+        if depth_colormap_contract is not None
+        else None
+    )
 
     if vision_patch_embed_init is not None and not video_config.channel_fusion:  # fmt: skip  # earlyfusion
         raise ValueError(

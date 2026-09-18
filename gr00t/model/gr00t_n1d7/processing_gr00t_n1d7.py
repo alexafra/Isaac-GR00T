@@ -33,6 +33,11 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.utils import cached_file
 
 from gr00t.configs.data.embodiment_configs import ModalityConfig
+from gr00t.data.depth_colormap import (
+    FIXED_TURBO_DEPTH_COLORMAP,
+    apply_fixed_turbo_depth_colormap,
+    apply_fixed_turbo_depth_colormap_array,
+)
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
@@ -642,7 +647,16 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Process images: observation values are (B, T, H, W, C) numpy arrays
         video_config = modality_config["video"]  # earlyfusion
         image_keys = video_config.modality_keys  # earlyfusion
-        images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
+        images_dict = {}
+        for view in image_keys:
+            view_images = observation[f"video.{view}"]
+            if video_config.depth_colormap is not None and view == "depth_gray_view":
+                if video_config.depth_colormap != FIXED_TURBO_DEPTH_COLORMAP:
+                    raise ValueError(
+                        f"Unsupported depth colormap: {video_config.depth_colormap!r}"
+                    )
+                view_images = apply_fixed_turbo_depth_colormap_array(view_images)
+            images_dict[view] = torch.from_numpy(view_images)
         images = torch.stack(
             [images_dict[view] for view in image_keys], dim=2
         )  # (B, T, V, H, W, C)
@@ -903,6 +917,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             language=language,
             channel_fusion=video_config.channel_fusion,  # earlyfusion
             post_vision_fusion=video_config.post_vision_fusion,
+            depth_colormap=video_config.depth_colormap,
         )
 
         transformed_inputs = {
@@ -920,14 +935,23 @@ class Gr00tN1d7Processor(BaseProcessor):
     def _get_vlm_inputs(
         self,
         image_keys: list[str],
-        images: list[Image.Image],
+        images: dict[str, list[Image.Image | np.ndarray]],
         masks: dict[str, list[np.ndarray]] | None,
         image_transform: transforms.Compose | A.Compose,
         language: str,
         channel_fusion: list[Any] | None = None,  # earlyfusion
         post_vision_fusion: bool = False,
+        depth_colormap: str | None = None,
     ):
         temporal_stacked_images = {}
+
+        def images_for_view(view: str) -> list[Image.Image | np.ndarray]:
+            view_images = images[view]
+            if depth_colormap is None or view != "depth_gray_view":
+                return view_images
+            if depth_colormap != FIXED_TURBO_DEPTH_COLORMAP:
+                raise ValueError(f"Unsupported depth colormap: {depth_colormap!r}")
+            return [apply_fixed_turbo_depth_colormap(image) for image in view_images]
 
         if self.use_albumentations:
             # Use albumentations transforms
@@ -937,7 +961,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 if masks is not None:
                     assert view in masks, f"{view} not in masks"
                 view_masks = masks.get(view) if masks else None
-                view_images = images[view]
+                view_images = images_for_view(view)
 
                 # Apply transforms with replay for consistency
                 transformed_images, replay = apply_with_replay(
@@ -962,11 +986,12 @@ class Gr00tN1d7Processor(BaseProcessor):
             geometry_image_transform = _without_torchvision_color_jitter(image_transform)
             for view in image_keys:
                 assert view in images, f"{view} not in {images}"
+                view_images = images_for_view(view)
                 view_transform = (
                     geometry_image_transform if _is_geometry_view(view) else image_transform
                 )
                 temporal_stacked_images[view] = torch.stack(
-                    [view_transform(img) for img in images[view]]
+                    [view_transform(img) for img in view_images]
                 )  # (T, C, H, W)
 
         for k, v in temporal_stacked_images.items():

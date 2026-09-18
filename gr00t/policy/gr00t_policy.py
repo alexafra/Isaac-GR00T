@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from transformers import AutoModel, AutoProcessor
 
+from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
 from gr00t.data.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
@@ -81,6 +82,39 @@ _POST_VISION_STAGE_SPECS = {
 }
 
 
+def _depth_colormap_contract(
+    model_config: Any, video_config: ModalityConfig
+) -> dict[str, object] | None:
+    """Validate the checkpoint/processor depth representation contract."""
+
+    processor_name = getattr(video_config, "depth_colormap", None)
+    checkpoint_name = getattr(model_config, "vision_depth_colormap", None)
+    checkpoint_digest = getattr(
+        model_config, "vision_depth_colormap_lut_sha256", None
+    )
+    if checkpoint_name != processor_name:
+        raise ValueError(
+            "Checkpoint/processor depth-colormap mismatch: "
+            f"checkpoint={checkpoint_name!r}, processor={processor_name!r}"
+        )
+    if processor_name is None:
+        if checkpoint_digest is not None:
+            raise ValueError(
+                "Checkpoint without a depth colormap must not declare a depth LUT digest; "
+                f"got {checkpoint_digest!r}"
+            )
+        return None
+
+    contract = fixed_turbo_depth_colormap_contract()
+    expected_digest = contract["lut_sha256"]
+    if checkpoint_digest != expected_digest:
+        raise ValueError(
+            "Checkpoint fixed-Turbo depth LUT hash mismatch: "
+            f"got {checkpoint_digest!r}, expected {expected_digest!r}"
+        )
+    return contract
+
+
 def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> dict[str, Any]:  # fmt: skip  # earlyfusion
     fusion = getattr(video_config, "channel_fusion", None)  # earlyfusion
     post_vision_fusion = getattr(video_config, "post_vision_fusion", False)
@@ -114,6 +148,7 @@ def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> d
         raise ValueError(f"Early-fusion model/processor layout mismatch: model={model_layout!r}, processor={layout!r}")  # fmt: skip  # earlyfusion
     if patch_init not in allowed_inits:  # earlyfusion
         raise ValueError(f"Early-fusion patch initialization mismatch: got {patch_init!r}, allowed {sorted(allowed_inits)!r}")  # fmt: skip  # earlyfusion
+    depth_colormap = _depth_colormap_contract(model_config, video_config)
     if fusion_mode == _POST_VISION_LATE_FUSION:
         wire_keys = list(video_config.modality_keys)
         if fusion:
@@ -259,7 +294,7 @@ def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> d
                 f"got {patch_embed_trainable!r}"
             )
         parameters_per_adapter = adapter_input_dim * adapter_output_dim + adapter_output_dim
-        return {
+        contract = {
             "version": 2,
             "mode": _POST_VISION_LATE_FUSION,
             "input_channels": channels,
@@ -287,7 +322,13 @@ def _vision_input_contract(model_config: Any, video_config: ModalityConfig) -> d
                 "source_keys": normalized_source_keys,
             },
         }
-    return {"version": 1, "mode": "early_channel_fusion" if fusion else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": patch_init, "wire_video_keys": list(video_config.modality_keys)}  # fmt: skip  # earlyfusion
+        if depth_colormap is not None:
+            contract["depth_colormap"] = depth_colormap
+        return contract
+    contract = {"version": 1, "mode": "early_channel_fusion" if fusion else "separate_views", "input_channels": channels, "channel_layout": layout, "patch_embed_init": patch_init, "wire_video_keys": list(video_config.modality_keys)}  # fmt: skip  # earlyfusion
+    if depth_colormap is not None:
+        contract["depth_colormap"] = depth_colormap
+    return contract
 
 
 def _validate_post_vision_fusion_runtime(model: Any, contract: dict[str, Any]) -> None:
