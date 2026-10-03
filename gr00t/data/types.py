@@ -207,11 +207,19 @@ class ModalityConfig:
                 "depth_colormap must be None or "
                 f"{FIXED_TURBO_DEPTH_COLORMAP!r}, got {self.depth_colormap!r}"
             )
-        if self.depth_colormap is not None and (
-            not self.post_vision_fusion
-            or self.modality_keys != ["ego_view", "depth_gray_view"]
+        if self.depth_colormap is not None and self.modality_keys != [
+            "ego_view",
+            "depth_gray_view",
+        ]:
+            raise ValueError(
+                "depth_colormap requires separate RGB and depth inputs with ordered "
+                "modality_keys ['ego_view', 'depth_gray_view']"
+            )
+        if (
+            self.depth_colormap is not None
+            and self.channel_fusion is not None
+            and self.channel_fusion[1].channels != (0, 1, 2)
         ):
             raise ValueError(
-                "depth_colormap requires post-vision late fusion with ordered "
-                "modality_keys ['ego_view', 'depth_gray_view']"
+                "depth_colormap early channel fusion requires all three Turbo channels"
             )

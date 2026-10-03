@@ -97,17 +97,37 @@ def test_fixed_turbo_depth_config_roundtrip_and_validation():
         depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
     )
 
-    restored = parse_modality_configs(
-        to_json_serializable({"tag": {"video": video}})
-    )["tag"]["video"]
+    restored = parse_modality_configs(to_json_serializable({"tag": {"video": video}}))["tag"][
+        "video"
+    ]
 
     assert restored.depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    separate = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    separate_restored = parse_modality_configs(to_json_serializable({"tag": {"video": separate}}))[
+        "tag"
+    ]["video"]
+    assert separate_restored.depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    assert separate_restored.post_vision_fusion is False
     with pytest.raises(ValueError, match="depth_colormap must be"):
         ModalityConfig([0], ["depth_gray_view"], depth_colormap="library_turbo")
-    with pytest.raises(ValueError, match="requires post-vision late fusion"):
+    with pytest.raises(ValueError, match="requires separate RGB and depth inputs"):
         ModalityConfig(
             [0],
             ["ego_view", "surface_normals_view"],
+            depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+        )
+    with pytest.raises(ValueError, match="requires all three Turbo channels"):
+        ModalityConfig(
+            [0],
+            ["ego_view", "depth_gray_view"],
+            channel_fusion=[
+                VideoChannelSource("ego_view", (0, 1, 2)),
+                VideoChannelSource("depth_gray_view", (0,)),
+            ],
             depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
         )
 
@@ -188,9 +208,7 @@ def test_inspire_post_vision_late_fusion_configs_are_explicit(config_name, auxil
     assert video.post_vision_fusion_stage == stage
     assert video.channel_fusion is None
     assert video.vision_input_channels == 3
-    assert video.depth_colormap == (
-        FIXED_TURBO_DEPTH_COLORMAP if "turbo" in config_name else None
-    )
+    assert video.depth_colormap == (FIXED_TURBO_DEPTH_COLORMAP if "turbo" in config_name else None)
 
 
 def test_post_vision_fusion_keeps_two_3_channel_branches_and_one_prompt_stream():

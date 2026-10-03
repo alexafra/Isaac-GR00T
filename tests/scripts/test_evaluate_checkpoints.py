@@ -155,6 +155,72 @@ def test_default_validation_selection_still_evaluates_every_episode(tmp_path):
     assert selected == [0, 1, 2, 3, 4]
 
 
+@pytest.mark.parametrize("quota", [1, 5, 8])
+def test_train_probe_per_goal_cli_default_and_override(tmp_path, monkeypatch, quota):
+    argv = ["evaluate_checkpoints", "--run-dir", str(tmp_path / "run"),
+            "--dataset-path", str(tmp_path / "validation")]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert evaluate_checkpoints.parse_args().train_probe_episodes_per_goal == 5
+    monkeypatch.setattr(sys, "argv", argv + ["--train-probe-episodes-per-goal", str(quota)])
+    assert evaluate_checkpoints.parse_args().train_probe_episodes_per_goal == quota
+
+
+@pytest.mark.parametrize("quota", ["0", "-1", "not-an-int"])
+def test_train_probe_per_goal_cli_rejects_invalid_quota(tmp_path, monkeypatch, quota):
+    monkeypatch.setattr(sys, "argv", [
+        "evaluate_checkpoints", "--run-dir", str(tmp_path / "run"),
+        "--dataset-path", str(tmp_path / "validation"),
+        "--train-probe-episodes-per-goal", quota,
+    ])
+    with pytest.raises(SystemExit) as exc:
+        evaluate_checkpoints.parse_args()
+    assert exc.value.code == 2
+
+
+def test_train_probe_selects_five_per_goal_deterministically(tmp_path):
+    tasks = [["a"]] * 9 + [["b"]] * 8 + [["c"]] * 7
+    _write_episode_metadata(tmp_path, tasks)
+    kwargs = dict(episode_count=3, seed=42, per_goal_count=5)
+    selected = select_trajectory_ids(tmp_path, len(tasks), None, **kwargs)
+    assert selected == select_trajectory_ids(tmp_path, len(tasks), None, **kwargs)
+    assert len(selected) == len(set(selected)) == 15
+    assert {goal: sum(goal in tasks[i] for i in selected) for goal in ("a", "b", "c")} == {
+        "a": 5, "b": 5, "c": 5}
+
+
+def test_train_probe_per_goal_shortage_takes_every_available_episode(tmp_path):
+    tasks = [["a"]] * 2 + [["b"]] * 7
+    _write_episode_metadata(tmp_path, tasks)
+    selected = select_trajectory_ids(tmp_path, len(tasks), None, episode_count=3, per_goal_count=5)
+    assert len(selected) == 7
+    assert {0, 1}.issubset(selected)
+    assert sum("b" in tasks[i] for i in selected) == 5
+
+
+def test_train_probe_multigoal_episodes_are_unique_and_cover_each_quota(tmp_path):
+    tasks = [["a", "a", "b"]] * 3 + [["a"]] * 4 + [["b"]] * 4 + [["c"]]
+    _write_episode_metadata(tmp_path, tasks)
+    selected = select_trajectory_ids(tmp_path, len(tasks), None, episode_count=3, per_goal_count=5)
+    assert len(selected) == len(set(selected))
+    for goal in ("a", "b", "c"):
+        available = sum(goal in episode for episode in tasks)
+        assert sum(goal in tasks[i] for i in selected) >= min(5, available)
+
+
+def test_train_probe_quota_does_not_change_explicit_or_all_episode_selection(tmp_path):
+    assert select_trajectory_ids(tmp_path, 6, [4, 1], episode_count=3, per_goal_count=5) == [4, 1]
+    assert select_trajectory_ids(tmp_path, 6, None, episode_count=0, per_goal_count=5) == list(range(6))
+
+
+def test_per_goal_one_preserves_legacy_sampler_and_soft_minimum(tmp_path):
+    tasks = [["a"]] * 8 + [["b"]] * 8
+    _write_episode_metadata(tmp_path, tasks)
+    args = (tmp_path, len(tasks), list(range(len(tasks))), 3, 42)
+    assert select_task_balanced_trajectory_ids(*args, per_goal_count=1) == select_task_balanced_trajectory_ids(*args)
+    assert len(select_task_balanced_trajectory_ids(*args)) == 3
+    assert len(select_task_balanced_trajectory_ids(*args, per_goal_count=5)) == 10
+
+
 def _write_run_processor(run_dir):
     processor_dir = run_dir / "processor"
     processor_dir.mkdir(parents=True)

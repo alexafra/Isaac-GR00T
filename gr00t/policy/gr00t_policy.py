@@ -47,6 +47,7 @@ _RTC_OPTION_KEYS = frozenset(
         "rtc_overlap_steps",
         "rtc_frozen_steps",
         "rtc_ramp_rate",
+        "rtc_pure",
     }
 )
 _RTC_REQUIRED_OPTION_KEYS = frozenset(
@@ -680,6 +681,16 @@ class Gr00tPolicy(BasePolicy):
         if missing:
             raise ValueError(f"Missing required RTC options: {sorted(missing)}")
 
+        rtc_pure = options.get("rtc_pure", False)
+        if not isinstance(rtc_pure, bool):
+            raise ValueError("RTC option 'rtc_pure' must be a boolean")
+        if rtc_pure:
+            if "rtc_ramp_rate" in options:
+                raise ValueError("rtc_ramp_rate is only supported by legacy RTC, not rtc_pure")
+            action_head = getattr(self.model, "action_head", None)
+            if getattr(action_head, "supports_rtc_pure", False) is not True:
+                raise RuntimeError("This model does not support rtc_pure inference guidance")
+
         previous_action = options["rtc_previous_action"]
         if not isinstance(previous_action, dict):
             raise ValueError("RTC option 'rtc_previous_action' must be an action dictionary")
@@ -760,18 +771,20 @@ class Gr00tPolicy(BasePolicy):
                 f"got {frozen_steps}"
             )
 
-        ramp_rate = options.get("rtc_ramp_rate")
-        if ramp_rate is None:
-            ramp_rate = getattr(getattr(self.model, "config", None), "rtc_ramp_rate", None)
+        ramp_rate = None
+        if not rtc_pure:
+            ramp_rate = options.get("rtc_ramp_rate")
             if ramp_rate is None:
-                raise ValueError(
-                    "RTC ramp rate was not supplied and the model config has no rtc_ramp_rate"
-                )
-        if isinstance(ramp_rate, bool) or not isinstance(ramp_rate, Real):
-            raise ValueError(f"RTC ramp rate must be a finite positive number, got {ramp_rate!r}")
-        ramp_rate = float(ramp_rate)
-        if not math.isfinite(ramp_rate) or ramp_rate <= 0.0:
-            raise ValueError(f"RTC ramp rate must be a finite positive number, got {ramp_rate!r}")
+                ramp_rate = getattr(getattr(self.model, "config", None), "rtc_ramp_rate", None)
+                if ramp_rate is None:
+                    raise ValueError(
+                        "RTC ramp rate was not supplied and the model config has no rtc_ramp_rate"
+                    )
+            if isinstance(ramp_rate, bool) or not isinstance(ramp_rate, Real):
+                raise ValueError(f"RTC ramp rate must be a finite positive number, got {ramp_rate!r}")
+            ramp_rate = float(ramp_rate)
+            if not math.isfinite(ramp_rate) or ramp_rate <= 0.0:
+                raise ValueError(f"RTC ramp rate must be a finite positive number, got {ramp_rate!r}")
 
         model_config = getattr(self.model, "config", None)
         try:
@@ -817,23 +830,39 @@ class Gr00tPolicy(BasePolicy):
             "action_horizon": previous_horizon,
             "rtc_overlap_steps": overlap_steps,
             "rtc_frozen_steps": frozen_steps,
-            "rtc_ramp_rate": ramp_rate,
         }
         info = {
             "rtc_applied": True,
             "rtc_previous_action_horizon": previous_horizon,
             "rtc_overlap_steps": overlap_steps,
             "rtc_frozen_steps": frozen_steps,
-            "rtc_ramp_rate": ramp_rate,
         }
+        normalized_batch = np.stack(normalized_batch, axis=0)
+        if rtc_pure:
+            model_options.update(
+                rtc_pure=True,
+                rtc_action_dim=total_action_dim,
+                # Retain the target precision across the model's usual BF16
+                # input conversion. This is internal, not a client option.
+                rtc_previous_action_fp32=torch.from_numpy(normalized_batch),
+            )
+            info.update(
+                rtc_pure_applied=True,
+                rtc_sampler="pseudoinverse_guidance_v1",
+                rtc_guidance_max_weight=5.0,
+                rtc_physical_prefix_restored=False,
+            )
+        else:
+            model_options["rtc_ramp_rate"] = ramp_rate
+            info["rtc_ramp_rate"] = ramp_rate
         frozen_physical_prefix = None
-        if frozen_steps:
+        if frozen_steps and not rtc_pure:
             source_start = previous_horizon - overlap_steps
             frozen_physical_prefix = {
                 key: previous_action[key][:, source_start : source_start + frozen_steps, :].copy()
                 for key in action_keys
             }
-        return np.stack(normalized_batch, axis=0), model_options, info, frozen_physical_prefix
+        return normalized_batch, model_options, info, frozen_physical_prefix
 
     def check_observation(self, observation: dict[str, Any]) -> None:
         """Validate that the observation has the correct structure and types.
@@ -1048,12 +1077,20 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
+        rtc_pure = bool(model_options is not None and model_options.get("rtc_pure", False))
+        # Pure RTC needs input gradients only inside the action sampler. Keep
+        # the backbone no-grad, but do not create inference tensors that the
+        # action expert would be unable to save for its backward pass.
+        with torch.inference_mode(mode=not rtc_pure), torch.no_grad():
             if model_options is None:
                 model_pred = self.model.get_action(**collated_inputs)
             else:
                 model_pred = self.model.get_action(**collated_inputs, options=model_options)
-        normalized_action = model_pred["action_pred"].float()
+        if rtc_pure and model_pred.get("rtc_pure_applied") is not True:
+            raise RuntimeError("Model did not acknowledge rtc_pure inference guidance; refusing fallback")
+        normalized_action = model_pred["action_pred"].detach().float()
+        if rtc_pure and not torch.isfinite(normalized_action).all():
+            raise RuntimeError("rtc_pure returned non-finite action predictions")
 
         # Step 5: Decode actions from normalized space back to physical units
         batched_states = {}
@@ -1063,6 +1100,9 @@ class Gr00tPolicy(BasePolicy):
             normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
         )
         if frozen_physical_prefix is not None:
+            # Legacy RTC preserves its hard-frozen physical commands exactly.
+            # Pure RTC returns the guided prediction without prefix replacement,
+            # both during denoising and after decoding.
             for key, frozen_targets in frozen_physical_prefix.items():
                 unnormalized_action[key][:, : frozen_targets.shape[1], :] = frozen_targets
 

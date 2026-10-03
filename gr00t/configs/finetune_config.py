@@ -15,6 +15,8 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+import math
+from typing import Literal
 import warnings
 
 
@@ -58,6 +60,9 @@ class FinetuneConfig:
     vision_patch_embed_init: str | None = None  # earlyfusion
     """Optional early-fusion initialization override: rgb_mean or zeros.
     If unset, 4-channel fusion uses rgb_mean and 6-channel fusion uses zeros."""
+    late_fusion_language_readout: Literal["post_final_rmsnorm", "pre_final_rmsnorm"] = "post_final_rmsnorm"
+    """Late fusion only: pre_final_rmsnorm matches the stock GR00T language readout.
+    post_final_rmsnorm preserves historical late-fusion checkpoints and recipes."""
     tune_projector: bool = True
     """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
 
@@ -72,6 +77,16 @@ class FinetuneConfig:
     """
     Dropout probability applied to state inputs for regularization during training.
     """
+
+    vision_modality_dropout_rgb_prob: float = 0.0
+    """Global probability of dropping RGB, mutually exclusive with geometry dropout."""
+
+    vision_modality_dropout_geometry_prob: float = 0.0
+    """Global probability of dropping geometry. Both zero preserve legacy training."""
+
+    vision_modality_dropout_state_policy: str = "independent"
+    """state_first retains existing state masks and drops vision only if both keep
+    state. independent leaves visual and state masks independent. Training only."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
@@ -219,6 +234,12 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        validate_vision_modality_dropout_config(
+            self.vision_modality_dropout_rgb_prob,
+            self.vision_modality_dropout_geometry_prob,
+            self.vision_modality_dropout_state_policy,
+            self.state_dropout_prob,
+        )
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
@@ -230,4 +251,34 @@ class FinetuneConfig:
                 f"accumulated_batch_size={accumulated_batch_size} "
                 f"(× gradient_accumulation_steps={self.gradient_accumulation_steps}).",
                 stacklevel=2,
+            )
+
+
+def validate_vision_modality_dropout_config(
+    rgb_prob: float,
+    geometry_prob: float,
+    state_policy: str,
+    state_dropout_prob: float,
+) -> None:
+    """Validate global, exclusive modality-drop probabilities before loading data."""
+    for name, probability in (
+        ("vision_modality_dropout_rgb_prob", rgb_prob),
+        ("vision_modality_dropout_geometry_prob", geometry_prob),
+    ):
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError(f"{name} must be finite and in [0, 1], got {probability}")
+    total = rgb_prob + geometry_prob
+    if total > 1.0:
+        raise ValueError("RGB and geometry dropout probabilities must sum to <= 1")
+    if state_policy not in {"state_first", "independent"}:
+        raise ValueError("vision_modality_dropout_state_policy must be state_first or independent")
+    if total and state_policy == "state_first":
+        if not math.isfinite(state_dropout_prob) or not 0.0 <= state_dropout_prob <= 1.0:
+            raise ValueError("state_dropout_prob must be finite and in [0, 1]")
+        eligible_probability = (1.0 - state_dropout_prob) ** 2
+        if total > eligible_probability + 1e-12:
+            raise ValueError(
+                "state_first global modality-drop probability must be <= "
+                "(1 - state_dropout_prob)^2; requested "
+                f"{total}, eligible probability {eligible_probability}"
             )

@@ -4,6 +4,7 @@ from pathlib import Path  # earlyfusion
 from unittest.mock import MagicMock, patch  # earlyfusion
 
 import albumentations as A  # earlyfusion
+from gr00t.data.depth_colormap import FIXED_TURBO_DEPTH_COLORMAP, FIXED_TURBO_DEPTH_LUT
 from gr00t.data.types import ModalityConfig, VideoChannelSource  # earlyfusion
 from gr00t.data.utils import parse_modality_configs, to_json_serializable  # earlyfusion
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor  # earlyfusion
@@ -58,6 +59,54 @@ def test_early_fusion_config_roundtrip():  # earlyfusion
     restored = parse_modality_configs(serialized)["tag"]["video"]  # earlyfusion
     assert restored.channel_fusion == video.channel_fusion  # earlyfusion
     assert restored.vision_input_channels == 4  # earlyfusion
+
+
+def test_fixed_turbo_early_fusion_keeps_geometry_colors_and_one_image():
+    video = ModalityConfig(
+        [0],
+        ["ego_view", "depth_gray_view"],
+        channel_fusion=[
+            VideoChannelSource("ego_view", (0, 1, 2)),
+            VideoChannelSource("depth_gray_view", (0, 1, 2)),
+        ],
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    restored = parse_modality_configs(to_json_serializable({"tag": {"video": video}}))["tag"][
+        "video"
+    ]
+    assert restored.channel_fusion == video.channel_fusion
+    assert restored.depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    assert restored.vision_input_channels == 6
+    processor = Gr00tN1d7Processor.__new__(Gr00tN1d7Processor)
+    processor.use_albumentations = True
+    processor.training = True
+    processor.processor = MagicMock()
+    processor.processor.apply_chat_template.return_value = "one image"
+    gray = np.array([[0, 1, 127], [254, 255, 2]], dtype=np.uint8)
+    rgb = np.full((2, 3, 3), 100, dtype=np.uint8)
+    depth = np.repeat(gray[..., None], 3, axis=-1)
+    result = processor._get_vlm_inputs(
+        video.modality_keys,
+        {"ego_view": [Image.fromarray(rgb)], "depth_gray_view": [Image.fromarray(depth)]},
+        None,
+        A.ReplayCompose(
+            [
+                A.ColorJitter(
+                    brightness=(0.5, 0.5), contrast=0, saturation=0, hue=0, p=1
+                ),
+                A.HorizontalFlip(p=1),
+            ]
+        ),
+        "test",
+        channel_fusion=video.channel_fusion,
+        depth_colormap=video.depth_colormap,
+    )["vlm_content"]
+    assert len(result["images"]) == 1
+    assert result["vision_input_channels"] == 6
+    fused = result["images"][0]
+    assert fused.shape == (6, 2, 3)
+    assert np.all(fused[:3] == 50)
+    np.testing.assert_array_equal(fused[3:].transpose(1, 2, 0), FIXED_TURBO_DEPTH_LUT[gray][:, ::-1])
 
 
 def test_early_fusion_override_replaces_pretrained_modalities():  # earlyfusion

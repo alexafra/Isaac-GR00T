@@ -137,6 +137,26 @@ def test_launch_preserves_existing_separate_view_contract():
     assert config.model.vision_fusion_source_keys == []
 
 
+def test_launch_serializes_fixed_turbo_for_separate_views_without_enabling_fusion():
+    video = ModalityConfig(
+        [0],
+        ["ego_view", "depth_gray_view"],
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    config = _config(video)
+
+    configure_vision_input_contract(config, "new_embodiment", video, None)
+
+    assert list(config.data.modality_configs) == [
+        "new_embodiment",
+        "inactive_pretraining_embodiment",
+    ]
+    assert config.model.vision_fusion_mode == "none"
+    assert config.model.vision_fusion_source_keys == []
+    assert config.model.vision_depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    assert config.model.vision_depth_colormap_lut_sha256 == FIXED_TURBO_DEPTH_LUT_SHA256
+
+
 def test_launch_preserves_existing_early_fusion_mapping():
     video = ModalityConfig(
         [0],
@@ -160,6 +180,31 @@ def test_launch_preserves_existing_early_fusion_mapping():
     ]
     assert config.model.vision_patch_embed_init == "rgb_mean"
     assert config.model.vision_fusion_mode == "none"
+
+
+def test_launch_serializes_fixed_turbo_early_fusion_contract():
+    video = ModalityConfig(
+        [0],
+        ["ego_view", "depth_gray_view"],
+        channel_fusion=[
+            VideoChannelSource("ego_view", (0, 1, 2)),
+            VideoChannelSource("depth_gray_view", (0, 1, 2)),
+        ],
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    config = _config(video)
+    config.model.tune_vision_patch_embed = True
+
+    configure_vision_input_contract(config, "new_embodiment", video, "rgb_mean")
+    validate_vision_trainability_contract(config, video)
+
+    assert list(config.data.modality_configs) == ["new_embodiment"]
+    assert config.model.vision_input_channels == 6
+    assert config.model.vision_channel_layout == video.vision_channel_layout
+    assert config.model.vision_patch_embed_init == "rgb_mean"
+    assert config.model.vision_fusion_mode == "none"
+    assert config.model.vision_depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    assert config.model.vision_depth_colormap_lut_sha256 == FIXED_TURBO_DEPTH_LUT_SHA256
 
 
 def test_launch_rejects_patch_embed_override_for_post_vision_fusion():
@@ -187,10 +232,7 @@ def test_launch_serializes_pinned_fixed_turbo_depth_contract():
     configure_vision_input_contract(config, "new_embodiment", video, None)
 
     assert config.model.vision_depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
-    assert (
-        config.model.vision_depth_colormap_lut_sha256
-        == FIXED_TURBO_DEPTH_LUT_SHA256
-    )
+    assert config.model.vision_depth_colormap_lut_sha256 == FIXED_TURBO_DEPTH_LUT_SHA256
 
 
 def test_launch_preserves_no_depth_colormap_for_existing_configs():

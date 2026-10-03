@@ -25,6 +25,7 @@ import sys
 from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
+from gr00t.eval.live_model_aliases import DEFAULT_BLIND_STUDY
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.replay_policy import ReplayPolicy
 from gr00t.policy.server_client import PolicyServer
@@ -978,6 +979,23 @@ def _load_json_modality_configs(config_path: Path) -> dict[str, ModalityConfig]:
         ) from exc
 
 
+def _model_identity(model_path: str) -> dict[str, str | None]:
+    """Identify the loaded model for recording provenance, without reading weights."""
+
+    path = Path(model_path)
+    checkpoint = (
+        path.name
+        if path.name.startswith("checkpoint-") and path.name[len("checkpoint-") :].isdigit()
+        else None
+    )
+    model_dir = path.parent if checkpoint is not None else path
+    return {
+        "model_name": model_dir.name or model_dir.resolve().name,
+        "checkpoint": checkpoint,
+        "model_path": model_path,
+    }
+
+
 @dataclass
 class ServerConfig:
     """Configuration for running the GR00T inference server."""
@@ -985,6 +1003,18 @@ class ServerConfig:
     # Gr00t policy configs
     model_path: str | None = None
     """Path to the model checkpoint directory"""
+
+    model: str | None = None
+    """Visible live-folder alias: rgb, separate, or fusion."""
+
+    blind: str | None = None
+    """Independent hidden mode: A or B; defaults to RGB versus surface-normals separate views."""
+
+    blind_study: str = DEFAULT_BLIND_STUDY
+    """Reuse this study name across sessions; never reshuffled on restart."""
+
+    live_model_root: str = "/home/alex/Development/Models/inspire_live_test"
+    """Folder containing live_models.json and all aliased checkpoints."""
 
     embodiment_tag: str = "new_embodiment"
     """Embodiment tag (name or value, case-insensitive). Run with --help to see known tags."""
@@ -1020,6 +1050,7 @@ class ServerConfig:
 
 
 def main(config: ServerConfig):
+    import uuid
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
     print("Starting GR00T inference server...")
     print(f"  Embodiment tag: {config.embodiment_tag}")
@@ -1098,7 +1129,10 @@ def main(config: ServerConfig):
     policy_metadata = {
         "embodiment_tag": config.embodiment_tag.value,
         "embodiment_name": config.embodiment_tag.name,
+        "server_instance_id": uuid.uuid4().hex,
     }
+    if config.model_path is not None:
+        policy_metadata["model_identity"] = getattr(config, "_public_identity", None) or _model_identity(config.model_path)
     if config.model_path is not None and not config.use_sim_policy_wrapper:
         policy_metadata["vision_input_contract"] = policy.get_vision_input_contract()  # earlyfusion
         # Explicit capability handshake for clients that need model-side RTC
@@ -1109,6 +1143,13 @@ def main(config: ServerConfig):
             "protocol_version": 1,
             "physical_action_tail": True,
             "backend": "pytorch",
+            "pure_inference_guidance": (
+                getattr(
+                    getattr(getattr(policy, "model", None), "action_head", None),
+                    "supports_rtc_pure",
+                    False,
+                ) is True
+            ),
         }
     if config.deployment_dataset_path is not None:
         deployment_dataset_path = Path(config.deployment_dataset_path)
@@ -1135,12 +1176,45 @@ def main(config: ServerConfig):
         port=config.port,
         policy_metadata=policy_metadata,
     ) as server:
+        announcer = getattr(config, "_ready_announce", None)
+        if announcer is not None:
+            announcer(f"Blind model {config.blind.upper()} ready on {config.host}:{config.port} (study {config.blind_study})")
         try:
             server.run()
         except KeyboardInterrupt:
             print("\nShutting down server...")
 
 
+def launch(config: ServerConfig):
+    """Resolve aliases before entering the unchanged full-path server workflow."""
+    from gr00t.eval.live_model_aliases import DEFAULT_DATASET, private_server_output, resolve_live_model
+    if config.model is not None or config.blind is not None:
+        if config.model_path is not None or config.dataset_path is not None:
+            raise ValueError("--model/--blind cannot be combined with --model-path/--dataset-path")
+        try:
+            selection = resolve_live_model(model=config.model, blind=config.blind,
+                                           study=config.blind_study, root=Path(config.live_model_root))
+        except Exception:
+            if config.blind is not None:
+                raise SystemExit("Blind selection failed; mapping was not reshuffled. Inspect the private study directory.") from None
+            raise
+        config.model_path = str(selection.checkpoint)
+        config._public_identity = selection.identity
+        if config.deployment_dataset_path is None:
+            config.deployment_dataset_path = DEFAULT_DATASET
+        if selection.private_directory is not None:
+            print(f"Loading blind model {config.blind.upper()} (study {config.blind_study}); identity logs kept private.", flush=True)
+            with private_server_output(selection.private_directory) as announce:
+                config._ready_announce = announce
+                try:
+                    return main(config)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    announce("Blind server failed; detailed diagnostics are in the private study directory.")
+                    raise SystemExit(1) from None
+    return main(config)
+
+
 if __name__ == "__main__":
-    config = tyro.cli(ServerConfig)
-    main(config)
+    launch(tyro.cli(ServerConfig))

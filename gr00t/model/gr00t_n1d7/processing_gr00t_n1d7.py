@@ -390,6 +390,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         # State augmentation
         exclude_state: bool = False,
         state_dropout_prob: float = 0.0,
+        vision_modality_dropout_rgb_prob: float = 0.0,
+        vision_modality_dropout_geometry_prob: float = 0.0,
+        vision_modality_dropout_state_policy: str = "independent",
+        vision_modality_dropout_source_keys: list[str] | None = None,
         # Normalization
         use_mean_std: bool = False,
         letter_box_transform: bool = False,
@@ -425,6 +429,48 @@ class Gr00tN1d7Processor(BaseProcessor):
         # State augmentation settings
         self.exclude_state = exclude_state
         self.state_dropout_prob = state_dropout_prob
+        from .modality_dropout import validate_modality_dropout
+
+        self.vision_modality_dropout_rgb_prob = vision_modality_dropout_rgb_prob
+        self.vision_modality_dropout_geometry_prob = vision_modality_dropout_geometry_prob
+        self.vision_modality_dropout_state_policy = vision_modality_dropout_state_policy
+        self.vision_modality_dropout_source_keys = list(vision_modality_dropout_source_keys or [])
+        if vision_modality_dropout_rgb_prob or vision_modality_dropout_geometry_prob:
+            validate_modality_dropout(
+                vision_modality_dropout_rgb_prob,
+                vision_modality_dropout_geometry_prob,
+                state_dropout_prob,
+                vision_modality_dropout_state_policy,
+                exclude_state,
+            )
+            expected_keys = self.vision_modality_dropout_source_keys
+            if (
+                len(expected_keys) != 2
+                or expected_keys[0] != "ego_view"
+                or expected_keys[1] not in ("depth_gray_view", "surface_normals_view")
+            ):
+                raise ValueError("Modality dropout requires ordered RGB and geometry source keys")
+            for modality in self.modality_configs.values():
+                video = modality["video"]
+                if list(video.modality_keys) != expected_keys:
+                    raise ValueError("Modality dropout source keys disagree with video views")
+                if getattr(modality["state"], "exclude_state", False):
+                    validate_modality_dropout(
+                        vision_modality_dropout_rgb_prob,
+                        vision_modality_dropout_geometry_prob,
+                        state_dropout_prob,
+                        vision_modality_dropout_state_policy,
+                        True,
+                    )
+                if video.channel_fusion:
+                    gray_depth = (
+                        expected_keys[1] == "depth_gray_view"
+                        and video.depth_colormap != FIXED_TURBO_DEPTH_COLORMAP
+                    )
+                    expected_channels = (0,) if gray_depth else (0, 1, 2)
+                    layout = [(source.key, tuple(source.channels)) for source in video.channel_fusion]
+                    if layout != [(expected_keys[0], (0, 1, 2)), (expected_keys[1], expected_channels)]:
+                        raise ValueError("Modality dropout requires RGB-first early-fusion channels")
 
         self.letter_box_transform = letter_box_transform
 
@@ -872,11 +918,46 @@ class Gr00tN1d7Processor(BaseProcessor):
         exclude_state = self.exclude_state or getattr(
             self.modality_configs[embodiment_tag.value]["state"], "exclude_state", False
         )
-        if exclude_state or (
-            self.state_dropout_prob > 0
-            and random.random() < self.state_dropout_prob
-            and self.training
-        ):
+        modality_decision = None
+        vision_keep = None
+        modality_dropout_active = self.training and (
+            getattr(self, "vision_modality_dropout_rgb_prob", 0.0)
+            or getattr(self, "vision_modality_dropout_geometry_prob", 0.0)
+        )
+        if modality_dropout_active and self.vision_modality_dropout_state_policy == "state_first":
+            from .modality_dropout import sample_modality_dropout
+
+            modality_decision = sample_modality_dropout(
+                self.vision_modality_dropout_rgb_prob,
+                self.vision_modality_dropout_geometry_prob,
+                self.state_dropout_prob,
+                self.vision_modality_dropout_state_policy,
+                exclude_state=exclude_state,
+                draw=random.random,
+            )
+            drop_state_input = modality_decision.drop_state_input
+            vision_keep = modality_decision.vision_keep
+        else:
+            # Preserve the legacy draws and behavior exactly when not opted in.
+            drop_state_input = exclude_state or (
+                self.state_dropout_prob > 0
+                and random.random() < self.state_dropout_prob
+                and self.training
+            )
+            if modality_dropout_active:
+                # Additive independent mode leaves BOTH legacy state-dropout
+                # sites in place. Only the visual decision is added here.
+                choice = random.random()
+                if choice < self.vision_modality_dropout_rgb_prob:
+                    vision_keep = (0.0, 1.0)
+                elif choice < (
+                    self.vision_modality_dropout_rgb_prob
+                    + self.vision_modality_dropout_geometry_prob
+                ):
+                    vision_keep = (1.0, 0.0)
+                else:
+                    vision_keep = (1.0, 1.0)
+        if drop_state_input:
             normalized_states = torch.cat(
                 [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
             )
@@ -923,6 +1004,20 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_inputs = {
             "state": normalized_states.to(torch.get_default_dtype()),
         }
+        if vision_keep is not None:
+            frame_counts = [len(content.images[key]) for key in image_keys]
+            if len(frame_counts) != 2 or frame_counts[0] <= 0 or len(set(frame_counts)) != 1:
+                raise ValueError("Modality dropout requires equal positive RGB/geometry frame counts")
+            transformed_inputs["vision_modality_keep"] = torch.tensor(
+                vision_keep, dtype=torch.float32
+            )
+            transformed_inputs["vision_modality_num_frames"] = torch.tensor(
+                frame_counts[0], dtype=torch.long
+            )
+            if modality_decision is not None:
+                transformed_inputs["state_feature_keep"] = torch.tensor(
+                    modality_decision.keep_state_features, dtype=torch.bool
+                )
         if normalized_actions is not None:
             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
         # Add VLM inputs
@@ -1069,6 +1164,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 # State augmentation
                 "exclude_state": self.exclude_state,
                 "state_dropout_prob": self.state_dropout_prob,
+                "vision_modality_dropout_rgb_prob": self.vision_modality_dropout_rgb_prob,
+                "vision_modality_dropout_geometry_prob": self.vision_modality_dropout_geometry_prob,
+                "vision_modality_dropout_state_policy": self.vision_modality_dropout_state_policy,
+                "vision_modality_dropout_source_keys": self.vision_modality_dropout_source_keys,
             },
         }
         with open(main_config_file, "w") as f:
@@ -1139,6 +1238,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
+        processor_kwargs.setdefault("vision_modality_dropout_rgb_prob", 0.0)
+        processor_kwargs.setdefault("vision_modality_dropout_geometry_prob", 0.0)
+        processor_kwargs.setdefault("vision_modality_dropout_state_policy", "independent")
+        processor_kwargs.setdefault("vision_modality_dropout_source_keys", [])
 
         # Directly override other processor kwargs
         if kwargs:
@@ -1155,7 +1258,11 @@ class Gr00tN1d7Processor(BaseProcessor):
                 for config_override in modality_configs.values()  # earlyfusion
                 if (video := config_override.get("video")) is not None  # earlyfusion
             )  # earlyfusion
-            if fusion_override:  # earlyfusion
+            modality_dropout_override = bool(
+                kwargs.get("vision_modality_dropout_rgb_prob", 0.0)
+                or kwargs.get("vision_modality_dropout_geometry_prob", 0.0)
+            )
+            if fusion_override or (modality_dropout_override and modality_configs):
                 processor_kwargs["modality_configs"] = modality_configs  # earlyfusion
                 processor_kwargs["statistics"] = {  # earlyfusion
                     embodiment_tag: statistics  # earlyfusion
@@ -1173,6 +1280,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "use_relative_action",
                 "exclude_state",
                 "state_dropout_prob",
+                "vision_modality_dropout_rgb_prob",
+                "vision_modality_dropout_geometry_prob",
+                "vision_modality_dropout_state_policy",
+                "vision_modality_dropout_source_keys",
                 "use_mean_std",
                 "model_name",
                 "model_type",

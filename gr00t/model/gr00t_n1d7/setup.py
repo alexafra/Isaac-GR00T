@@ -50,6 +50,7 @@ def _reconcile_depth_colormap_contract(
     requested_config,
     *,
     initializing_late_fusion: bool,
+    initializing_depth_colormap: bool = False,
 ) -> None:
     """Bind a base checkpoint to the requested depth representation exactly once."""
 
@@ -70,12 +71,10 @@ def _reconcile_depth_colormap_contract(
                 f"got {target!r}, expected {expected_target!r}"
             )
     elif target[1] is not None:
-        raise RuntimeError(
-            "Requested depth-colormap LUT digest requires a depth-colormap name"
-        )
+        raise RuntimeError("Requested depth-colormap LUT digest requires a depth-colormap name")
     if source == target:
         return
-    if source == (None, None) and initializing_late_fusion:
+    if source == (None, None) and (initializing_late_fusion or initializing_depth_colormap):
         checkpoint_config.vision_depth_colormap = target[0]
         checkpoint_config.vision_depth_colormap_lut_sha256 = target[1]
         return
@@ -83,6 +82,41 @@ def _reconcile_depth_colormap_contract(
         "Checkpoint depth-colormap contract does not match the requested configuration: "
         f"checkpoint={source!r}, requested={target!r}"
     )
+
+
+def _reconcile_late_fusion_language_readout(
+    checkpoint_config, requested_config, *, initializing_late_fusion: bool
+) -> None:
+    """Adopt the readout only when initializing fusion; never reinterpret a trained head."""
+    source = getattr(checkpoint_config, "late_fusion_language_readout", "post_final_rmsnorm")
+    target = getattr(requested_config, "late_fusion_language_readout", "post_final_rmsnorm")
+    allowed = ("post_final_rmsnorm", "pre_final_rmsnorm")
+    if source not in allowed or target not in allowed:
+        raise ValueError(f"Invalid late-fusion language readout: {source!r} -> {target!r}")
+    if source != target and not initializing_late_fusion:
+        raise RuntimeError(
+            "Checkpoint late-fusion language readout mismatch; refusing to reinterpret "
+            f"trained weights: checkpoint={source!r}, requested={target!r}"
+        )
+    checkpoint_config.late_fusion_language_readout = target
+
+
+def _checkpoint_has_serialized_vision_contract(checkpoint: str | Path) -> bool:
+    """Fail closed unless a local checkpoint is the unbound stock base.
+
+    The stock N1.7 base predates the explicit ``vision_*`` contract fields.
+    Fine-tuned checkpoints produced by this repository serialize those fields,
+    including explicit ``null`` depth-colormap values.  That distinction lets a
+    new fixed-Turbo recipe bind the stock base once without allowing a gray
+    fine-tune or a resume checkpoint to be silently reinterpreted as Turbo.
+    """
+
+    config_path = Path(checkpoint) / "config.json"
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return True
+    return any(key.startswith("vision_") for key in payload)
 
 
 class Gr00tN1d7Pipeline(ModelPipeline):
@@ -130,6 +164,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
+                vision_modality_dropout_rgb_prob=self.model_config.vision_modality_dropout_rgb_prob,
+                vision_modality_dropout_geometry_prob=self.model_config.vision_modality_dropout_geometry_prob,
+                vision_modality_dropout_state_policy=self.model_config.vision_modality_dropout_state_policy,
+                vision_modality_dropout_source_keys=self.model_config.vision_modality_dropout_source_keys,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -213,8 +251,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.model_config.vision_fusion_geometry_init_scale,
             )
             initializing_late_fusion = (
-                source_fusion[0] == "none"
-                and target_fusion[0] == "post_vision_late_fusion"
+                source_fusion[0] == "none" and target_fusion[0] == "post_vision_late_fusion"
             )
             if source_fusion != target_fusion:
                 if initializing_late_fusion:
@@ -276,10 +313,22 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     geometry_init_scale=source_fusion[13],
                     vision_input_channels=source_channels,
                 )
+            _reconcile_late_fusion_language_readout(
+                model.config, self.model_config,
+                initializing_late_fusion=initializing_late_fusion,
+            )
+            model.backbone.late_fusion_language_readout = model.config.late_fusion_language_readout
+            logging.info("Late-fusion language readout: %s", model.config.late_fusion_language_readout)
             _reconcile_depth_colormap_contract(
                 model.config,
                 self.model_config,
                 initializing_late_fusion=initializing_late_fusion,
+                initializing_depth_colormap=(
+                    self.model_config.vision_depth_colormap is not None
+                    and not _checkpoint_has_serialized_vision_contract(
+                        self.config.training.start_from_checkpoint
+                    )
+                ),
             )
 
         else:
@@ -342,6 +391,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 # State augmentation overrides
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
+                vision_modality_dropout_rgb_prob=self.model_config.vision_modality_dropout_rgb_prob,
+                vision_modality_dropout_geometry_prob=self.model_config.vision_modality_dropout_geometry_prob,
+                vision_modality_dropout_state_policy=self.model_config.vision_modality_dropout_state_policy,
+                vision_modality_dropout_source_keys=self.model_config.vision_modality_dropout_source_keys,
                 use_mean_std=self.model_config.use_mean_std,
                 **self.transformers_loading_kwargs,
             )
@@ -371,6 +424,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 # State augmentation
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
+                vision_modality_dropout_rgb_prob=self.model_config.vision_modality_dropout_rgb_prob,
+                vision_modality_dropout_geometry_prob=self.model_config.vision_modality_dropout_geometry_prob,
+                vision_modality_dropout_state_policy=self.model_config.vision_modality_dropout_state_policy,
+                vision_modality_dropout_source_keys=self.model_config.vision_modality_dropout_source_keys,
                 use_mean_std=self.model_config.use_mean_std,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )

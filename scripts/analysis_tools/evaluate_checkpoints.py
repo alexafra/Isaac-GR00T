@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument(
+        "--evaluation-split", choices=("validation", "test"), default="validation",
+        help="Held-out split label. Test mode evaluates one explicitly preselected checkpoint only.",
+    )
+    parser.add_argument(
         "--base-model-path",
         type=Path,
         help=(
@@ -53,8 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        required=True,
-        help="Held-out validation dataset path.",
+        help="Held-out dataset path for --evaluation-split (required unless --train-probe-only).",
     )
     parser.add_argument(
         "--train-dataset-path",
@@ -79,6 +82,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trajectory-plot-seed", type=int, default=42)
     parser.add_argument(
+        "--all-trajectory-plots", action="store_true",
+        help="Plot every evaluated episode; raw frame predictions are always saved for every episode.",
+    )
+    parser.add_argument(
         "--train-traj-ids",
         type=int,
         nargs="*",
@@ -89,12 +96,27 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Soft target for train episodes. Selection covers every task first, so the actual "
+            "Legacy soft minimum for total train episodes, after per-goal coverage; the actual "
             "count can exceed this value. Defaults to 3 when --train-dataset-path is provided; "
-            "use 0 to evaluate all train episodes."
+            "use 0 to evaluate all train episodes, ignoring the per-goal quota."
+        ),
+    )
+    parser.add_argument(
+        "--train-probe-episodes-per-goal",
+        type=int,
+        default=5,
+        help=(
+            "Training-probe episodes sampled without replacement per goal (default: 5), "
+            "or all available if fewer. Shared multi-goal episodes are deduplicated. "
+            "Use 1 for legacy coverage; explicit --train-traj-ids and all-train mode override this."
         ),
     )
     parser.add_argument("--train-probe-seed", type=int, default=42)
+    parser.add_argument(
+        "--train-probe-only",
+        action="store_true",
+        help="Evaluate training diagnostics only in a fresh explicit output directory; no validation inference.",
+    )
     parser.add_argument("--checkpoint-steps", type=int, nargs="*")
     parser.add_argument(
         "--run-root-step",
@@ -152,13 +174,108 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    if args.evaluation_split == "test":
+        try:
+            validate_test_evaluation_args(args)
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+    if args.train_probe_only:
+        if args.train_dataset_path is None or args.output_dir is None:
+            parser.error("--train-probe-only requires --train-dataset-path and an explicit --output-dir")
+        if args.traj_ids:
+            parser.error("--traj-ids selects validation episodes; use --train-traj-ids for a training-only probe")
+        try:
+            validate_train_probe_output(args)
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+    elif args.dataset_path is None:
+        parser.error("--dataset-path is required unless --train-probe-only")
     if args.train_dataset_path is None and (args.train_traj_ids or args.train_probe_episodes):
         parser.error("--train-traj-ids and --train-probe-episodes require --train-dataset-path")
     if args.inference_batch_size <= 0:
         parser.error("--inference-batch-size must be positive")
+    if args.train_probe_episodes_per_goal <= 0:
+        parser.error("--train-probe-episodes-per-goal must be positive")
     if not np.isfinite(args.action_error_range_floor) or args.action_error_range_floor <= 0:
         parser.error("--action-error-range-floor must be finite and positive")
     return args
+
+
+def validate_test_evaluation_args(args: argparse.Namespace) -> None:
+    """Prevent checkpoint selection, partial test scoring, and evaluation-output reuse."""
+    if not args.checkpoint_steps or len(args.checkpoint_steps) != 1 or args.checkpoint_steps[0] <= 0:
+        raise ValueError("Test evaluation requires exactly one positive --checkpoint-steps value selected before testing")
+    if args.base_model_path is not None or args.train_probe_only or args.train_dataset_path is not None:
+        raise ValueError("Test evaluation cannot include a base model or training probe")
+    if args.steps != 0 or args.traj_ids:
+        raise ValueError("Test evaluation must cover complete episodes and the complete supplied test dataset")
+    if args.output_dir is None:
+        raise ValueError("Test evaluation requires an explicit --output-dir separate from validation outputs")
+    output = args.output_dir.expanduser().resolve()
+    run = args.run_dir.expanduser().resolve()
+    if output == run or run.is_relative_to(output):
+        raise ValueError("Test output cannot be the model directory or an ancestor of it")
+    protected = {run / f"{prefix}{args.execution_horizon}" for prefix in (
+        "evaluation_exec_hor_", "normalized_action_metrics_exec_hor_",
+    )}
+    protected.update(path.resolve() for prefix in (
+        "evaluation_exec_hor_", "normalized_action_metrics_exec_hor_", "checkpoint-",
+    ) for path in run.glob(f"{prefix}*"))
+    protected.update(run / name for name in ("processor", "experiment_cfg"))
+    if any(output == path or output.is_relative_to(path) or path.is_relative_to(output)
+           for path in protected):
+        raise ValueError("Test output must be path-disjoint from validation outputs, weights, and processor metadata")
+    if output.exists() and not output.is_dir():
+        raise ValueError("Test output must be a directory")
+    if output.is_dir() and not args.plots_only and any(output.iterdir()):
+        raise ValueError("Test output is populated; use --plots-only for saved results or a fresh directory")
+    if args.plots_only:
+        summary = pd.read_csv(output / "metrics_by_checkpoint.csv", usecols=["split", "checkpoint_step"])
+        if set(summary["split"]) != {"test"} or set(summary["checkpoint_step"]) != set(args.checkpoint_steps):
+            raise ValueError("Test plot regeneration requires only the explicitly selected test checkpoint")
+        for filename in ("validation_frame_predictions.csv.gz", "train_probe_frame_predictions.csv.gz"):
+            if any(output.glob(f"checkpoint-*/{filename}")):
+                raise ValueError("Test output contains non-test frame predictions")
+
+
+def validate_train_probe_output(args: argparse.Namespace) -> None:
+    """Keep training-only diagnostics disjoint from every canonical evaluation tree."""
+    output = args.output_dir.expanduser().resolve()
+    run = args.run_dir.expanduser().resolve()
+    prefixes = (
+        "evaluation_exec_hor_", "normalized_action_metrics_exec_hor_",
+        "test_evaluation_exec_hor_", "test_normalized_action_metrics_exec_hor_",
+    )
+    protected = {run / f"{prefix}{args.execution_horizon}" for prefix in prefixes}
+    protected.update(path.resolve() for prefix in prefixes for path in run.glob(f"{prefix}*"))
+    if any(output == path or output.is_relative_to(path) or path.is_relative_to(output)
+           for path in protected):
+        raise ValueError("Training-probe output must be path-disjoint from canonical validation/test evaluations")
+    if output.exists() and not output.is_dir():
+        raise ValueError("Training-probe output must be a directory")
+    if output.is_dir() and not args.plots_only and any(output.iterdir()):
+        raise ValueError("Training-probe output is populated; use a fresh directory")
+    if args.plots_only:
+        summary_path = output / "metrics_by_checkpoint.csv"
+        summary = pd.read_csv(summary_path, usecols=["split"])
+        if set(summary["split"]) != {"train_probe"}:
+            raise ValueError("Training-only plot regeneration requires only train_probe metrics")
+        if any(output.glob("checkpoint-*/validation_frame_predictions.csv.gz")):
+            raise ValueError("Training-only output contains validation predictions")
+
+
+def evaluation_probe_specs(args: argparse.Namespace) -> list[tuple]:
+    """Build the inference plan without ever opening held-out data in probe-only mode."""
+    specs = [] if getattr(args, "train_probe_only", False) else [
+        (getattr(args, "evaluation_split", "validation"), args.dataset_path, args.traj_ids, 0, 0)
+    ]
+    if args.train_dataset_path is not None:
+        specs.append((
+            "train_probe", args.train_dataset_path, args.train_traj_ids,
+            3 if args.train_probe_episodes is None else args.train_probe_episodes,
+            args.train_probe_seed,
+        ))
+    return specs
 
 
 def _load_episode_tasks(dataset_path: Path, dataset_size: int) -> dict[int, list[str]]:
@@ -196,9 +313,12 @@ def select_task_balanced_trajectory_ids(
     candidate_ids: list[int],
     episode_count: int,
     seed: int = 42,
+    per_goal_count: int = 1,
 ) -> list[int]:
     if episode_count < 0:
         raise ValueError(f"Episode count must be non-negative, got {episode_count}")
+    if per_goal_count <= 0:
+        raise ValueError(f"Per-goal episode count must be positive, got {per_goal_count}")
     if episode_count == 0 or not candidate_ids:
         return []
 
@@ -216,11 +336,20 @@ def select_task_balanced_trajectory_ids(
     for episode_id, tasks in episode_tasks.items():
         if episode_id not in candidate_set:
             continue
-        for task in tasks:
+        for task in dict.fromkeys(tasks):
             task_episodes.setdefault(task, []).append(episode_id)
 
-    # Select one random episode for every task, even when that exceeds the soft target.
-    selected = {int(rng.choice(task_episodes[task])) for task in sorted(task_episodes)}
+    # The generic/plot default keeps the legacy one-per-goal RNG path. Training
+    # probes opt into a larger quota; deduplication preserves multi-goal coverage.
+    if per_goal_count == 1:
+        selected = {int(rng.choice(task_episodes[task])) for task in sorted(task_episodes)}
+    else:
+        selected = set()
+        for task in sorted(task_episodes):
+            candidates = task_episodes[task]
+            selected.update(
+                rng.choice(candidates, size=min(per_goal_count, len(candidates)), replace=False).tolist()
+            )
 
     # When there are fewer tasks than the target, fill from the remaining episodes.
     target_count = min(episode_count, len(candidate_ids))
@@ -238,6 +367,7 @@ def select_trajectory_ids(
     selected_ids: list[int] | None,
     episode_count: int = 0,
     seed: int = 42,
+    per_goal_count: int = 1,
 ) -> list[int]:
     if episode_count < 0:
         raise ValueError(f"Episode count must be non-negative, got {episode_count}")
@@ -251,6 +381,7 @@ def select_trajectory_ids(
             list(range(dataset_size)),
             episode_count,
             seed,
+            per_goal_count=per_goal_count,
         )
     else:
         trajectory_ids = list(range(dataset_size))
@@ -1099,34 +1230,17 @@ def plot_checkpoint_progress(
         axis.set_title(scope_label)
     axis.grid(alpha=0.25)
     progress_metrics = [("MAE", "tab:blue"), ("RMSE", "tab:orange")]
+    legend_splits = ["test"] if set(summary.get("split", [])) == {"test"} else ["validation", "train_probe"]
     axis.legend(
         handles=[
-            handle
-            for metric_label, color in progress_metrics
-            for handle in (
-                Line2D(
-                    [0],
-                    [0],
-                    color=color,
-                    marker="o",
-                    linestyle="-",
-                    label=f"{metric_label} — Validation",
-                    linewidth=SUMMARY_LINE_WIDTH,
-                    markersize=SUMMARY_MARKER_SIZE,
-                    alpha=SUMMARY_ALPHA,
-                ),
-                Line2D(
-                    [0],
-                    [0],
-                    color=color,
-                    marker="o",
-                    linestyle="--",
-                    label=f"{metric_label} — Train Probe",
-                    linewidth=SUMMARY_LINE_WIDTH,
-                    markersize=SUMMARY_MARKER_SIZE,
-                    alpha=SUMMARY_ALPHA,
-                ),
+            Line2D(
+                [0], [0], color=color, marker="o", linestyle=split_linestyle(split),
+                label=f"{metric_label} — {split_label(split)}",
+                linewidth=SUMMARY_LINE_WIDTH, markersize=SUMMARY_MARKER_SIZE,
+                alpha=SUMMARY_ALPHA,
             )
+            for metric_label, color in progress_metrics
+            for split in legend_splits
         ],
         ncol=1,
         handlelength=3.5,
@@ -1154,15 +1268,16 @@ def plot_checkpoint_metric_summary(
     maximum_axis = axes[1, 1]
 
     all_steps = sorted(summary["checkpoint_step"].unique())
+    held_out_split = "test" if set(summary.get("split", [])) == {"test"} else "validation"
     magnitude_axes = {
-        "validation": validation_magnitude_axis,
+        held_out_split: validation_magnitude_axis,
         "train_probe": train_magnitude_axis,
     }
     populated_magnitude_splits = set()
     for split, split_summary in summary_splits(summary):
         steps = split_summary["checkpoint_step"]
         label = split_label(split)
-        magnitude_split = "train_probe" if split.startswith("train") else "validation"
+        magnitude_split = "train_probe" if split.startswith("train") else held_out_split
         magnitude_axis = magnitude_axes[magnitude_split]
         populated_magnitude_splits.add(magnitude_split)
         split_color = "tab:blue" if split.startswith("train") else "tab:orange"
@@ -1238,7 +1353,11 @@ def plot_checkpoint_metric_summary(
         axis.set_xticks(all_steps)
         axis.grid(alpha=0.25)
 
-    title = "Aggregate train-probe and validation metrics across checkpoints"
+    title = (
+        "Held-out test metrics at the preselected checkpoint"
+        if held_out_split == "test"
+        else "Aggregate train-probe and validation metrics across checkpoints"
+    )
     if scope_label:
         title += f" — {scope_label}"
     figure.suptitle(title)
@@ -1310,6 +1429,7 @@ LEGACY_RAW_PREDICTION_COLUMNS = [
 RAW_PREDICTION_COLUMNS = [*LEGACY_RAW_PREDICTION_COLUMNS, "measured_state"]
 RAW_PREDICTION_FILENAMES = {
     "validation": "validation_frame_predictions.csv.gz",
+    "test": "test_frame_predictions.csv.gz",
     "train_probe": "train_probe_frame_predictions.csv.gz",
 }
 GOAL_METRICS_FILENAME = "metrics_by_goal.csv"
@@ -2454,7 +2574,13 @@ def plot_evaluation_summaries(
     labels: list[str],
     filename_suffix: str = "",
     scope_label: str | None = None,
-) -> int:
+) -> int | None:
+    test_only = "test" in set(summary["split"])
+    if test_only:
+        steps = set(summary["checkpoint_step"])
+        if (set(summary["split"]) != {"test"} or set(joints["split"]) != {"test"}
+                or len(steps) != 1 or min(steps) <= 0 or set(joints["checkpoint_step"]) != steps):
+            raise ValueError("Test summaries require exactly one preselected positive checkpoint and test-only metrics")
     includes_base = bool((summary["checkpoint_step"] == 0).any())
     full_scope_label = scope_label
     if includes_base:
@@ -2471,8 +2597,25 @@ def plot_evaluation_summaries(
         output_dir / f"checkpoint_metric_summary{filename_suffix}.png",
         full_scope_label,
     )
+    if test_only:
+        selected_step = int(summary["checkpoint_step"].iloc[0])
+        test_scope = " — ".join(label for label in (scope_label, "Held-out test; preselected checkpoint") if label)
+        plot_joint_checkpoint_heatmap(
+            joints, labels, output_dir / f"joint_error_by_checkpoint{filename_suffix}.png", test_scope,
+        )
+        plot_best_checkpoint_joints(
+            joints, selected_step, labels,
+            output_dir / f"selected_checkpoint_joint_mae{filename_suffix}.png", test_scope,
+        )
+        # No argmin, ranking, or checkpoint selection is performed on test data.
+        return None
     validation_summary = summary[summary["split"] == "validation"]
     validation_joints = joints[joints["split"] == "validation"]
+    if validation_summary.empty and set(summary["split"]) == {"train_probe"}:
+        if set(joints["split"]) != {"train_probe"}:
+            raise ValueError("Training-only summary and joint splits disagree")
+        # This diagnostic is not a validation-based checkpoint selection.
+        return None
     if validation_summary.empty:
         raise ValueError("Saved evaluation metrics contain no validation checkpoints")
     if validation_joints.empty:
@@ -2671,13 +2814,13 @@ def regenerate_trajectory_plots(
     error_normalizer: ActionErrorNormalizer | None = None,
     state_cache: dict[tuple, pd.DataFrame] | None = None,
 ) -> None:
-    if args.skip_trajectory_plots or args.trajectory_plot_episodes == 0:
+    if args.skip_trajectory_plots or (args.trajectory_plot_episodes == 0 and not getattr(args, "all_trajectory_plots", False)):
         return
     if state_cache is None:
         state_cache = {}
 
     split_specs = [
-        ("validation", args.dataset_path, args.traj_ids),
+        (getattr(args, "evaluation_split", "validation"), args.dataset_path, args.traj_ids),
         ("train_probe", args.train_dataset_path, args.train_traj_ids),
     ]
     for step in checkpoint_steps:
@@ -2700,7 +2843,7 @@ def regenerate_trajectory_plots(
                     state_cache=state_cache,
                 )
             available_ids = sorted(int(value) for value in raw_predictions["trajectory"].unique())
-            plot_ids = select_saved_plot_ids(
+            plot_ids = available_ids if getattr(args, "all_trajectory_plots", False) else select_saved_plot_ids(
                 dataset_path=dataset_path,
                 available_ids=available_ids,
                 explicit_ids=explicit_ids,
@@ -2868,7 +3011,7 @@ def regenerate_plots(
         output_dir=output_dir,
         summary=summary,
         dataset_paths={
-            "validation": args.dataset_path,
+            getattr(args, "evaluation_split", "validation"): args.dataset_path,
             "train_probe": args.train_dataset_path,
         },
         execution_horizon=args.execution_horizon,
@@ -2879,7 +3022,7 @@ def regenerate_plots(
             output_dir=output_dir,
             summary=summary,
             dataset_paths={
-                "validation": args.dataset_path,
+                getattr(args, "evaluation_split", "validation"): args.dataset_path,
                 "train_probe": args.train_dataset_path,
             },
             execution_horizon=args.execution_horizon,
@@ -2894,11 +3037,10 @@ def regenerate_plots(
             raise ValueError(f"Saved metrics do not contain checkpoints: {sorted(missing_steps)}")
     checkpoint_steps = sorted(int(step) for step in summary["checkpoint_step"].unique())
     trajectory_plot_checkpoint_steps = latest_checkpoint_steps(checkpoint_steps)
-    validation_summary = summary[summary["split"] == "validation"]
-    best_step = int(validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"])
     validation_joints = joints[joints["split"] == "validation"]
-    labels = validation_joints["joint"].drop_duplicates().astype(str).tolist()
-    plot_evaluation_summaries(output_dir, summary, joints, labels)
+    label_joints = validation_joints if not validation_joints.empty else joints
+    labels = label_joints["joint"].drop_duplicates().astype(str).tolist()
+    best_step = plot_evaluation_summaries(output_dir, summary, joints, labels)
     right_best_step = plot_right_evaluation_summaries(
         output_dir,
         summary,
@@ -2922,7 +3064,8 @@ def regenerate_plots(
     print(f"Regenerated plots from saved CSVs in {output_dir}")
     print(f"Aggregate plots include all checkpoint(s): {checkpoint_steps}")
     print(f"Trajectory plots limited to latest checkpoint(s): {trajectory_plot_checkpoint_steps}")
-    print(f"Lowest validation MAE: checkpoint {best_step}")
+    if best_step is not None:
+        print(f"Lowest validation MAE: checkpoint {best_step}")
     if right_best_step is not None:
         print(f"Lowest right-side validation MAE: checkpoint {right_best_step}")
 
@@ -2995,17 +3138,7 @@ def main() -> None:
         action_keys = (
             modality["action"].modality_keys if args.modality_keys is None else args.modality_keys
         )
-        probe_specs = [("validation", args.dataset_path, args.traj_ids, 0, 0)]
-        if args.train_dataset_path is not None:
-            probe_specs.append(
-                (
-                    "train_probe",
-                    args.train_dataset_path,
-                    args.train_traj_ids,
-                    3 if args.train_probe_episodes is None else args.train_probe_episodes,
-                    args.train_probe_seed,
-                )
-            )
+        probe_specs = evaluation_probe_specs(args)
 
         for split, dataset_path, selected_ids, episode_count, seed in probe_specs:
             loader = LeRobotEpisodeLoader(dataset_path=str(dataset_path), modality_configs=modality)
@@ -3021,6 +3154,7 @@ def main() -> None:
                 selected_ids,
                 episode_count=episode_count,
                 seed=seed,
+                per_goal_count=args.train_probe_episodes_per_goal if split == "train_probe" else 1,
             )
             episode_tasks = _load_episode_tasks(dataset_path, len(loader))
             trajectory_goals = {
@@ -3030,10 +3164,10 @@ def main() -> None:
             if (
                 step not in trajectory_plot_step_set
                 or args.skip_trajectory_plots
-                or args.trajectory_plot_episodes == 0
+                or (args.trajectory_plot_episodes == 0 and not getattr(args, "all_trajectory_plots", False))
             ):
                 plot_trajectory_ids = set()
-            elif selected_ids:
+            elif selected_ids or getattr(args, "all_trajectory_plots", False):
                 # Explicit trajectory selections remain explicit for plotting too.
                 plot_trajectory_ids = set(trajectory_ids)
             else:
@@ -3125,7 +3259,7 @@ def main() -> None:
         output_dir=output_dir,
         summary=summary,
         dataset_paths={
-            "validation": args.dataset_path,
+            getattr(args, "evaluation_split", "validation"): args.dataset_path,
             "train_probe": args.train_dataset_path,
         },
         execution_horizon=args.execution_horizon,
@@ -3136,7 +3270,7 @@ def main() -> None:
             output_dir=output_dir,
             summary=summary,
             dataset_paths={
-                "validation": args.dataset_path,
+                getattr(args, "evaluation_split", "validation"): args.dataset_path,
                 "train_probe": args.train_dataset_path,
             },
             execution_horizon=args.execution_horizon,
@@ -3144,9 +3278,7 @@ def main() -> None:
 
     checkpoint_summary_csv = output_dir / "checkpoint_metric_summary.csv"
     summary.to_csv(checkpoint_summary_csv, index=False)
-    validation_summary = summary[summary["split"] == "validation"]
-    best_step = int(validation_summary.loc[validation_summary["mae"].idxmin(), "checkpoint_step"])
-    plot_evaluation_summaries(
+    best_step = plot_evaluation_summaries(
         output_dir,
         summary,
         joints,
@@ -3171,7 +3303,8 @@ def main() -> None:
     )
 
     print(summary.to_string(index=False))
-    print(f"\nLowest validation MAE: checkpoint {best_step}")
+    if best_step is not None:
+        print(f"\nLowest validation MAE: checkpoint {best_step}")
     if right_best_step is not None:
         print(f"Lowest right-side validation MAE: checkpoint {right_best_step}")
     print(f"Aggregate plots include all checkpoint(s): {checkpoint_steps}")
@@ -3180,10 +3313,12 @@ def main() -> None:
     print(f"Goal metrics CSV: {output_dir / GOAL_METRICS_FILENAME}")
     print(f"Horizon-position metrics CSV: {output_dir / HORIZON_POSITION_METRICS_FILENAME}")
     print(f"Normalized metrics by scope CSV: {normalized_outputs['scopes']}")
-    print(
-        "Frame-level validation CSVs: "
-        f"{output_dir}/<checkpoint>/validation_frame_predictions.csv.gz"
-    )
+    if not args.train_probe_only:
+        held_out_split = getattr(args, "evaluation_split", "validation")
+        print(
+            f"Frame-level {held_out_split} CSVs: "
+            f"{output_dir}/<checkpoint>/{RAW_PREDICTION_FILENAMES[held_out_split]}"
+        )
     print(
         "Frame-level train-probe CSVs: "
         f"{output_dir}/<checkpoint>/train_probe_frame_predictions.csv.gz"

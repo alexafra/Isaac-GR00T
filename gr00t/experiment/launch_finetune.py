@@ -23,8 +23,11 @@ from pathlib import Path
 import tyro
 
 from gr00t.configs.base_config import get_default_config
-from gr00t.configs.finetune_config import FinetuneConfig
-from gr00t.data.depth_colormap import fixed_turbo_depth_colormap_contract
+from gr00t.configs.finetune_config import FinetuneConfig, validate_vision_modality_dropout_config
+from gr00t.data.depth_colormap import (
+    FIXED_TURBO_DEPTH_COLORMAP,
+    fixed_turbo_depth_colormap_contract,
+)
 from gr00t.experiment.experiment import run
 
 
@@ -66,9 +69,7 @@ def configure_vision_input_contract(
     )
     config.model.vision_depth_colormap = depth_colormap
     config.model.vision_depth_colormap_lut_sha256 = (
-        depth_colormap_contract["lut_sha256"]
-        if depth_colormap_contract is not None
-        else None
+        depth_colormap_contract["lut_sha256"] if depth_colormap_contract is not None else None
     )
 
     if vision_patch_embed_init is not None and not video_config.channel_fusion:  # fmt: skip  # earlyfusion
@@ -112,6 +113,56 @@ def configure_vision_input_contract(
         config.model.vision_fusion_adapter_bias = True
         config.model.vision_fusion_adapter_bias_init = "zeros"
         config.model.tune_vision_fusion_adapters = True
+
+
+def configure_vision_modality_dropout_contract(
+    config, embodiment_tag: str, video_config, ft_config: FinetuneConfig
+) -> None:
+    """Bind opt-in masking to a unique ordered RGB/geometry input contract."""
+    rgb_prob = ft_config.vision_modality_dropout_rgb_prob
+    geometry_prob = ft_config.vision_modality_dropout_geometry_prob
+    policy = ft_config.vision_modality_dropout_state_policy
+    validate_vision_modality_dropout_config(
+        rgb_prob, geometry_prob, policy, ft_config.state_dropout_prob
+    )
+    config.model.vision_modality_dropout_rgb_prob = rgb_prob
+    config.model.vision_modality_dropout_geometry_prob = geometry_prob
+    config.model.vision_modality_dropout_state_policy = policy
+    config.model.vision_modality_dropout_source_keys = []
+    if not rgb_prob + geometry_prob:
+        return
+
+    source_keys = list(video_config.modality_keys)
+    if source_keys not in (
+        ["ego_view", "depth_gray_view"],
+        ["ego_view", "surface_normals_view"],
+    ):
+        raise ValueError(
+            "Modality dropout requires exactly ordered paired RGB and geometry keys: "
+            "['ego_view', 'depth_gray_view'] or ['ego_view', 'surface_normals_view']"
+        )
+    # ModalityConfig shares delta_indices across its video keys: a nonempty
+    # list therefore defines equal, positive frame counts for both sources.
+    if not video_config.delta_indices:
+        raise ValueError("Modality dropout requires equal positive frame counts for both views")
+    if video_config.channel_fusion:
+        gray_depth = (
+            source_keys[1] == "depth_gray_view"
+            and video_config.depth_colormap != FIXED_TURBO_DEPTH_COLORMAP
+        )
+        geometry_channels = [0] if gray_depth else [0, 1, 2]
+        expected_layout = [f"ego_view:{channel}" for channel in range(3)] + [
+            f"{source_keys[1]}:{channel}" for channel in geometry_channels
+        ]
+        if video_config.vision_channel_layout != expected_layout:
+            raise ValueError(
+                "Modality dropout requires RGB channels 0,1,2 first, followed by "
+                "gray depth channel 0 or Turbo/normals channels 0,1,2"
+            )
+    config.model.vision_modality_dropout_source_keys = source_keys
+    # Separate-view recipes otherwise retain unrelated pretrained embodiments.
+    # An active dropout model must have one unambiguous view-order contract.
+    config.data.modality_configs = {embodiment_tag: config.data.modality_configs[embodiment_tag]}
 
 
 def validate_vision_trainability_contract(config, video_config) -> None:
@@ -175,6 +226,10 @@ if __name__ == "__main__":
         video_config,
         ft_config.vision_patch_embed_init,
     )
+    configure_vision_modality_dropout_contract(config, embodiment_tag, video_config, ft_config)
+    if ft_config.late_fusion_language_readout == "pre_final_rmsnorm" and not video_config.post_vision_fusion:
+        raise ValueError("--late-fusion-language-readout applies only to late-fusion recipes")
+    config.model.late_fusion_language_readout = ft_config.late_fusion_language_readout
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual

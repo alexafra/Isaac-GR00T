@@ -22,6 +22,9 @@ OUTPUT_DIR=""
 EXPERIMENT_NAME=""
 WANDB_PROJECT=""
 STATE_DROPOUT_PROB=""
+VISION_MODALITY_DROPOUT_RGB_PROB=""
+VISION_MODALITY_DROPOUT_GEOMETRY_PROB=""
+VISION_MODALITY_DROPOUT_STATE_POLICY=""
 COLOR_JITTER_PARAMS="${COLOR_JITTER_PARAMS:-brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08}"
 USE_PERCENTILES=""
 SHORTEST_IMAGE_EDGE=""
@@ -37,6 +40,9 @@ Usage: bash examples/finetune.sh \
   --output-dir <path> \
   [--modality-config-path <path>] \
   [--state-dropout-prob <value>] \
+  [--vision-modality-dropout-rgb-prob <global probability>] \
+  [--vision-modality-dropout-geometry-prob <global probability>] \
+  [--vision-modality-dropout-state-policy <state_first|independent>] \
   [--color-jitter-params "brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08"] \
   [--use-percentiles <true|false>] \
   [--shortest-image-edge <pixels>] \
@@ -80,6 +86,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --state-dropout-prob)
             STATE_DROPOUT_PROB="$2"
+            shift 2
+            ;;
+        --vision-modality-dropout-rgb-prob)
+            VISION_MODALITY_DROPOUT_RGB_PROB="$2"
+            shift 2
+            ;;
+        --vision-modality-dropout-geometry-prob)
+            VISION_MODALITY_DROPOUT_GEOMETRY_PROB="$2"
+            shift 2
+            ;;
+        --vision-modality-dropout-state-policy)
+            VISION_MODALITY_DROPOUT_STATE_POLICY="$2"
             shift 2
             ;;
         --color-jitter-params)
@@ -174,6 +192,15 @@ fi
 
 if [ -n "$STATE_DROPOUT_PROB" ]; then
     LAUNCH_CMD+=(--state_dropout_prob "$STATE_DROPOUT_PROB")
+fi
+if [ -n "$VISION_MODALITY_DROPOUT_RGB_PROB" ]; then
+    LAUNCH_CMD+=(--vision-modality-dropout-rgb-prob "$VISION_MODALITY_DROPOUT_RGB_PROB")
+fi
+if [ -n "$VISION_MODALITY_DROPOUT_GEOMETRY_PROB" ]; then
+    LAUNCH_CMD+=(--vision-modality-dropout-geometry-prob "$VISION_MODALITY_DROPOUT_GEOMETRY_PROB")
+fi
+if [ -n "$VISION_MODALITY_DROPOUT_STATE_POLICY" ]; then
+    LAUNCH_CMD+=(--vision-modality-dropout-state-policy "$VISION_MODALITY_DROPOUT_STATE_POLICY")
 fi
 if [ -n "$COLOR_JITTER_PARAMS" ]; then
     read -r -a COLOR_JITTER_ARGS <<< "$COLOR_JITTER_PARAMS"

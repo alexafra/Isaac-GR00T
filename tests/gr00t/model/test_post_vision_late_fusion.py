@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import types
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.data.depth_colormap import FIXED_TURBO_DEPTH_COLORMAP, FIXED_TURBO_DEPTH_LUT_SHA256
-from gr00t.model.gr00t_n1d7.setup import _reconcile_depth_colormap_contract
+from gr00t.model.gr00t_n1d7.setup import (
+    _checkpoint_has_serialized_vision_contract,
+    _reconcile_depth_colormap_contract,
+)
 from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
 import pytest
 import torch
@@ -143,6 +147,48 @@ def test_depth_colormap_checkpoint_contract_rejects_gray_turbo_reinterpretation(
             turbo,
             gray,
             initializing_late_fusion=False,
+        )
+
+
+def test_fixed_turbo_separate_view_can_bind_only_an_unbound_base_config(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(json.dumps({"model_type": "Gr00tN1d7"}), encoding="utf-8")
+    assert _checkpoint_has_serialized_vision_contract(base) is False
+
+    requested = Gr00tN1d7Config(
+        vision_depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+        vision_depth_colormap_lut_sha256=FIXED_TURBO_DEPTH_LUT_SHA256,
+    )
+    checkpoint = Gr00tN1d7Config()
+    _reconcile_depth_colormap_contract(
+        checkpoint,
+        requested,
+        initializing_late_fusion=False,
+        initializing_depth_colormap=True,
+    )
+    assert checkpoint.vision_depth_colormap == FIXED_TURBO_DEPTH_COLORMAP
+    assert checkpoint.vision_depth_colormap_lut_sha256 == FIXED_TURBO_DEPTH_LUT_SHA256
+
+    serialized_gray = tmp_path / "gray"
+    serialized_gray.mkdir()
+    (serialized_gray / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "Gr00tN1d7",
+                "vision_depth_colormap": None,
+                "vision_depth_colormap_lut_sha256": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _checkpoint_has_serialized_vision_contract(serialized_gray) is True
+    with pytest.raises(RuntimeError, match="does not match"):
+        _reconcile_depth_colormap_contract(
+            Gr00tN1d7Config(),
+            requested,
+            initializing_late_fusion=False,
+            initializing_depth_colormap=False,
         )
 
 

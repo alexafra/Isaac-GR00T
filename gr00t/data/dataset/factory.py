@@ -17,8 +17,10 @@ import numpy as np
 from tqdm import tqdm
 
 from gr00t.configs.base_config import Config
+from gr00t.data.dataset.selected_frame_training_dataset import (
+    SelectedFrameTrainingDataset as ShardedSingleStepDataset,
+)
 from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
-from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.stats import generate_rel_stats, generate_stats

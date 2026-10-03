@@ -68,9 +68,7 @@ def test_six_channel_contract_accepts_both_supported_initializations():  # early
 
 
 def _late_fusion_model(auxiliary_key: str, **overrides):
-    stage = overrides.get(
-        "vision_fusion_stage", "pre_vision_language_adapter"
-    )
+    stage = overrides.get("vision_fusion_stage", "pre_vision_language_adapter")
     input_dim, output_dim = {
         "pre_vision_language_adapter": (2048, 1024),
         "post_vision_language_adapter": (4096, 2048),
@@ -246,9 +244,29 @@ def test_fixed_turbo_depth_contract_is_checkpoint_bound():
         ),
     ):
         with pytest.raises(ValueError, match=message):
-            _vision_input_contract(
-                _late_fusion_model("depth_gray_view", **overrides), video
-            )
+            _vision_input_contract(_late_fusion_model("depth_gray_view", **overrides), video)
+
+
+def test_fixed_turbo_depth_contract_supports_separate_views_without_fusion():
+    video = ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["ego_view", "depth_gray_view"],
+        depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+    )
+    model = SimpleNamespace(
+        vision_input_channels=3,
+        vision_channel_layout=["ego_view:0", "ego_view:1", "ego_view:2"],
+        vision_patch_embed_init="original_rgb",
+        vision_fusion_mode="none",
+        vision_depth_colormap=FIXED_TURBO_DEPTH_COLORMAP,
+        vision_depth_colormap_lut_sha256=FIXED_TURBO_DEPTH_LUT_SHA256,
+    )
+
+    contract = _vision_input_contract(model, video)
+
+    assert contract["mode"] == "separate_views"
+    assert contract["wire_video_keys"] == ["ego_view", "depth_gray_view"]
+    assert contract["depth_colormap"] == fixed_turbo_depth_colormap_contract()
 
 
 def test_gray_depth_processor_rejects_fixed_turbo_checkpoint_contract():
@@ -318,9 +336,7 @@ def test_post_vision_runtime_requires_four_stage_specific_linear_adapters(
     }
 
     _validate_post_vision_fusion_runtime(
-        _late_fusion_runtime_model(
-            stage=stage, in_features=in_features, out_features=out_features
-        ),
+        _late_fusion_runtime_model(stage=stage, in_features=in_features, out_features=out_features),
         contract,
     )
 
@@ -344,9 +360,7 @@ def test_post_vision_runtime_requires_four_stage_specific_linear_adapters(
             ),
             contract,
         )
-    with pytest.raises(
-        ValueError, match=rf"Linear\({in_features}, {out_features}\)"
-    ):
+    with pytest.raises(ValueError, match=rf"Linear\({in_features}, {out_features}\)"):
         _validate_post_vision_fusion_runtime(
             _late_fusion_runtime_model(
                 stage=stage,

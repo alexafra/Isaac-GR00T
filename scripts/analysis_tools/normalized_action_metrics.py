@@ -42,6 +42,7 @@ FORMULA_VERSION = CANONICAL_FORMULA_VERSION
 DEFAULT_RANGE_FLOOR = 1e-8
 PREDICTION_FILENAMES = {
     "validation": "validation_frame_predictions.csv.gz",
+    "test": "test_frame_predictions.csv.gz",
     "train_probe": "train_probe_frame_predictions.csv.gz",
 }
 JOINT_PATTERN = re.compile(r"^(?P<group>[A-Za-z0-9_.-]+)\[(?P<index>[0-9]+)\]$")

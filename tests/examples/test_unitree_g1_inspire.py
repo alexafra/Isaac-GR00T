@@ -22,6 +22,11 @@ CONFIG_RECIPES = [
         ["ego_view:0", "ego_view:1", "ego_view:2"],
     ),
     (
+        "g1_inspire_head_3_channel_turbo_depth_config",
+        ["ego_view", "depth_gray_view"],
+        ["ego_view:0", "ego_view:1", "ego_view:2"],
+    ),
+    (
         "g1_inspire_head_depth_gray_only_config",
         ["depth_gray_view"],
         ["depth_gray_view:0", "depth_gray_view:1", "depth_gray_view:2"],
@@ -30,6 +35,18 @@ CONFIG_RECIPES = [
         "g1_inspire_head_4_channel_gray_depth_fusion_config",
         ["ego_view", "depth_gray_view"],
         ["ego_view:0", "ego_view:1", "ego_view:2", "depth_gray_view:0"],
+    ),
+    (
+        "g1_inspire_head_6_channel_turbo_depth_fusion_config",
+        ["ego_view", "depth_gray_view"],
+        [
+            "ego_view:0",
+            "ego_view:1",
+            "ego_view:2",
+            "depth_gray_view:0",
+            "depth_gray_view:1",
+            "depth_gray_view:2",
+        ],
     ),
     (
         "g1_inspire_head_3_channel_surface_normals_config",

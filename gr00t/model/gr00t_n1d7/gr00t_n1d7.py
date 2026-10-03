@@ -25,6 +25,7 @@ from transformers.feature_extraction_utils import BatchFeature
 import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.model.gr00t_n1d7.rtc_pure import rtc_pure_guided_step, rtc_pure_weights
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
@@ -50,9 +51,7 @@ def sample_initial_action_noise(
     if noise_seeds is None:
         return torch.randn(size=shape, dtype=dtype, device=device)
     if len(noise_seeds) != batch_size:
-        raise ValueError(
-            f"Expected {batch_size} per-sample noise seeds, got {len(noise_seeds)}"
-        )
+        raise ValueError(f"Expected {batch_size} per-sample noise seeds, got {len(noise_seeds)}")
     rows = []
     for seed in noise_seeds:
         generator = torch.Generator(device=device)
@@ -72,6 +71,7 @@ class Gr00tN1d7ActionHead(nn.Module):
     """Action head component for flow matching diffusion policy."""
 
     supports_gradient_checkpointing = True
+    supports_rtc_pure = True
 
     def __init__(self, config: Gr00tN1d7Config):
         super().__init__()
@@ -250,7 +250,14 @@ class Gr00tN1d7ActionHead(nn.Module):
         state_features = self.state_encoder(action_input.state, embodiment_id)
 
         # Dropout state features (training only): zero out dropped states.
-        if self.training and self.state_dropout_prob > 0:
+        if self.training and "state_feature_keep" in action_input:
+            # The opt-in modality policy samples BOTH existing state masks in the
+            # processor, so RGB/geometry masking can depend on state availability.
+            keep = action_input.state_feature_keep
+            if keep.shape != (state_features.shape[0],) or keep.dtype != torch.bool:
+                raise ValueError("state_feature_keep must be a per-example boolean mask")
+            state_features = state_features * keep[:, None, None].to(state_features.dtype)
+        elif self.training and self.state_dropout_prob > 0:
             do_dropout = (
                 torch.rand(state_features.shape[0], device=state_features.device)
                 < self.state_dropout_prob
@@ -355,6 +362,131 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
 
+    def _get_action_rtc_pure_with_features(
+        self,
+        backbone_features: torch.Tensor,
+        state_features: torch.Tensor,
+        embodiment_id: torch.Tensor,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        options: dict[str, Any],
+    ) -> BatchFeature:
+        """Paper RTC VJP sampler; no weight updates and no VLM/state backward pass."""
+        if self.training:
+            raise ValueError("RTC pure is inference-only and requires action_head.eval()")
+        required = ("action_horizon", "rtc_overlap_steps", "rtc_frozen_steps", "rtc_action_dim")
+        for key in required:
+            if key not in options:
+                raise ValueError(f"RTC pure requires {key}")
+            if isinstance(options[key], bool) or not isinstance(options[key], int):
+                raise ValueError(f"RTC pure {key} must be an integer")
+        previous_horizon = options["action_horizon"]
+        overlap = options["rtc_overlap_steps"]
+        previous = options.get("rtc_previous_action_fp32", action_input["action"])
+        if (
+            previous.ndim != 3
+            or previous.shape[0] != backbone_features.shape[0]
+            or previous.shape[2] != self.action_dim
+            or not 0 <= overlap <= previous_horizon <= previous.shape[1]
+        ):
+            raise ValueError("RTC pure previous action shape/horizon is inconsistent")
+        if self.num_inference_timesteps <= 0:
+            raise ValueError("RTC pure requires a positive number of inference timesteps")
+
+        # The public model/policy APIs normally use no_grad/inference_mode.
+        # Override both locally and clone cached conditioning tensors here:
+        # tensors created in inference_mode cannot be saved for input backward.
+        # These detached clones prevent any gradient into vision/language/state.
+        with torch.inference_mode(False), torch.enable_grad():
+            vl_embeds = backbone_features.detach().clone()
+            state = state_features.detach().clone()
+            embodiment = embodiment_id.detach().clone()
+            image_mask = (
+                backbone_output.image_mask.detach().clone()
+                if self.config.use_alternate_vl_dit
+                else None
+            )
+            attention_mask = (
+                backbone_output.backbone_attention_mask.detach().clone()
+                if self.config.use_alternate_vl_dit
+                else None
+            )
+            batch_size, device = vl_embeds.shape[0], vl_embeds.device
+            weights = rtc_pure_weights(
+                horizon=self.action_horizon,
+                action_dim=self.action_dim,
+                real_action_dim=options["rtc_action_dim"],
+                overlap_steps=overlap,
+                frozen_steps=options["rtc_frozen_steps"],
+                device=device,
+            )
+            # Sample the FULL new chunk: old actions are targets, not initial
+            # latent values. Keep integration/error arithmetic in fp32 even
+            # when the action transformer runs with BF16 weights.
+            actions = sample_initial_action_noise(
+                batch_size=batch_size,
+                action_horizon=self.action_horizon,
+                action_dim=self.action_dim,
+                dtype=vl_embeds.dtype,
+                device=device,
+                noise_seeds=options.get("noise_seeds"),
+            ).float()
+            target = torch.zeros_like(actions)
+            target[:, :overlap] = (
+                previous[:, previous_horizon - overlap : previous_horizon]
+                .detach()
+                .to(device=device, dtype=torch.float32)
+                .clone()
+            )
+            if not torch.isfinite(target).all():
+                raise ValueError("RTC pure previous action target contains non-finite values")
+            model_dtype = next(self.action_encoder.parameters()).dtype
+            step_size = 1.0 / self.num_inference_timesteps
+            for step in range(self.num_inference_timesteps):
+                flow_time = step / float(self.num_inference_timesteps)
+                timesteps = torch.full(
+                    (batch_size,), int(flow_time * self.num_timestep_buckets), device=device
+                )
+
+                def predict_velocity(latent: torch.Tensor) -> torch.Tensor:
+                    action_features = self.action_encoder(
+                        latent.to(model_dtype), timesteps, embodiment
+                    )
+                    if self.config.add_pos_embed:
+                        positions = torch.arange(
+                            action_features.shape[1], dtype=torch.long, device=device
+                        )
+                        action_features = action_features + self.position_embedding(
+                            positions
+                        ).unsqueeze(0)
+                    sa_embs = torch.cat((state, action_features), dim=1)
+                    kwargs = {
+                        "hidden_states": sa_embs,
+                        "encoder_hidden_states": vl_embeds,
+                        "timestep": timesteps,
+                    }
+                    if self.config.use_alternate_vl_dit:
+                        kwargs.update(image_mask=image_mask, backbone_attention_mask=attention_mask)
+                    output = self.model(**kwargs)
+                    return self.action_decoder(output, embodiment)[:, -self.action_horizon :]
+
+                actions = rtc_pure_guided_step(
+                    actions,
+                    predict_velocity=predict_velocity,
+                    target=target,
+                    weights=weights,
+                    flow_time=flow_time,
+                    step_size=step_size,
+                )
+        return BatchFeature(
+            data={
+                "action_pred": actions.detach(),
+                "backbone_features": vl_embeds,
+                "state_features": state,
+                "rtc_pure_applied": True,
+            }
+        )
+
     @torch.no_grad()
     def get_action_with_features(
         self,
@@ -374,6 +506,20 @@ class Gr00tN1d7ActionHead(nn.Module):
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
         """
+        if options is not None and options.get("rtc_pure", False):
+            if self.training:
+                raise ValueError("RTC pure is inference-only and requires action_head.eval()")
+            if "action" in action_input:
+                return self._get_action_rtc_pure_with_features(
+                    backbone_features,
+                    state_features,
+                    embodiment_id,
+                    backbone_output,
+                    action_input,
+                    options,
+                )
+            # Bootstrap has no old chunk to condition on: use the unchanged
+            # ordinary sampler, including its established noise/dtype behavior.
         vl_embeds = backbone_features
 
         # Set initial actions as the sampled noise.
@@ -475,6 +621,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 "action_pred": actions,
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
+                **({"rtc_pure_applied": True} if options and options.get("rtc_pure") else {}),
             }
         )
 
@@ -573,6 +720,7 @@ class Gr00tN1d7(PreTrainedModel):
             vision_fusion_mode=config.vision_fusion_mode,
             vision_fusion_version=config.vision_fusion_version,
             vision_fusion_stage=config.vision_fusion_stage,
+            late_fusion_language_readout=config.late_fusion_language_readout,
             vision_fusion_adapter_type=config.vision_fusion_adapter_type,
             vision_fusion_adapter_bias=config.vision_fusion_adapter_bias,
             vision_fusion_adapter_bias_init=config.vision_fusion_adapter_bias_init,
@@ -585,6 +733,9 @@ class Gr00tN1d7(PreTrainedModel):
             vision_fusion_rgb_init_scale=config.vision_fusion_rgb_init_scale,
             vision_fusion_geometry_init_scale=config.vision_fusion_geometry_init_scale,
             tune_vision_fusion_adapters=config.tune_vision_fusion_adapters,
+            vision_modality_dropout_rgb_prob=config.vision_modality_dropout_rgb_prob,
+            vision_modality_dropout_geometry_prob=config.vision_modality_dropout_geometry_prob,
+            vision_modality_dropout_source_keys=config.vision_modality_dropout_source_keys,
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,

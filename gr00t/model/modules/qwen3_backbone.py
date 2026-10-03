@@ -153,6 +153,7 @@ class Qwen3Backbone(torch.nn.Module):
         vision_fusion_mode: str = "none",
         vision_fusion_version: int = 1,
         vision_fusion_stage: str = _PRE_VISION_LANGUAGE_ADAPTER,
+        late_fusion_language_readout: str = "post_final_rmsnorm",
         vision_fusion_adapter_type: str = "concat_linear",
         vision_fusion_adapter_bias: bool = True,
         vision_fusion_adapter_bias_init: str = "zeros",
@@ -165,6 +166,9 @@ class Qwen3Backbone(torch.nn.Module):
         vision_fusion_rgb_init_scale: float = 0.5,
         vision_fusion_geometry_init_scale: float = 0.5,
         tune_vision_fusion_adapters: bool = True,
+        vision_modality_dropout_rgb_prob: float = 0.0,
+        vision_modality_dropout_geometry_prob: float = 0.0,
+        vision_modality_dropout_source_keys: list[str] | None = None,
         select_layer: int = -1,
         reproject_vision: bool = True,
         use_flash_attention: bool = False,
@@ -189,6 +193,29 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
         super().__init__()
+        if late_fusion_language_readout not in ("post_final_rmsnorm", "pre_final_rmsnorm"):
+            raise ValueError(f"Unsupported late-fusion language readout: {late_fusion_language_readout!r}")
+        self.late_fusion_language_readout = late_fusion_language_readout
+        self.vision_modality_dropout_rgb_prob = vision_modality_dropout_rgb_prob
+        self.vision_modality_dropout_geometry_prob = vision_modality_dropout_geometry_prob
+        self.vision_modality_dropout_source_keys = list(vision_modality_dropout_source_keys or [])
+        probabilities = (vision_modality_dropout_rgb_prob, vision_modality_dropout_geometry_prob)
+        if (
+            any(not math.isfinite(p) or not 0 <= p <= 1 for p in probabilities)
+            or sum(probabilities) > 1
+        ):
+            raise ValueError(
+                "Vision modality dropout probabilities must be finite, nonnegative and sum to <= 1"
+            )
+        if any(probabilities) and (
+            len(self.vision_modality_dropout_source_keys) != 2
+            or self.vision_modality_dropout_source_keys[0] != "ego_view"
+            or self.vision_modality_dropout_source_keys[1]
+            not in ("depth_gray_view", "surface_normals_view")
+        ):
+            raise ValueError(
+                "Vision modality dropout requires ordered [ego_view, geometry] source keys"
+            )
         self.trainable_params_fp32 = trainable_params_fp32
         if vision_fusion_mode != "none":
             incompatible_trainability = {
@@ -828,11 +855,104 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _vision_modality_dropout_active(self) -> bool:
+        return self.training and (
+            getattr(self, "vision_modality_dropout_rgb_prob", 0.0) > 0
+            or getattr(self, "vision_modality_dropout_geometry_prob", 0.0) > 0
+        )
+
+    def _modality_token_keep(
+        self, vl_input: dict[str, torch.Tensor], *, separate_views: bool, merged: bool
+    ) -> torch.Tensor:
+        """Expand processor-owned example masks in packed image/token order, without RNG."""
+        if "vision_modality_keep" not in vl_input or "vision_modality_num_frames" not in vl_input:
+            raise ValueError(
+                "Enabled training modality dropout requires processor keep/frame metadata"
+            )
+        keep = vl_input["vision_modality_keep"]
+        frames = vl_input["vision_modality_num_frames"]
+        batch_size = vl_input["input_ids"].shape[0]
+        if keep.shape != (batch_size, 2) or not bool(((keep == 0) | (keep == 1)).all()):
+            raise ValueError("vision_modality_keep must be binary [batch, 2]")
+        if not bool((keep.sum(dim=-1) >= 1).all()):
+            raise ValueError("Vision modality dropout cannot remove RGB and geometry together")
+        if frames.shape != (batch_size,) or frames.dtype not in (torch.int32, torch.int64):
+            raise ValueError("vision_modality_num_frames must be integer [batch]")
+        if not bool((frames > 0).all()):
+            raise ValueError("vision_modality_num_frames must be positive")
+        grid = vl_input["image_grid_thw"]
+        if grid.ndim != 2 or grid.shape[1] != 3 or grid.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Modality dropout requires integer image_grid_thw [images, 3]")
+        if not bool((grid > 0).all()):
+            raise ValueError("Modality dropout image grids must be positive")
+        image_keep = torch.repeat_interleave(keep, frames.to(keep.device), dim=0)
+        if separate_views:
+            # Processor order is sample -> time -> [RGB, geometry].
+            image_keep = image_keep.reshape(-1, 1)
+        if image_keep.shape[0] != grid.shape[0]:
+            raise ValueError("Modality dropout frame counts do not match packed image grids")
+        token_counts = grid.prod(dim=-1)
+        if merged:
+            merge_area = self.model.model.visual.spatial_merge_size**2
+            if bool((token_counts.remainder(merge_area) != 0).any()):
+                raise ValueError("Image grids must contain complete spatial-merge groups")
+            token_counts = token_counts // merge_area
+        return torch.repeat_interleave(image_keep, token_counts.to(keep.device), dim=0)
+
+    def _mask_early_fusion_pixels(self, vl_input: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Zero normalized channel groups before the shared patch stem (not black RGB)."""
+        pixels = vl_input["pixel_values"]
+        channels = self.model.visual.patch_embed.proj.in_channels
+        if channels not in (4, 6) or pixels.ndim != 2 or pixels.shape[1] % channels:
+            raise ValueError("Early-fusion modality dropout requires packed 4/6-channel patches")
+        keep = self._modality_token_keep(vl_input, separate_views=False, merged=False)
+        if keep.shape[0] != pixels.shape[0]:
+            raise ValueError("Early-fusion modality mask does not match raw patch rows")
+        channel_keep = torch.cat(
+            (keep[:, :1].expand(-1, 3), keep[:, 1:].expand(-1, channels - 3)), dim=-1
+        ).to(device=pixels.device, dtype=pixels.dtype)
+        return (pixels.reshape(pixels.shape[0], channels, -1) * channel_keep[..., None]).reshape_as(
+            pixels
+        )
+
+    def _forward_separate_view_modality_dropout(
+        self, vl_input: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Remove a view's content at every Qwen vision-to-language entry, retaining slots."""
+        qwen = self.model.model
+        keep = self._modality_token_keep(vl_input, separate_views=True, merged=True)
+        chunks, deepstack = qwen.get_image_features(
+            vl_input["pixel_values"], vl_input["image_grid_thw"]
+        )
+        if (
+            not isinstance(chunks, (tuple, list))
+            or len(chunks) != vl_input["image_grid_thw"].shape[0]
+        ):
+            raise RuntimeError("Separate-view Qwen features did not preserve image order")
+        final = torch.cat(tuple(chunks), dim=0)
+        if final.ndim != 2 or keep.shape[0] != final.shape[0]:
+            raise RuntimeError("Separate-view modality mask does not match Qwen token rows")
+        if not isinstance(deepstack, (tuple, list)) or len(deepstack) != 3:
+            raise RuntimeError("Separate-view dropout requires all three Qwen DeepStack streams")
+        if any(stream.shape != final.shape for stream in deepstack):
+            raise RuntimeError("Separate-view final/DeepStack token alignment mismatch")
+        return self._forward_fused_vision_language(
+            input_ids=vl_input["input_ids"],
+            attention_mask=vl_input["attention_mask"],
+            primary_grid=vl_input["image_grid_thw"],
+            fused_final=final * keep.to(device=final.device, dtype=final.dtype),
+            fused_deepstack=[
+                stream * keep.to(device=stream.device, dtype=stream.dtype) for stream in deepstack
+            ],
+            preserve_standard_hidden_state=True,
+        )
+
     def _fuse_vision_streams(
         self,
         adapter_name: str,
         primary: torch.Tensor,
         auxiliary: torch.Tensor,
+        modality_keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.vision_fusion_adapters is None:
             raise RuntimeError("Late-fusion adapters are not enabled")
@@ -859,6 +979,13 @@ class Qwen3Backbone(torch.nn.Module):
                 f"Linear({adapter.in_features}, {adapter.out_features}, "
                 f"bias={adapter.bias is not None})"
             )
+        if modality_keep is not None:
+            if modality_keep.shape != (primary.shape[0], 2):
+                raise ValueError("Late-fusion modality mask must match packed token rows")
+            primary = primary * modality_keep[:, :1].to(device=primary.device, dtype=primary.dtype)
+            auxiliary = auxiliary * modality_keep[:, 1:].to(
+                device=auxiliary.device, dtype=auxiliary.dtype
+            )
         adapter_input = torch.cat((primary, auxiliary), dim=-1).to(
             device=adapter.weight.device, dtype=adapter.weight.dtype
         )
@@ -884,6 +1011,7 @@ class Qwen3Backbone(torch.nn.Module):
         combined_pixels: torch.Tensor,
         combined_grid: torch.Tensor,
         primary_raw_token_count: int,
+        modality_keep: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Run the pinned Qwen vision path and fuse raw ViT features before mergers.
 
@@ -947,6 +1075,7 @@ class Qwen3Backbone(torch.nn.Module):
                     f"deepstack_{stream_index}",
                     hidden_states[:primary_raw_token_count],
                     hidden_states[primary_raw_token_count:],
+                    modality_keep=modality_keep,
                 )
                 fused_deepstack.append(visual.deepstack_merger_list[stream_index](fused_raw))
 
@@ -954,6 +1083,7 @@ class Qwen3Backbone(torch.nn.Module):
             "final",
             hidden_states[:primary_raw_token_count],
             hidden_states[primary_raw_token_count:],
+            modality_keep=modality_keep,
         )
         fused_final = visual.merger(fused_final_raw)
         if len(fused_deepstack) != 3:
@@ -1043,6 +1173,7 @@ class Qwen3Backbone(torch.nn.Module):
         primary_grid: torch.Tensor,
         fused_final: torch.Tensor,
         fused_deepstack: list[torch.Tensor],
+        preserve_standard_hidden_state: bool = False,
     ) -> torch.Tensor:
         if len(fused_deepstack) != 3:
             raise RuntimeError(
@@ -1071,6 +1202,40 @@ class Qwen3Backbone(torch.nn.Module):
             attention_mask=self._attention_mask_for_rope(attention_mask),
         )
         qwen.rope_deltas = rope_deltas
+        if preserve_standard_hidden_state or (
+            getattr(self, "vision_fusion_mode", "none") == "post_vision_late_fusion"
+            and getattr(self, "late_fusion_language_readout", "post_final_rmsnorm")
+            == "pre_final_rmsnorm"
+        ):
+            # The ordinary conditional-model output recorder returns the last
+            # decoder tensor BEFORE final RMSNorm. Corrected late fusion and
+            # separate-view dropout preserve that exact tensor and its gradients.
+            # Historical late-fusion checkpoints still return last_hidden_state.
+            layers = getattr(qwen.language_model, "layers", None)
+            if layers is None or len(layers) == 0:
+                raise RuntimeError("Pre-final-RMSNorm readout requires Qwen decoder output capture")
+            captured = []
+
+            def capture_last_decoder(_module, _inputs, output):
+                captured.append(output[0] if isinstance(output, tuple) else output)
+
+            handle = layers[-1].register_forward_hook(capture_last_decoder)
+            try:
+                qwen.language_model(
+                    input_ids=None,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    visual_pos_masks=visual_pos_masks,
+                    deepstack_visual_embeds=fused_deepstack,
+                )
+            finally:
+                handle.remove()
+            if len(captured) != 1 or not isinstance(captured[0], torch.Tensor):
+                raise RuntimeError(
+                    "Qwen last decoder did not produce exactly one hidden-state tensor"
+                )
+            return captured[0]
         outputs = qwen.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -1104,6 +1269,15 @@ class Qwen3Backbone(torch.nn.Module):
             combined_pixels,
             combined_grid,
             primary_raw_token_count,
+            **(
+                {
+                    "modality_keep": self._modality_token_keep(
+                        vl_input, separate_views=False, merged=False
+                    )
+                }
+                if self._vision_modality_dropout_active()
+                else {}
+            ),
         )
         return self._forward_fused_vision_language(
             input_ids=input_ids,
@@ -1123,6 +1297,11 @@ class Qwen3Backbone(torch.nn.Module):
             auxiliary_grid,
         ) = self._validate_late_fusion_inputs(vl_input)
 
+        modality_keep = (
+            self._modality_token_keep(vl_input, separate_views=False, merged=True)
+            if self._vision_modality_dropout_active()
+            else None
+        )
         qwen = self.model.model
         combined_pixels = torch.cat((primary_pixels, auxiliary_pixels), dim=0)
         combined_grid = torch.cat((primary_grid, auxiliary_grid), dim=0)
@@ -1156,7 +1335,9 @@ class Qwen3Backbone(torch.nn.Module):
             )
         primary_final = torch.cat(tuple(primary_chunks), dim=0)
         auxiliary_final = torch.cat(tuple(auxiliary_chunks), dim=0)
-        fused_final = self._fuse_vision_streams("final", primary_final, auxiliary_final)
+        fused_final = self._fuse_vision_streams(
+            "final", primary_final, auxiliary_final, modality_keep=modality_keep
+        )
 
         if not isinstance(deepstack_streams, (tuple, list)) or len(deepstack_streams) != 3:
             raise RuntimeError(
@@ -1176,6 +1357,7 @@ class Qwen3Backbone(torch.nn.Module):
                     f"deepstack_{index}",
                     stream[:primary_token_count],
                     stream[primary_token_count:],
+                    modality_keep=modality_keep,
                 )
             )
 
@@ -1191,6 +1373,9 @@ class Qwen3Backbone(torch.nn.Module):
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
+        modality_dropout = self._vision_modality_dropout_active()
+        if modality_dropout:
+            keys_to_use.extend(["vision_modality_keep", "vision_modality_num_frames"])
         if self.vision_fusion_mode == "post_vision_late_fusion":
             keys_to_use.extend(["late_fusion_pixel_values", "late_fusion_image_grid_thw"])
             selected_input = {k: vl_input[k] for k in keys_to_use if k in vl_input}
@@ -1212,8 +1397,19 @@ class Qwen3Backbone(torch.nn.Module):
                     f"{unexpected_late_keys}"
                 )
             selected_input = {k: vl_input[k] for k in keys_to_use}
-            model_outputs = self.model(**selected_input, output_hidden_states=True)
-            outputs = model_outputs.hidden_states[-1]
+            if modality_dropout and self.model.visual.patch_embed.proj.in_channels == 3:
+                outputs = self._forward_separate_view_modality_dropout(selected_input)
+            else:
+                model_input = selected_input
+                if modality_dropout:
+                    model_input = {
+                        k: v
+                        for k, v in selected_input.items()
+                        if not k.startswith("vision_modality_")
+                    }
+                    model_input["pixel_values"] = self._mask_early_fusion_pixels(selected_input)
+                model_outputs = self.model(**model_input, output_hidden_states=True)
+                outputs = model_outputs.hidden_states[-1]
         image_mask = selected_input["input_ids"] == self.model.config.image_token_id
         attention_mask = selected_input["attention_mask"] == 1
         return BatchFeature(

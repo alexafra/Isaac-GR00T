@@ -139,6 +139,7 @@ Choose one of these modality configurations:
 | --- | --- |
 | RGB | `g1_inspire_headonly_config.py` |
 | RGB + gray depth, separate views | `g1_inspire_head_3_channel_gray_depth_config.py` |
+| RGB + fixed-Turbo depth, separate views | `g1_inspire_head_3_channel_turbo_depth_config.py` |
 | Gray depth only | `g1_inspire_head_depth_gray_only_config.py` |
 | RGB + depth early fusion | `g1_inspire_head_4_channel_gray_depth_fusion_config.py` |
 | RGB-D late fusion, pre-adapter | `g1_inspire_head_rgbd_late_fusion_pre_adapter_config.py` |

@@ -415,7 +415,8 @@ When direct optimization is insufficient, use one or more of the following:
 > still-unconsumed **physical** action tail plus `rtc_overlap_steps`,
 > `rtc_frozen_steps`, and optionally `rtc_ramp_rate`. `Gr00tPolicy` re-encodes that
 > tail against the request's current state (important for relative-action
-> embodiments), then restores the completely frozen physical prefix after decode.
+> embodiments). Legacy RTC restores the completely frozen physical prefix after
+> decode; optional `rtc_pure` instead returns the guided prediction unchanged.
 > A compatible server advertises `policy_metadata.rtc.protocol_version == 1`.
 > ReplayPolicy and the simulation policy wrapper do not advertise this capability.
 > TensorRT deployment does not currently implement this RTC options path either.
@@ -425,6 +426,40 @@ When direct optimization is insufficient, use one or more of the following:
 > generations, and enter a safe state on buffer underrun.
 
 #### Real-Time Chunking (RTC) Details
+
+**Optional gradient-guided sampler (`rtc_pure`)**
+
+The Unitree client flag `--rtc-pure` selects asynchronous RTC and adds
+`rtc_pure: true` to continuation requests. Restart the ordinary PyTorch server
+with the **same existing checkpoint** after updating this code; no extra server
+flag, checkpoint conversion, fine-tuning, or training change is required.
+Without this option, the existing GR00T copy/freeze/ramp sampler is unchanged.
+
+This inference-only alternative follows equations 2--5 of
+[Real-Time Execution of Action Chunking Flow Policies](https://arxiv.org/html/2506.07339v2#S3.SS1):
+full-noise initialization, the paper's overlap weights, and a vector-Jacobian
+product through the action denoiser at each flow step (maximum guidance weight
+5). Gradients are requested only for the candidate action tensor; model weights
+and parameter-gradient buffers are not updated. Cached vision/state features
+remain detached. Guidance arithmetic and normalized prior targets use float32,
+while the action network retains its checkpoint precision. Padded action-output
+dimensions do not contribute to the guidance error.
+
+The server advertises `rtc.pure_inference_guidance: true` only when its loaded
+action head supports this sampler. Both the policy and the client require an
+explicit `rtc_pure_applied: true` response; there is no silent fallback. Pure
+mode rejects `rtc_ramp_rate`, which belongs to the legacy sampler. In the
+Unitree client, a discarded guided request measures startup delay before action
+execution; the ordinary first chunk remains the first executed plan.
+
+The guided denoising trajectory is **not** hard-clamped, and the policy wrapper
+does **not** replace the physical prefix after decoding in pure mode. The entire
+decoded prediction comes from the guided sampler; `rtc_physical_prefix_restored`
+is false. Exact prefix restoration remains exclusive to legacy RTC. In pure
+mode, `rtc_frozen_steps` specifies the full-weight guidance region, not a hard
+freeze. All existing actuator limits/conditioning remain in force. This mode requires latency,
+memory, and closed-loop validation on the deployment hardware; CPU tests do not
+establish real-robot performance or safety.
 
 **Principle**
 

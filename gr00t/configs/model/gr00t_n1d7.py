@@ -57,6 +57,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     vision_fusion_mode: str = "none"
     vision_fusion_version: int = 1
     vision_fusion_stage: str = "pre_vision_language_adapter"
+    # Missing in historical checkpoints: preserve their post-final-RMSNorm readout.
+    # New controlled runs explicitly select pre_final_rmsnorm to match stock GR00T.
+    late_fusion_language_readout: str = "post_final_rmsnorm"
     vision_fusion_adapter_type: str = "concat_linear"
     vision_fusion_adapter_bias: bool = True
     vision_fusion_adapter_bias_init: str = "zeros"
@@ -74,6 +77,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     # training rather than relying on a library-provided colour map.
     vision_depth_colormap: str | None = None
     vision_depth_colormap_lut_sha256: str | None = None
+    # Training-only, mutually exclusive whole RGB/geometry masking. Serialized
+    # probabilities are global (not conditional on the state-first eligibility).
+    vision_modality_dropout_rgb_prob: float = 0.0
+    vision_modality_dropout_geometry_prob: float = 0.0
+    vision_modality_dropout_state_policy: str = "independent"
+    vision_modality_dropout_source_keys: list[str] = field(default_factory=list)
     select_layer: int = 12
     reproject_vision: bool = False
     use_flash_attention: bool = True
