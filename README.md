@@ -1,3 +1,30 @@
+# G1 RGB-D research fork of Isaac-GR00T
+
+This fork extends [NVIDIA Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) for thesis experiments with Unitree G1 robots, Dex3 and Inspire hands, and depth-augmented GR00T N1.7 policies. The research implementation is on **`research/g1-dex3-finetuning`**, not `main`.
+
+## What this fork adds
+
+- **Depth representations and input configurations:** grayscale depth, Turbo-coloured depth, and surface normals; RGB baselines, separate image views, and four- or six-channel early fusion.
+- **Pre-adapter late fusion:** RGB and depth features share the Qwen vision encoder and are combined by four trainable projections before the final and DeepStack spatial mergers and vision-to-language projections. See the [backbone implementation](gr00t/model/modules/qwen3_backbone.py).
+- **Dataset and evaluation support:** G1 embodiment configurations, geometry contracts, checkpoint comparisons, per-joint and normalised action-error metrics, and held-out evaluation. See the [G1 pipeline notes](examples/UnitreeG1/INSPIRE_DFX_PIPELINE.md) and [checkpoint evaluator](scripts/analysis_tools/evaluate_checkpoints.py).
+- **Experimental asynchronous deployment:** policy/server support for Real-Time Chunking, including optional inference-time gradient guidance. See the [deployment notes](getting_started/real_world_deployment.md) and [RTC sampler](gr00t/model/gr00t_n1d7/rtc_pure.py).
+
+## Start with the research branch
+
+```bash
+git clone --recurse-submodules --branch research/g1-dex3-finetuning https://github.com/alexafra/Isaac-GR00T.git
+```
+
+The companion [training scripts](https://github.com/alexafra/thesis_scripts) orchestrate experiments; [unitree_lerobot](https://github.com/alexafra/unitree_lerobot/tree/research/g1-rgbd-dataset-tools) provides conversion and the robot-side observation/action client. Collection uses [xr_teleoperate](https://github.com/alexafra/xr_teleoperate/tree/research/g1-data-collection) and [TeleImager](https://github.com/alexafra/teleimager/tree/research/rgbd-data-collection).
+
+Match the dataset encoding, calibration, embodiment, and checkpoint configuration. Historical recipes include machine-specific paths and are not portable defaults. The RTC-options path is PyTorch-only, not implemented for TensorRT or the simulation policy wrapper. These research additions do not guarantee improved task success or safe robot control.
+
+## Upstream documentation and attribution
+
+NVIDIA's original documentation, acknowledgements, and licensing are retained below. Upstream release/support claims and clone commands refer to NVIDIA's project, not validation of this fork's additions. See [LICENSE](LICENSE) and [ATTRIBUTIONS.md](ATTRIBUTIONS.md).
+
+---
+
 <div align="center">
 
   <img src="media/header_compress.png" width="800" alt="NVIDIA Isaac GR00T N1.7 Header">
