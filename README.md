@@ -1,3 +1,15 @@
+# Research fork: Isaac-GR00T
+
+This is [alexafra's research fork](https://github.com/alexafra/Isaac-GR00T) of [NVIDIA/Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T). **The thesis implementation is on [`research/g1-dex3-finetuning`](https://github.com/alexafra/Isaac-GR00T/tree/research/g1-dex3-finetuning), not this `main` branch.**
+
+Depth-augmented GR00T N1.7 for Unitree G1: separate image views, early fusion, pre-adapter late fusion, geometry encodings, evaluation tools, and experimental RTC server support.
+
+Read the [research-branch README](https://github.com/alexafra/Isaac-GR00T/blob/research/g1-dex3-finetuning/README.md) for the implemented additions, companion repositories, branch-specific setup, and limitations. Selecting this fork's `main` branch does not select the research configuration.
+
+The upstream documentation and attribution below are retained for reference; they are not validation or safety guarantees for the research additions. Existing licensing and third-party attribution remain applicable.
+
+---
+
 <div align="center">
 
   <img src="media/header_compress.png" width="800" alt="NVIDIA Isaac GR00T N1.7 Header">
